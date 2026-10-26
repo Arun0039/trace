@@ -1,0 +1,71 @@
+# Trace · AI QA Test Management Platform MVP
+
+A local-first QA workspace for project-scoped requirements, test cases, execution tracking, lightweight bug tracking, coverage, and CSV reporting. The server, database, and UI use only Python's standard library; no account, package installation, database service, or network connection is needed to run the app.
+
+## Quick start (Windows)
+
+1. Install Python 3.10 or later from [python.org](https://www.python.org/downloads/) and enable **Add Python to PATH**.
+2. Open PowerShell or Command Prompt and enter this folder:
+
+   ```powershell
+   cd "C:\path\to\QA Tracker\qa-platform"
+   ```
+
+3. Start the app:
+
+   ```powershell
+   .\start-qa-platform.bat
+   ```
+
+   The launcher checks Python's `py` and `python` commands and common per-user/system install folders. If Python is missing and `winget` is available, it offers to install Python 3.13 for the current user; otherwise it provides the official download link. You can also run `py -3 app.py` or `python app.py` from this folder. The launcher keeps its console visible if Python exits, so you can copy the startup error.
+4. When startup succeeds, the app prints its local URL and tries to open the browser automatically. If it does not, open <http://127.0.0.1:8000> manually. Keep the console open while using the app; Ctrl+C stops the server.
+
+The app listens on loopback (`127.0.0.1`) only by default. Structured data is stored in `qa_platform.sqlite3` alongside `app.py`; each project has a separate folder under `storage/projects/{project_id}/` for requirement uploads, application files, and CSV exports. Deleting a project removes its SQLite records and moves its folder to `storage/archived-projects/` so the files are retained. To use a different database location, set `QA_PLATFORM_DB` before startup. `QA_HOST` and `QA_PORT` can also override the bind address and port; do not expose this development MVP to an untrusted network.
+
+## Using the workspace
+
+- **Project** is the primary module and opens the searchable project list, with status filtering and generated project ID, project key, status, and created/updated dates. Create a project to open its details page, or use View, Details, Edit, and Delete from the list. Project edits validate required fields and unique project keys; deletion confirms the action, removes associated SQLite records, and archives the project folder so uploaded files and exports are retained.
+- Each selected project has its own child modules: **Requirement**, **Test Case**, **Application**, **API Documentation**, **App Analysis**, **Bug Tracker**, and **Project files**. The child modules remain associated with the selected project's SQLite ID and appear in the project navigation while a project workspace is open. **Dashboard (Beta)** and **Settings (Beta)** are workspace modules. Settings contains the **AI module** for local Ollama configuration and **Archive** for browsing retained folders from deleted projects. Project setup records product type, project name, description, version, environment, QA owner, and active/inactive status.
+- The **Archive** view lists retained project folders and their archive dates. It does not restore deleted SQLite records; files remain in the local `storage/archived-projects/` directory.
+- Follow the project flow: (1) provide a requirement as text or upload a `.docx` (maximum 5 MB), `.txt`, or `.md` (maximum 1 MB); (2) review requirements and generate linked test-case drafts; (3) upload the finalized application ZIP and validate requirement coverage against its source. Requirement upload supports deterministic structuring or the configured local Ollama model. AI-generated requirement output is validated, deduplicated against existing project requirements, and always needs review. Re-imported or manually entered requirements with matching normalized content (case and whitespace differences ignored) are skipped or rejected. Requirements can be deleted; linked cases remain but are unlinked.
+- Generate test cases by clicking **Generate mapped test cases** once requirements exist. Cases are generated from requirements only and linked to the originating requirement; API docs and application source are reserved for their separate inventory and coverage-validation steps. Choose the local deterministic generator or an optional local Ollama model. Ollama output is schema-validated and linked only to valid project requirement IDs. Scenario and expected result are separate fields and must describe, respectively, the action/condition under test and its observable outcome. Both generators skip matching repeats. Each request is capped at 300 cases. Review and edit all cases before execution.
+- Import a local `.json` OpenAPI 3.x or Swagger 2.0 specification from **API docs** to build a searchable project endpoint inventory. The app validates the document and records operations, summaries, operation IDs, tags, and the source document name; it never fetches a URL.
+- Upload a finalized developer build `.zip` from **Applications** for a project-scoped file inventory and bounded static analysis. Use **Validate requirement coverage** on an upload to compare every project requirement against source excerpts using local Ollama. At most 80 excerpts and 300 KB of source text per model request are sent to the configured loopback model (requirements are processed in batches of 100); cited evidence must match text in the uploaded files. Reports are marked stale when requirements change and should be rerun. Results are AI-assisted static estimates, not proof of runtime functionality or correctness. No code is sent to an external service or executed. ZIPs are limited to 25 MB, 3,000 entries, 100 MB total extracted content, and 20 MB per file. Unsafe paths, symbolic links, duplicate/colliding entries, unsupported compression, encrypted members, and excessive compression are rejected.
+- Optional AI generation and coverage analysis use an Ollama server on the same computer. Install Ollama, launch its desktop app or run `ollama serve`, then download a model (for example, `ollama pull llama3.1:8b`). Check `http://127.0.0.1:11434/api/tags` locally; it should return JSON listing installed models. Open **Settings (Beta) → AI module**, click **Connect / refresh model list**, then choose an installed model from the dropdown; if the list is empty, pull a model first. Select **Open-source AI model (Ollama)** in **Test cases** to generate with it. Only loopback Ollama URLs are accepted. Requirement text and, only when validating code coverage, bounded source excerpts go to that local Ollama instance; no external service receives them. The local deterministic option remains available for requirement structuring and test-case generation. If the model is unavailable or returns invalid output, the app reports the error rather than silently falling back.
+- Execute a case with one of: Not Executed, In Progress, Pass, Fail, Blocked, or Skipped. Each save creates an execution record; the latest result appears in the case list and dashboard. Optionally attach PNG, JPEG, GIF, or WebP screenshot evidence (maximum 5 MB per image) while recording an execution. The case list links to evidence previews and downloads.
+- Log bugs and link them to cases, especially failed cases. Update bug status, severity, priority, and assignment.
+- Use **Export report** to download a UTF-8 CSV that opens in Excel. It contains test cases, evidence references for each case's latest execution, a complete execution-evidence reference section, a requirement coverage matrix, and a bug summary. CSV is used instead of `.xlsx` to avoid third-party dependencies. Test-case list includes case/requirement IDs, type, scenario, description, steps, expected result, status, and actual result; edit cases to update their fields, status, or actual result, and delete cases with their execution history.
+
+## Static application analysis with REA
+
+Select **App analysis** inside a project to statically inspect an application directory or `.asar` file using the sibling `rea/` package. This integration invokes REA's documented `analyze-javascript-application` CLI command through a local Node.js process; it is **not an MCP integration**. REA and its compiled runtime/dependencies must already be available in `../rea/`. The app does not install or build REA automatically. The runtime status endpoint and page explain missing Node.js, unsupported Node versions, missing builds/dependencies, and unsafe network binding.
+
+Enter the exact absolute path as seen by the computer running the QA server. The path must identify an existing directory or `.asar` file. This separate REA workflow does not accept ZIP uploads or execute application code. Analysis runs in a background worker, one at a time, with a 10-minute timeout and bounded CLI output/evidence bundle size. The complete REA Evidence is written to a unique temporary bundle path and deleted after REA returns its summary. Project-scoped SQLite history retains the input path, status, bounded summary, and failure message—not the full Evidence bundle.
+
+The summary presents only values reported by REA, such as the artifact SHA-256 and format, source/module statistics, Electron boundary counts, route statistics when present, and explicit limitations. Missing summary fields remain absent; they are not interpreted as zero or as proof of absence.
+
+## Data and safety notes
+
+- SQLite is initialized on startup with foreign-key enforcement, project-scoped relationships, and parameterized user-data queries. Additive schema initialization creates API-document, endpoint-inventory, execution-evidence, application-analysis, application-upload, requirement-document, and local AI-settings tables and fields for existing databases.
+- Requirements accept `.docx` uploads up to 5 MB and `.txt` / `.md` documents up to 1 MB of text. DOCX parsing reads only the bounded `word/document.xml` member without extracting or opening embedded content. API specifications accept local `.json` uploads up to 1 MB and must declare OpenAPI 3.x or Swagger 2.0 with valid document metadata and paths. No URL import, remote fetch, uploaded code execution, or specification dereferencing occurs.
+- Application ZIPs are untrusted input. Members are fully preflighted before extraction, extracted into a unique staging folder and atomically moved into `storage/projects/{project_id}/applications/{upload_uuid}` beside the SQLite database. The database stores the project-scoped inventory and static findings; API responses do not reveal the server storage path. Source inspection has per-file, total-byte, file-count, and findings limits, so results may be incomplete. ZIP upload API: `POST /api/projects/{id}/applications/import?filename=client.zip` with raw ZIP bytes and `Content-Type: application/zip` (25 MB maximum); JSON/base64 uploads remain supported. List or retrieve records through `GET /api/projects/{id}/applications` and `GET /api/projects/{id}/applications/{upload_id}`.
+- Ollama connection preferences are stored in SQLite. Configure them through `GET` / `POST /api/ai/settings`; test the saved local server with `POST /api/ai/ollama/test`. Test-case generation accepts `{"generator":"deterministic"}` or `{"generator":"ollama"}` at `POST /api/projects/{id}/test-cases/generate`; deterministic mode remains the default.
+- Evidence is validated by declared image MIME type, file signature/structure, dimensions where available, and a 5 MB size limit, then stored as a BLOB in SQLite under its project and execution. The application does not serve evidence cross-project. Request bodies are capped at 27 MB to support raw ZIP uploads.
+- CSV exports are downloaded as before and also saved to `storage/projects/{project_id}/exports/project-report.csv`. `DELETE /api/projects/{id}` deletes the project's SQLite records and archives its project folder instead of deleting its files.
+- The web app is a single-user local MVP without authentication or cloud sync. It listens on `127.0.0.1` by default. REA analysis is disabled if the server is configured to bind beyond loopback; do not expose the app to an untrusted network. Keep the database file private and back it up by stopping the app and copying it.
+
+## Tests
+
+Run the standard-library test suite from this folder:
+
+```powershell
+py -m unittest discover -s tests -v
+```
+
+Application-analysis API: `GET /api/rea/runtime` checks local CLI readiness; `POST /api/projects/{id}/analyses` starts a job with `{"input_path":"<absolute local path>"}`; `GET /api/projects/{id}/analyses` lists that project's history; and `GET /api/projects/{id}/analyses/{analysis_id}` reads one project-scoped result.
+
+Requirement-document API: `POST /api/projects/{id}/requirements/import` accepts `{"filename":"requirements.md","content":"..."}` for TXT/Markdown, or `{"filename":"requirements.docx","document_data":"<base64 DOCX bytes>"}` for DOCX. Pass `"generator":"ollama"` to structure source text into AI-generated requirements using the configured local model; deterministic extraction is the default. `GET /api/projects/{id}/requirements/documents` lists project-scoped imports; `GET /api/projects/{id}/requirements/documents/{document_id}` downloads the stored original.
+
+Test-case generation API: `POST /api/projects/{id}/test-cases/generate` with `{}` generates drafts only from project requirements. Optionally pass `{"requirement_ids":[1,2]}` to select requirements. The response reports created cases, duplicate skips, and whether the 300-case limit was reached.
+
+Code coverage API: `POST /api/projects/{id}/applications/{application_id}/validate-requirements` asks the configured local Ollama model to compare project requirements with a bounded set of uploaded source excerpts. Results and exact-snippet citations are validated and retained with that application upload. This is static evidence, not a runtime test.

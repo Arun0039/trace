@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10131b">
+  <title>Trace · QA Workspace</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-mark">T</span><span>trace<span class="brand-dot">.</span><small>QA WORKSPACE</small></span></a>
+    <div class="workspace-label">WORKSPACE</div>
+    <label class="project-select-label" for="projectSelect">Active project</label>
+    <select id="projectSelect" aria-label="Select project"><option value="">Choose a project</option></select>
+    <button class="new-project side-action" id="newProjectBtn"><span>＋</span> New project</button>
+    <div class="workspace-label nav-label">MODULES</div>
+    <nav id="workspaceNavigation">
+      <button class="nav-item active" data-view="projects"><span class="nav-icon">▦</span> Project</button>
+      <button class="nav-item" data-view="dashboard"><span class="nav-icon">◫</span> Dashboard <span class="badge beta-badge">BETA</span></button>
+      <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span> Settings <span class="badge beta-badge">BETA</span></button>
+    </nav>
+    <div class="workspace-label nav-label" id="projectNavigationLabel" hidden>PROJECT</div>
+    <nav id="navigation" class="child-navigation" hidden>
+      <button class="nav-item" data-view="project-details"><span class="nav-icon">▤</span> Project details</button>
+      <button class="nav-item" data-view="requirements"><span class="nav-icon">⌑</span> Requirements <span class="nav-count" id="reqNavCount">0</span></button>
+      <button class="nav-item" data-view="cases"><span class="nav-icon">☷</span> Test cases <span class="nav-count" id="caseNavCount">0</span></button>
+      <button class="nav-item" data-view="files"><span class="nav-icon">▤</span> Project files</button>
+      <button class="nav-item" data-view="applications"><span class="nav-icon">▧</span> Applications <span class="nav-count" id="applicationNavCount">0</span></button>
+      <button class="nav-item" data-view="api-docs"><span class="nav-icon">⇄</span> API docs <span class="nav-count" id="apiDocNavCount">0</span></button>
+      <button class="nav-item" data-view="application-analysis"><span class="nav-icon">⌕</span> App analysis <span class="nav-count" id="analysisNavCount">0</span></button>
+      <button class="nav-item" data-view="bugs"><span class="nav-icon">⌁</span> Bug tracker <span class="nav-count" id="bugNavCount">0</span></button>
+    </nav>
+    <div class="workspace-label nav-label" id="settingsNavigationLabel" hidden>SETTINGS</div>
+    <nav id="settingsNavigation" class="child-navigation" hidden>
+      <button class="nav-item" data-view="settings-ai"><span class="nav-icon">✦</span> AI module</button>
+      <button class="nav-item" data-view="archive"><span class="nav-icon">▣</span> Archive</button>
+    </nav>
+    <div class="sidebar-bottom"><span class="local-indicator"></span><span>Local workspace</span><small>SQLite · private to this device</small></div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="breadcrumb"><span>Workspace</span><b>/</b><strong id="crumb">Overview</strong></div>
+      <div class="top-actions"><span class="local-pill"><i></i> LOCAL ONLY</span><button class="button button-quiet" id="exportBtn">↓ <span>Export report</span></button></div>
+    </header>
+    <section class="page" id="page">
+      <div class="welcome-empty">
+        <div class="empty-orbit">T</div>
+        <div class="eyebrow">YOUR QA CONTROL ROOM</div>
+        <h1>Clear coverage.<br><span>Confident releases.</span></h1>
+        <p>Create a project to organize requirements, test cases, execution results, and bugs in one private workspace.</p>
+        <button class="button button-primary" id="emptyCreateBtn">＋ Create your first project</button>
+        <div class="empty-note">No cloud account or external service required.</div>
+      </div>
+    </section>
+  </main>
+  <dialog id="modal">
+    <form id="modalForm" method="dialog">
+      <div class="modal-head"><div><div class="eyebrow" id="modalEyebrow">PROJECT SETUP</div><h2 id="modalTitle">Create project</h2></div><button type="button" class="close-btn" id="closeModal" aria-label="Close">×</button></div>
+      <div id="modalFields" class="form-grid"></div>
+      <div class="form-error" id="formError" role="alert"></div>
+      <div class="modal-foot"><button type="button" class="button button-quiet" id="cancelModal">Cancel</button><button class="button button-primary" id="saveModal">Save project</button></div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
