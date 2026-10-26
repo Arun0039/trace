@@ -17,6 +17,57 @@ MAX_REQUIREMENTS = 100
 MAX_DOCX_ENTRIES = 3000
 MAX_DOCX_XML_BYTES = 8 * 1024 * 1024
 WORD_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+MODULE_TYPES = ("Functional", "Non-Functional")
+NON_FUNCTIONAL_CATEGORIES = (
+    "Performance", "Security", "Usability", "Compatibility", "Reliability", "Other",
+)
+MODULE_CATEGORIES = ("Functional", *NON_FUNCTIONAL_CATEGORIES)
+_CATEGORY_HINTS = {
+    "Performance": re.compile(
+        r"\b(?:performance|latency|response time|throughput|scalab\w*|capacity|"
+        r"concurrent users?|high load|requests? per second|rps|p95|p99|"
+        r"cpu usage|memory usage|resource usage)\b",
+        re.IGNORECASE,
+    ),
+    "Security": re.compile(
+        r"\b(?:security|secure|encrypt\w*|authenticat\w*|authoriz\w*|"
+        r"access control|role-based|role based|permission|privacy|"
+        r"audit (?:log|trail)|session timeout|session expiry|token|"
+        r"password (?:hash|policy|strength)|single sign-on|sso|mfa|2fa|"
+        r"vulnerab\w*|cross-site|xss|csrf|sql injection)\b",
+        re.IGNORECASE,
+    ),
+    "Usability": re.compile(
+        r"\b(?:usability|user-friendly|user friendly|intuitive|"
+        r"accessib\w*|wcag|screen reader|locali[sz]\w*|translation|"
+        r"responsive|mobile-friendly|mobile friendly|learnab\w*|"
+        r"consistent (?:ui|navigation|layout)|ease of use)\b",
+        re.IGNORECASE,
+    ),
+    "Compatibility": re.compile(
+        r"\b(?:compatib\w*|portab\w*|browser|chrome|firefox|safari|edge|"
+        r"operating system|windows|macos|linux|ios|android|tablet|"
+        r"mobile device|screen resolution|viewport)\b",
+        re.IGNORECASE,
+    ),
+    "Reliability": re.compile(
+        r"\b(?:reliab\w*|availability|available|uptime|backup|recover\w*|"
+        r"failover|failover|retry|resilien\w*|fault[- ]toleran\w*|"
+        r"disaster recovery|data integrity|data consistency|"
+        r"sla|99\.9|high availability)\b",
+        re.IGNORECASE,
+    ),
+}
+_CATEGORY_ALIASES = {
+    "functional": "Functional",
+    "function": "Functional",
+    "fr": "Functional",
+    "non-functional": "Non-Functional",
+    "non functional": "Non-Functional",
+    "nonfunctional": "Non-Functional",
+    "nfr": "Non-Functional",
+    "quality": "Non-Functional",
+}
 REQUIREMENT_HEADING = re.compile(
     r"^\s*(?:#{1,6}\s+)?(?:(?:requirement\s+)?(REQ[-_ ]?\d+)\s*(?:[:.\-]\s*|\s+)|"
     r"\[(REQ[-_ ]?\d+)\]\s*)(.*)$",
@@ -33,6 +84,45 @@ SECTION_HEADINGS = {
     "dependency": "dependencies",
 }
 PRIORITY_PATTERN = re.compile(r"^\s*priority\s*:\s*(high|medium|low)\s*$", re.I)
+
+
+def classify_requirement_text(*parts: str) -> tuple[str, str]:
+    """Return (module type, module category) inferred from requirement text."""
+    text = "\n".join(part for part in parts if isinstance(part, str) and part)
+    if not text.strip():
+        return "Functional", "Functional"
+    scores = {category: len(pattern.findall(text)) for category, pattern in _CATEGORY_HINTS.items()}
+    order = list(_CATEGORY_HINTS)
+    best = max(order, key=lambda category: (scores[category], -order.index(category)))
+    if scores[best] > 0:
+        return "Non-Functional", best
+    return "Functional", "Functional"
+
+
+def normalize_requirement_module(
+    module_type: Any,
+    module_category: Any,
+    *fallback_parts: str,
+) -> tuple[str, str]:
+    """Normalize AI/user module values, inferring a safe classification when needed."""
+    type_value = module_type.strip().casefold() if isinstance(module_type, str) else ""
+    category_value = module_category.strip().casefold() if isinstance(module_category, str) else ""
+    type_value = _CATEGORY_ALIASES.get(type_value, type_value)
+    category_value = _CATEGORY_ALIASES.get(category_value, category_value)
+    exact_category = next(
+        (category for category in MODULE_CATEGORIES if category.casefold() == category_value),
+        "",
+    )
+    if type_value == "Functional" or exact_category == "Functional":
+        return "Functional", "Functional"
+    if type_value == "Non-Functional" or exact_category:
+        if exact_category and exact_category != "Functional":
+            return "Non-Functional", exact_category
+        inferred_type, inferred_category = classify_requirement_text(*fallback_parts)
+        if inferred_type == "Non-Functional":
+            return inferred_type, inferred_category
+        return "Non-Functional", "Other"
+    return classify_requirement_text(*fallback_parts)
 
 
 def _extract_docx(data: bytes) -> list[tuple[str, bool]]:
@@ -125,6 +215,8 @@ def extract_requirement_document(filename: str, *, content: str | None = None,
             "validation_rules_lines": [],
             "dependencies_lines": [],
             "priority": "Medium",
+            "module_type": "",
+            "module_category": "",
             "source_section": source_section[:200],
         }
 
@@ -135,6 +227,16 @@ def extract_requirement_document(filename: str, *, content: str | None = None,
         for field in ("description", "acceptance_criteria", "business_rules",
                       "validation_rules", "dependencies"):
             record[field] = "\n".join(record.pop(f"{field}_lines")).strip()
+        record["module_type"], record["module_category"] = normalize_requirement_module(
+            record.get("module_type"),
+            record.get("module_category"),
+            record["title"],
+            record["description"],
+            record["acceptance_criteria"],
+            record["business_rules"],
+            record["validation_rules"],
+            record["dependencies"],
+        )
         records.append(record)
 
     for line, is_heading in lines:
@@ -188,6 +290,18 @@ def extract_requirement_document(filename: str, *, content: str | None = None,
 
     if not records:
         raise ValueError("No requirement text was found in this document.")
+    for record in records:
+        if not record.get("module_type"):
+            record["module_type"], record["module_category"] = normalize_requirement_module(
+                record.get("module_type"),
+                record.get("module_category"),
+                record.get("title", ""),
+                record.get("description", ""),
+                record.get("acceptance_criteria", ""),
+                record.get("business_rules", ""),
+                record.get("validation_rules", ""),
+                record.get("dependencies", ""),
+            )
     if len(records) > MAX_REQUIREMENTS:
         raise ValueError(f"Document contains too many requirements (maximum {MAX_REQUIREMENTS}).")
     return text, records

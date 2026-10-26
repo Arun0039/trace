@@ -8,6 +8,14 @@ from typing import Any
 
 MAX_GENERATED_CASES = 300
 MAX_RULE_LENGTH = 2000
+TEST_TYPES = (
+    "Functional", "Negative", "Boundary", "Validation", "Permission",
+    "API", "Integration", "Performance", "Security", "Usability",
+    "Compatibility", "Reliability", "Non-Functional",
+)
+NON_FUNCTIONAL_TEST_TYPES = {
+    "Performance", "Security", "Usability", "Compatibility", "Reliability",
+}
 
 _BOUNDARY_HINTS = re.compile(
     r"\b(minimum|maximum|min|max|at least|at most|between|range|length|limit|boundary|zero)\b|"
@@ -59,6 +67,13 @@ def _case_type(text: str, *, validation: bool = False, business_rule: bool = Fal
     if business_rule:
         return "Functional"
     return "Functional"
+
+
+def _module_case_type(requirement: dict[str, Any]) -> str:
+    if str(requirement.get("module_type") or "").casefold() != "non-functional":
+        return ""
+    category = str(requirement.get("module_category") or "")
+    return category if category in NON_FUNCTIONAL_TEST_TYPES else "Non-Functional"
 
 
 def _fingerprint(requirement_id: int, case_type: str, source_text: str) -> str:
@@ -116,11 +131,23 @@ def generate_requirement_cases(requirement: dict[str, Any]) -> list[dict[str, st
         sources.append(("description", description or title, False, False))
 
     result = []
+    module_case_type = _module_case_type(requirement)
     for field, source_text, is_validation, is_business_rule in sources[:MAX_GENERATED_CASES]:
-        case_type = _case_type(
+        case_type = module_case_type or _case_type(
             source_text, validation=is_validation, business_rule=is_business_rule
         )
-        if is_validation:
+        if module_case_type:
+            label = module_case_type if module_case_type != "Non-Functional" else "non-functional"
+            scenario = f"Verify {label.lower()} requirement: {source_text}"
+            steps = (
+                f"1. Prepare the environment described for {title}.\n"
+                f"2. Exercise this condition: {source_text}\n"
+                f"3. Observe or measure the result against the stated quality target."
+            )
+            expected = (
+                f"The system meets the stated {label.lower()} requirement: {source_text}"
+            )
+        elif is_validation:
             scenario = f"Verify validation: {source_text}"
             steps = (
                 f"1. Open the feature for {title}.\n"

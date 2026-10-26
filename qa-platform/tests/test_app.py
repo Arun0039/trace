@@ -61,6 +61,20 @@ class TestCaseGeneratorTests(unittest.TestCase):
         self.assertIn("export a report", generated[0]["expected_result"])
         self.assertNotIn("permission", generated[0]["scenario"].lower())
 
+    def test_generates_non_functional_case_types_from_module_category(self):
+        generated = generate_requirement_cases({
+            "id": 2,
+            "requirement_key": "REQ-002",
+            "title": "Login latency",
+            "description": "The login page must load within 2 seconds.",
+            "module_type": "Non-Functional",
+            "module_category": "Performance",
+        })
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(generated[0]["test_type"], "Performance")
+        self.assertIn("performance", generated[0]["scenario"].lower())
+        self.assertIn("performance", generated[0]["expected_result"].lower())
+
 
 class OllamaIntegrationTests(unittest.TestCase):
     def test_connection_is_local_and_generated_cases_are_validated(self):
@@ -181,6 +195,40 @@ class OllamaIntegrationTests(unittest.TestCase):
                     "http://127.0.0.1:11434", "llama3.1:8b", [requirement], source_files
                 )
 
+    def test_requirement_module_classification_is_validated_and_inferred(self):
+        output = {"requirements": [{
+            "title": "Login page latency",
+            "description": "The login page must load within 2 seconds.",
+            "acceptance_criteria": "The page loads within 2 seconds.",
+            "business_rules": "",
+            "validation_rules": "",
+            "dependencies": "",
+            "priority": "High",
+            "module_type": "Non-Functional",
+            "module_category": "performance",
+        }]}
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(output)}
+        }):
+            requirements = generate_ollama_requirements(
+                "http://127.0.0.1:11434", "llama3.1:8b", "Login page must load in 2 seconds."
+            )
+        self.assertEqual(requirements[0]["module_type"], "Non-Functional")
+        self.assertEqual(requirements[0]["module_category"], "Performance")
+
+        output["requirements"][0].pop("module_type")
+        output["requirements"][0].pop("module_category")
+        output["requirements"][0]["title"] = "Password encryption"
+        output["requirements"][0]["description"] = "Passwords must be encrypted at rest."
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(output)}
+        }):
+            requirements = generate_ollama_requirements(
+                "http://127.0.0.1:11434", "llama3.1:8b", "Passwords must be encrypted."
+            )
+        self.assertEqual(requirements[0]["module_type"], "Non-Functional")
+        self.assertEqual(requirements[0]["module_category"], "Security")
+
 
 class RequirementDocumentTests(unittest.TestCase):
     @staticmethod
@@ -235,6 +283,25 @@ class RequirementDocumentTests(unittest.TestCase):
         self.assertIn("reset email", record["acceptance_criteria"])
         self.assertEqual(record["dependencies"], "Email service")
 
+    def test_classifies_functional_and_non_functional_requirements(self):
+        _, records = extract_requirement_document(
+            "requirements.md",
+            content=(
+                "# REQ-001: User login\nUsers can log in with email and password.\n\n"
+                "# REQ-002: Response time\nThe API response time must be under 200 milliseconds.\n\n"
+                "# REQ-003: Password storage\nPasswords must be encrypted at rest.\n\n"
+                "# REQ-004: Browser support\nThe app must work in Chrome and Firefox.\n"
+            ),
+        )
+        modules = {
+            record["requirement_key"]: (record["module_type"], record["module_category"])
+            for record in records
+        }
+        self.assertEqual(modules["REQ-001"], ("Functional", "Functional"))
+        self.assertEqual(modules["REQ-002"], ("Non-Functional", "Performance"))
+        self.assertEqual(modules["REQ-003"], ("Non-Functional", "Security"))
+        self.assertEqual(modules["REQ-004"], ("Non-Functional", "Compatibility"))
+
     def test_rejects_invalid_or_unsupported_documents(self):
         with self.assertRaisesRegex(ValueError, "valid document"):
             extract_requirement_document("broken.docx", document_data=b"not a document")
@@ -279,7 +346,8 @@ class RequirementDocumentTests(unittest.TestCase):
             with app.database(db_path) as db:
                 columns = {row["name"] for row in db.execute("PRAGMA table_info(requirements)")}
                 self.assertTrue({
-                    "business_rules", "validation_rules", "dependencies", "source_section"
+                    "business_rules", "validation_rules", "dependencies", "source_section",
+                    "module_type", "module_category",
                 }.issubset(columns))
                 case_columns = {row["name"] for row in db.execute("PRAGMA table_info(test_cases)")}
                 self.assertTrue({"test_type", "generation_key"}.issubset(case_columns))
@@ -776,6 +844,66 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(generated["count"], 2)
         self.assertTrue(all(item["requirement_id"] == requirement["id"] for item in generated["created"]))
+        self.assertIn(requirement["module_type"], {"Functional", "Non-Functional"})
+        self.assertTrue(requirement["module_category"])
+
+    def test_file_import_falls_back_to_rule_classification_when_ollama_is_unavailable(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Rule fallback", "project_key": "RULEFALL", "qa_owner": "QA"
+        })
+        with patch(
+            "app.generate_ollama_requirements",
+            side_effect=ValueError("Select an installed Ollama model."),
+        ):
+            status, imported = self.request(
+                f"/api/projects/{project['id']}/requirements/import", "POST",
+                {
+                    "filename": "security.txt",
+                    "content": "Passwords must be encrypted at rest.",
+                },
+            )
+        self.assertEqual(status, 201)
+        self.assertEqual(imported["generator"], "deterministic")
+        self.assertIn("Local AI analysis was unavailable", imported["analysis_warning"])
+        requirement = imported["created"][0]
+        self.assertEqual(requirement["module_type"], "Non-Functional")
+        self.assertEqual(requirement["module_category"], "Security")
+
+    def test_ai_requirement_classification_updates_existing_requirements(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "AI classify", "project_key": "AICLASS", "qa_owner": "QA"
+        })
+        _, functional = self.request(
+            f"/api/projects/{project['id']}/requirements", "POST",
+            {"title": "Checkout", "description": "A user can place an order."},
+        )
+        _, non_functional = self.request(
+            f"/api/projects/{project['id']}/requirements", "POST",
+            {"title": "Checkout latency", "description": "Checkout responds quickly."},
+        )
+        with patch("app.classify_ollama_requirements", return_value=[
+            {
+                "requirement_id": functional["id"],
+                "module_type": "Functional",
+                "module_category": "Functional",
+            },
+            {
+                "requirement_id": non_functional["id"],
+                "module_type": "Non-Functional",
+                "module_category": "Performance",
+            },
+        ]) as classify:
+            status, result = self.request(
+                f"/api/projects/{project['id']}/requirements/analyze", "POST", {}
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(result["updated"], 2)
+        self.assertEqual(result["functional"], 1)
+        self.assertEqual(result["non_functional"], 1)
+        self.assertEqual(classify.call_args.args[2][0]["id"], functional["id"])
+        _, requirements = self.request(f"/api/projects/{project['id']}/requirements")
+        by_id = {item["id"]: item for item in requirements}
+        self.assertEqual(by_id[non_functional["id"]]["module_category"], "Performance")
 
     def test_requirement_delete_is_project_scoped_and_unlinks_cases(self):
         _, project = self.request("/api/projects", "POST", {

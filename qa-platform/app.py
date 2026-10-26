@@ -34,6 +34,7 @@ from application_zip import (
     source_code_excerpts,
 )
 from ollama_integration import (
+    classify_requirements as classify_ollama_requirements,
     generate_test_cases as generate_ollama_test_cases,
     generate_requirements as generate_ollama_requirements,
     list_models as list_ollama_models,
@@ -41,8 +42,12 @@ from ollama_integration import (
     validate_base_url as validate_ollama_base_url,
     validate_model_name as validate_ollama_model_name,
 )
-from requirement_documents import MAX_DOCUMENT_BYTES, extract_requirement_document
-from test_case_generator import MAX_GENERATED_CASES, generate_project_cases
+from requirement_documents import (
+    MAX_DOCUMENT_BYTES,
+    extract_requirement_document,
+    normalize_requirement_module,
+)
+from test_case_generator import MAX_GENERATED_CASES, TEST_TYPES, generate_project_cases
 
 
 ROOT = Path(__file__).resolve().parent
@@ -133,6 +138,8 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
                 validation_rules TEXT NOT NULL DEFAULT '',
                 dependencies TEXT NOT NULL DEFAULT '',
                 priority TEXT NOT NULL DEFAULT 'Medium',
+                module_type TEXT NOT NULL DEFAULT 'Functional',
+                module_category TEXT NOT NULL DEFAULT 'Functional',
                 source_document TEXT NOT NULL DEFAULT '',
                 source_section TEXT NOT NULL DEFAULT '',
                 review_status TEXT NOT NULL DEFAULT 'Needs review',
@@ -147,6 +154,7 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
                 content_type TEXT NOT NULL,
                 file_size_bytes INTEGER NOT NULL,
                 requirement_count INTEGER NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
                 uploaded_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS test_cases (
@@ -262,13 +270,23 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
             row["name"] for row in db.execute("PRAGMA table_info(requirements)")
         }
         project_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
+        req_doc_columns = {row["name"] for row in db.execute("PRAGMA table_info(requirement_documents)")}
+        if "version" not in req_doc_columns:
+            db.execute("ALTER TABLE requirement_documents ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
         if "product_type" not in project_columns:
             db.execute("ALTER TABLE projects ADD COLUMN product_type TEXT NOT NULL DEFAULT ''")
         if "status" not in project_columns:
             db.execute("ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
-        for column in ("business_rules", "validation_rules", "dependencies", "source_section"):
+        for column, declaration in (
+            ("business_rules", "TEXT NOT NULL DEFAULT ''"),
+            ("validation_rules", "TEXT NOT NULL DEFAULT ''"),
+            ("dependencies", "TEXT NOT NULL DEFAULT ''"),
+            ("source_section", "TEXT NOT NULL DEFAULT ''"),
+            ("module_type", "TEXT NOT NULL DEFAULT 'Functional'"),
+            ("module_category", "TEXT NOT NULL DEFAULT 'Functional'"),
+        ):
             if column not in requirement_columns:
-                db.execute(f"ALTER TABLE requirements ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+                db.execute(f"ALTER TABLE requirements ADD COLUMN {column} {declaration}")
         case_columns = {row["name"] for row in db.execute("PRAGMA table_info(test_cases)")}
         for column, declaration in (
             ("test_type", "TEXT NOT NULL DEFAULT 'Functional'"),
@@ -324,6 +342,9 @@ def next_key(db: sqlite3.Connection, table: str, col: str, project_id: int, pref
 
 def validate_text(data, field: str, required: bool = False, limit: int = 12000) -> str:
     value = data.get(field, "")
+    # parse_qs returns lists; unwrap single-element lists transparently
+    if isinstance(value, list):
+        value = value[0] if value else ""
     if not isinstance(value, str):
         raise ValueError(f"{field.replace('_', ' ').capitalize()} must be text.")
     value = value.strip()
@@ -580,7 +601,8 @@ def application_analysis_dict(row: sqlite3.Row) -> dict:
 def requirements_signature(db: sqlite3.Connection, project_id: int) -> str:
     rows = db.execute(
         """SELECT requirement_key,title,description,acceptance_criteria,business_rules,
-        validation_rules,dependencies,priority FROM requirements WHERE project_id=? ORDER BY id""",
+        validation_rules,dependencies,priority,module_type,module_category
+        FROM requirements WHERE project_id=? ORDER BY id""",
         (project_id,),
     )
     content = json.dumps([list(row) for row in rows], ensure_ascii=False, separators=(",", ":"))
@@ -1279,7 +1301,7 @@ class QAHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 5 and parts[3:5] == ["requirements", "documents"]:
                 documents = db.execute(
-                    """SELECT id,filename,content_type,file_size_bytes,requirement_count,uploaded_at
+                    """SELECT id,filename,content_type,file_size_bytes,requirement_count,version,uploaded_at
                     FROM requirement_documents WHERE project_id=? ORDER BY id DESC""",
                     (pid,),
                 ).fetchall()
@@ -1308,7 +1330,8 @@ class QAHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[3] == "test-cases":
                 self.send_json([dict(r) for r in db.execute(
-                    """SELECT tc.*, r.requirement_key, COALESCE(e.status, 'Not Executed') status,
+                    """SELECT tc.*, r.requirement_key, r.module_type, r.module_category,
+                    COALESCE(e.status, 'Not Executed') status,
                     COALESCE(e.actual_result, '') actual_result, COALESCE(e.comments, '') comments,
                     e.id execution_id, e.executed_at,
                     (SELECT COUNT(*) FROM execution_evidence ev WHERE ev.execution_id=e.id) evidence_count,
@@ -1538,14 +1561,26 @@ class QAHandler(BaseHTTPRequestHandler):
                 )
                 return
             key = next_key(db, "requirements", "requirement_key", pid, "REQ")
+            module_type, module_category = normalize_requirement_module(
+                data.get("module_type"),
+                data.get("module_category"),
+                title,
+                requirement["description"],
+                requirement["acceptance_criteria"],
+                requirement["business_rules"],
+                requirement["validation_rules"],
+                requirement["dependencies"],
+            )
             cur = db.execute(
                 """INSERT INTO requirements(project_id,requirement_key,title,description,acceptance_criteria,
-                business_rules,validation_rules,dependencies,priority,source_document,source_section,
-                review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                business_rules,validation_rules,dependencies,priority,module_type,module_category,
+                source_document,source_section,review_status,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (pid, key, title, requirement["description"], requirement["acceptance_criteria"],
                  requirement["business_rules"], requirement["validation_rules"],
                  requirement["dependencies"],
                  self.choice(data, "priority", ("High", "Medium", "Low"), "Medium"),
+                 module_type, module_category,
                  validate_text(data, "source_document", limit=200),
                  validate_text(data, "source_section", limit=200), "Needs review", now),
             )
@@ -1579,18 +1614,35 @@ class QAHandler(BaseHTTPRequestHandler):
                 document_text, records = extract_requirement_document(filename, content=content)
                 original = content.encode("utf-8")
                 content_type = "text/markdown" if suffix == ".md" else "text/plain"
-            generator = data.get("generator", "deterministic")
-            if generator == "ollama":
+            generator = data.get("generator", "auto")
+            if generator not in {"auto", "ollama", "deterministic"}:
+                raise ValueError("Requirement generator must be auto, ollama, or deterministic.")
+            analysis_warning = ""
+            if generator in {"auto", "ollama"}:
                 ai_settings = db.execute(
                     "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
                 ).fetchone()
-                records = generate_ollama_requirements(
-                    ai_settings["ollama_base_url"],
-                    ai_settings["ollama_model"],
-                    document_text,
-                )
-            elif generator != "deterministic":
-                raise ValueError("Requirement generator must be deterministic or ollama.")
+                # If user explicitly requested ollama but model is not configured, give a helpful error
+                if generator == "ollama" and not ai_settings["ollama_model"]:
+                    raise ValueError(
+                        "No Ollama model is configured. Open Settings → AI module, connect to Ollama, "
+                        "and select an installed model before using AI analysis."
+                    )
+                try:
+                    records = generate_ollama_requirements(
+                        ai_settings["ollama_base_url"],
+                        ai_settings["ollama_model"],
+                        document_text,
+                    )
+                    generator = "ollama"
+                except ValueError as exc:
+                    if generator == "ollama":
+                        raise
+                    generator = "deterministic"
+                    analysis_warning = (
+                        "Local AI analysis was unavailable, so requirements were extracted and "
+                        f"classified by rule ({exc})"
+                    )
             filename = Path(filename).name
             document_id = uuid.uuid4().hex
             safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:160] or "requirements"
@@ -1600,6 +1652,12 @@ class QAHandler(BaseHTTPRequestHandler):
             )
             document_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = document_path.with_name(f".{document_id}.tmp")
+            # Determine version number for this filename
+            existing_versions = db.execute(
+                "SELECT MAX(version) FROM requirement_documents WHERE project_id=? AND filename=?",
+                (pid, filename),
+            ).fetchone()
+            doc_version = (existing_versions[0] or 0) + 1
             try:
                 with temp_path.open("xb") as output:
                     output.write(original)
@@ -1624,16 +1682,27 @@ class QAHandler(BaseHTTPRequestHandler):
                         raise ValueError(f"Requirement ID {key} already exists in this project.")
                     seen_keys.add(key)
                     seen_fingerprints.add(fingerprint)
+                    module_type, module_category = normalize_requirement_module(
+                        record.get("module_type"),
+                        record.get("module_category"),
+                        record.get("title", ""),
+                        record.get("description", ""),
+                        record.get("acceptance_criteria", ""),
+                        record.get("business_rules", ""),
+                        record.get("validation_rules", ""),
+                        record.get("dependencies", ""),
+                    )
                     cur = db.execute(
                         """INSERT INTO requirements
                         (project_id,requirement_key,title,description,acceptance_criteria,
-                        business_rules,validation_rules,dependencies,priority,source_document,
-                        source_section,review_status,created_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        business_rules,validation_rules,dependencies,priority,module_type,
+                        module_category,source_document,source_section,review_status,created_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             pid, key, record["title"], record["description"],
                             record["acceptance_criteria"], record["business_rules"],
                             record["validation_rules"], record["dependencies"], record["priority"],
+                            module_type, module_category,
                             filename, record.get("source_section", record["title"]), "Needs review", now,
                         ),
                     )
@@ -1642,12 +1711,12 @@ class QAHandler(BaseHTTPRequestHandler):
                     ).fetchone()))
                 cursor = db.execute(
                     """INSERT INTO requirement_documents
-                    (project_id,filename,storage_path,content_type,file_size_bytes,requirement_count,uploaded_at)
-                    VALUES(?,?,?,?,?,?,?)""",
-                    (pid, filename, str(document_path), content_type, len(original), len(created), now),
+                    (project_id,filename,storage_path,content_type,file_size_bytes,requirement_count,version,uploaded_at)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (pid, filename, str(document_path), content_type, len(original), len(created), doc_version, now),
                 )
                 document = db.execute(
-                    """SELECT id,filename,content_type,file_size_bytes,requirement_count,uploaded_at
+                    """SELECT id,filename,content_type,file_size_bytes,requirement_count,version,uploaded_at
                     FROM requirement_documents WHERE id=?""", (cursor.lastrowid,)
                 ).fetchone()
             except Exception:
@@ -1657,11 +1726,59 @@ class QAHandler(BaseHTTPRequestHandler):
             self.send_json({
                 "created": created,
                 "count": len(created),
+                "functional_count": sum(
+                    1 for item in created if item["module_type"] == "Functional"
+                ),
+                "non_functional_count": sum(
+                    1 for item in created if item["module_type"] == "Non-Functional"
+                ),
                 "skipped_duplicates": skipped_duplicates,
                 "total_extracted": len(records),
                 "generator": generator,
+                "analysis_warning": analysis_warning,
                 "document": dict(document),
             }, 201)
+            return
+        if parts[3] == "requirements" and len(parts) == 5 and parts[4] == "analyze":
+            requirements = [
+                dict(row) for row in db.execute(
+                    "SELECT * FROM requirements WHERE project_id=? ORDER BY id", (pid,)
+                )
+            ]
+            if not requirements:
+                raise ValueError("Add or import requirements before running AI classification.")
+            ai_settings = db.execute(
+                "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
+            ).fetchone()
+            classifications = classify_ollama_requirements(
+                ai_settings["ollama_base_url"],
+                ai_settings["ollama_model"],
+                requirements,
+            )
+            for entry in classifications:
+                db.execute(
+                    """UPDATE requirements SET module_type=?,module_category=?
+                    WHERE id=? AND project_id=?""",
+                    (
+                        entry["module_type"],
+                        entry["module_category"],
+                        entry["requirement_id"],
+                        pid,
+                    ),
+                )
+            updated = [
+                dict(row) for row in db.execute(
+                    "SELECT * FROM requirements WHERE project_id=? ORDER BY id", (pid,)
+                )
+            ]
+            self.send_json({
+                "updated": len(classifications),
+                "functional": sum(1 for item in updated if item["module_type"] == "Functional"),
+                "non_functional": sum(
+                    1 for item in updated if item["module_type"] == "Non-Functional"
+                ),
+                "requirements": updated,
+            })
             return
         if parts[3] == "api-docs" and len(parts) == 5 and parts[4] == "import":
             filename = validate_text(data, "filename", True, 200)
@@ -1713,6 +1830,11 @@ class QAHandler(BaseHTTPRequestHandler):
                 ai_settings = db.execute(
                     "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
                 ).fetchone()
+                if not ai_settings["ollama_model"]:
+                    raise ValueError(
+                        "No Ollama model is configured. Open Settings → AI module, connect to Ollama, "
+                        "and select an installed model before using AI generation."
+                    )
                 generated_cases = generate_ollama_test_cases(
                     ai_settings["ollama_base_url"],
                     ai_settings["ollama_model"],
@@ -1796,8 +1918,7 @@ class QAHandler(BaseHTTPRequestHandler):
                 test_type,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (pid, req_id, key, scenario, validate_text(data, "description"), validate_text(data, "steps"),
                  validate_text(data, "expected_result"),
-                 self.choice(data, "test_type", ("Functional", "Negative", "Boundary", "Validation",
-                     "Permission", "API", "Integration"), "Functional"), now, now),
+                 self.choice(data, "test_type", TEST_TYPES, "Functional"), now, now),
             )
             self.send_json(row_dict(db.execute("SELECT * FROM test_cases WHERE id=?", (cur.lastrowid,)).fetchone()), 201)
             return
@@ -1915,6 +2036,16 @@ class QAHandler(BaseHTTPRequestHandler):
             ]
             updated_content = dict(row)
             updated_content.update(dict(zip(editable_fields, vals)))
+            module_type, module_category = normalize_requirement_module(
+                data.get("module_type", row["module_type"]),
+                data.get("module_category", row["module_category"]),
+                updated_content["title"],
+                updated_content["description"],
+                updated_content["acceptance_criteria"],
+                updated_content["business_rules"],
+                updated_content["validation_rules"],
+                updated_content["dependencies"],
+            )
             duplicate = find_duplicate_requirement(db, pid, updated_content, exclude_id=record)
             if duplicate:
                 self.send_json(
@@ -1926,9 +2057,9 @@ class QAHandler(BaseHTTPRequestHandler):
             review = self.choice(data, "review_status", ("Needs review", "Reviewed"), row["review_status"])
             db.execute(
                 """UPDATE requirements SET title=?,description=?,acceptance_criteria=?,business_rules=?,
-                validation_rules=?,dependencies=?,source_section=?,priority=?,review_status=?
-                WHERE id=? AND project_id=?""",
-                (*vals, priority, review, record, pid),
+                validation_rules=?,dependencies=?,source_section=?,priority=?,module_type=?,
+                module_category=?,review_status=? WHERE id=? AND project_id=?""",
+                (*vals, priority, module_type, module_category, review, record, pid),
             )
         elif kind == "test-cases":
             row = db.execute("SELECT * FROM test_cases WHERE id=? AND project_id=?", (record, pid)).fetchone()
@@ -1940,8 +2071,7 @@ class QAHandler(BaseHTTPRequestHandler):
             steps = validate_text(data, "steps") if "steps" in data else row["steps"]
             expected = validate_text(data, "expected_result") if "expected_result" in data else row["expected_result"]
             test_type = self.choice(
-                data, "test_type", ("Functional", "Negative", "Boundary", "Validation",
-                    "Permission", "API", "Integration"), row["test_type"]
+                data, "test_type", TEST_TYPES, row["test_type"]
             )
             req_id = self.optional_requirement(db, data.get("requirement_id"), pid) if "requirement_id" in data else row["requirement_id"]
             db.execute(
@@ -2006,10 +2136,12 @@ class QAHandler(BaseHTTPRequestHandler):
         writer.writerow(["Project", self.csv_cell(project["name"]), "Key", self.csv_cell(project["project_key"]),
                          "Version", self.csv_cell(project["version"])])
         writer.writerow([])
-        writer.writerow(["Case ID", "Requirement ID", "Scenario", "Description", "Steps", "Expected Result",
+        writer.writerow(["Case ID", "Requirement ID", "Module Type", "Module Category", "Scenario",
+                         "Description", "Steps", "Expected Result",
                          "Actual Result", "Status", "Comments", "Evidence references"])
         for row in db.execute(
-            """SELECT tc.case_key, r.requirement_key, tc.scenario, tc.description, tc.steps, tc.expected_result,
+            """SELECT tc.case_key, r.requirement_key, COALESCE(r.module_type,''),
+            COALESCE(r.module_category,''), tc.scenario, tc.description, tc.steps, tc.expected_result,
             COALESCE(e.actual_result,''), COALESCE(e.status,'Not Executed'), COALESCE(e.comments,''),
             (SELECT group_concat(ev.id || ':' || ev.filename, '; ') FROM execution_evidence ev WHERE ev.execution_id=e.id)
             FROM test_cases tc LEFT JOIN requirements r ON r.id=tc.requirement_id
@@ -2018,9 +2150,11 @@ class QAHandler(BaseHTTPRequestHandler):
         ):
             writer.writerow([self.csv_cell(value) for value in row])
         writer.writerow([])
-        writer.writerow(["Requirement ID", "Requirement", "Mapped Test Cases", "Coverage"])
+        writer.writerow(["Requirement ID", "Module Type", "Module Category", "Requirement",
+                         "Mapped Test Cases", "Coverage"])
         for row in db.execute(
-            """SELECT r.requirement_key,r.title,COUNT(tc.id),CASE WHEN COUNT(tc.id)>0 THEN 'Covered' ELSE 'Not Covered' END
+            """SELECT r.requirement_key,r.module_type,r.module_category,r.title,COUNT(tc.id),
+            CASE WHEN COUNT(tc.id)>0 THEN 'Covered' ELSE 'Not Covered' END
             FROM requirements r LEFT JOIN test_cases tc ON tc.requirement_id=r.id
             WHERE r.project_id=? GROUP BY r.id ORDER BY r.id""", (pid,)
         ):
