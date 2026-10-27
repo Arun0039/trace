@@ -1,4 +1,4 @@
-/* ── FrameTest AI · app.js ──────────────────────────────────────────────
+/* ── Trace · app.js ────────────────────────────────────────────────────
    Single-file vanilla JS frontend.
    Every view renders into #page. Navigation is handled by state.view.
    All API calls go to the Python backend at the same origin.
@@ -20,17 +20,28 @@ const S = {
   project: null,
   projects: [],
   requirements: [],
+  requirementSuggestions: [],
   requirementDocs: [],
+  brdAnalysis: null,
   cases: [],
   bugs: [],
   apiDocs: [],
   applications: [],
   analyses: [],
   reaRuntime: null,
-  aiSettings: { ollama_base_url: "http://127.0.0.1:11434", ollama_model: "" },
-  ollamaModels: [],
-  ollamaStatus: "",
+  aiSettings: {
+    provider: "local",
+    model: "deterministic",
+    configured: true,
+    providers: [],
+  },
+  auth: { authenticated: false, admin_configured: false },
+  aiDraft: null,
+  aiStatus: "",
   caseGenerator: "deterministic",
+  assistedInput: "",
+  assistedCategories: ["Functional", "Non-Functional", "Sanity", "Smoke"],
+  assistedAnalysis: null,
   inventoryVisible: {},
 };
 
@@ -49,7 +60,11 @@ async function api(path, opts = {}) {
   }
   const ct = res.headers.get("content-type") || "";
   const data = ct.includes("application/json") ? await res.json() : null;
-  if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const error = new Error(data?.error || `Request failed (${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 
@@ -76,9 +91,10 @@ function pp(suffix) { return `/api/projects/${S.project.id}/${suffix}`; }
 
 /* ── Load everything from the backend ────────────────────────────── */
 async function loadProjects(preferred) {
-  [S.projects, S.aiSettings] = await Promise.all([
+  [S.projects, S.aiSettings, S.auth] = await Promise.all([
     api("/api/projects"),
     api("/api/ai/settings"),
+    api("/api/auth/status"),
   ]);
   const sel = $("#projectSelect");
   if (sel) {
@@ -94,11 +110,19 @@ async function loadProjects(preferred) {
 
 async function refresh() {
   if (!S.project) return render();
+  const suggestionsRequest = api(pp("requirements/suggestions")).catch(error => {
+    if (error.status !== 404) throw error;
+    const message = "This server does not support requirement suggestions. Stop it, start qa-platform\\start-qa-platform.bat, then refresh.";
+    console.warn(message);
+    toast(message);
+    return [];
+  });
   [
-    S.requirements, S.requirementDocs, S.cases, S.bugs,
+    S.requirements, S.requirementSuggestions, S.requirementDocs, S.cases, S.bugs,
     S.apiDocs, S.applications, S.analyses,
   ] = await Promise.all([
     api(pp("requirements")),
+    suggestionsRequest,
     api(pp("requirements/documents")),
     api(pp("test-cases")),
     api(pp("bugs")),
@@ -206,8 +230,8 @@ async function render() {
 
   /* ── Project workspace ── */
   const p = S.project;
-  const genReady = S.requirements.length > 0;
-  const genOk = S.caseGenerator !== "ollama" || Boolean(S.aiSettings.ollama_model);
+  const genReady = S.requirements.some(r => r.review_status === "Reviewed");
+  const genOk = S.caseGenerator === "deterministic" || Boolean(S.aiSettings.configured);
 
   const extraActions =
     S.view === "requirements"
@@ -421,7 +445,7 @@ async function overviewView() {
             <span class="badge badge-green">ACTIVE</span>
           </div>
           <div class="info-box">
-            <strong>FrameTest AI workflow</strong><br>
+            <strong>Trace workflow</strong><br>
             1. Upload BRD → 2. Review requirements → 3. Generate test cases → 4. Execute &amp; track
             <br><br>
             <button class="act-btn" id="goBrd">Upload BRD →</button>
@@ -432,6 +456,84 @@ async function overviewView() {
 }
 
 /* ── BRD Documents ────────────────────────────────────────────────── */
+function brdAnalysisView() {
+  const selected = S.brdAnalysis;
+  if (!selected) return "";
+  const report = selected.analysis;
+  const docId = selected.documentId;
+  return `
+    <div class="panel brd-analysis">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">BRD analysis · ${esc(selected.filename)}</div>
+          <div class="panel-sub">${esc(report.summary)}</div>
+        </div>
+        <a class="btn btn-ghost" href="/api/projects/${S.project.id}/requirements/documents/${docId}/analysis.md">Download Markdown</a>
+      </div>
+      <div class="info-box">
+        <strong>${esc(report.analysis_status || "NEEDS REVIEW")}</strong> · This analysis is an AI interpretation, not a confirmed requirement source. Only records shown as EXTRACTED below are rule-based requirements.
+      </div>
+      ${brdReportMarkup(report)}
+    </div>`;
+}
+
+function requirementSuggestionsView() {
+  const cards = S.requirementSuggestions.map(suggestion => {
+    const content = suggestion.content;
+    const related = S.requirements.find(item => item.id === suggestion.related_requirement_id);
+    const history = (suggestion.history || []).map(entry =>
+      `<li>${esc(entry.action)} · ${esc(entry.reviewer)} · ${fmtDate(entry.created_at)}</li>`
+    ).join("");
+    return `
+      <article class="brd-preview-item suggestion-card">
+        <div class="brd-preview-item-head">
+          <span class="badge badge-amber">AI SUGGESTION</span>
+          <span class="badge ${suggestion.status === "Accepted" ? "badge-green" : suggestion.status === "Rejected" ? "badge-red" : "badge-amber"}">${esc(suggestion.status)}</span>
+        </div>
+        <h3>${esc(content.title)}</h3>
+        ${content.description ? `<p>${pretty(content.description)}</p>` : ""}
+        ${content.acceptance_criteria ? `<p><strong>Acceptance criteria:</strong><br>${pretty(content.acceptance_criteria)}</p>` : ""}
+        ${content.business_rules ? `<p><strong>Business rules:</strong><br>${pretty(content.business_rules)}</p>` : ""}
+        ${content.validation_rules ? `<p><strong>Validation:</strong><br>${pretty(content.validation_rules)}</p>` : ""}
+        ${content.dependencies ? `<p><strong>Dependencies:</strong><br>${pretty(content.dependencies)}</p>` : ""}
+        <p><strong>Reason:</strong> ${esc(suggestion.reason)}</p>
+        <p><strong>Related requirement:</strong> ${related ? `${esc(related.requirement_key)} · ${esc(related.title)}` : esc(suggestion.related_requirement_key || "None identified")}
+          · <strong>Source reference:</strong> ${esc(suggestion.source_reference || "No exact source reference identified")}</p>
+        ${suggestion.source_evidence ? `<blockquote class="source-evidence">${esc(suggestion.source_evidence)}</blockquote>` : ""}
+        ${suggestion.status === "Pending" ? `
+          <div class="row-actions suggestion-actions">
+            <button class="act-btn suggestion-accept" data-id="${suggestion.id}">Accept</button>
+            <button class="act-btn suggestion-edit-toggle" data-id="${suggestion.id}">Edit</button>
+            <button class="act-btn act-btn-danger suggestion-reject" data-id="${suggestion.id}">Reject</button>
+          </div>
+          <details class="suggestion-editor" id="suggestion-editor-${suggestion.id}">
+            <summary>Edit proposed content before saving</summary>
+            ${["title", "description", "acceptance_criteria", "business_rules", "validation_rules", "dependencies"].map(field => `
+              <label class="field full">
+                <span>${esc(field.replace(/_/g, " "))}</span>
+                ${field === "title"
+                  ? `<input class="suggestion-field" data-field="${field}" value="${esc(content[field] || "")}">`
+                  : `<textarea class="suggestion-field" data-field="${field}">${esc(content[field] || "")}</textarea>`}
+              </label>`).join("")}
+            <button class="btn btn-primary suggestion-save" data-id="${suggestion.id}">Save edit</button>
+          </details>` : ""}
+        ${history ? `<details><summary>Approval history</summary><ul>${history}</ul></details>` : ""}
+      </article>`;
+  }).join("");
+  return `
+    <div class="panel">
+      <div class="panel-head">
+        <div><div class="panel-title">AI suggestion review</div>
+          <div class="panel-sub">Suggestions remain separate from extracted requirements and are excluded from test generation until explicitly accepted.</div>
+        </div>
+        <span class="badge">${S.requirementSuggestions.filter(item => item.status === "Pending").length} pending</span>
+      </div>
+      <div class="brd-preview-list">
+        ${cards || '<p class="empty-row">No AI suggestions are waiting for review.</p>'}
+      </div>
+    </div>`;
+}
+
 function brdView() {
   const docs = S.requirementDocs.map(d => `
     <tr>
@@ -439,19 +541,21 @@ function brdView() {
         <strong class="cell-main">${esc(d.filename)}</strong>
         <span class="cell-sub">v${d.version || 1} · ${d.requirement_count} requirements extracted</span>
       </td>
-      <td><span class="badge badge-blue">${esc(d.content_type.includes("docx") ? "DOCX" : d.content_type.includes("pdf") ? "PDF" : "TXT/MD")}</span></td>
+      <td><span class="badge badge-blue">${esc(d.content_type.includes("docx") ? "DOCX" : d.content_type.includes("pdf") ? "PDF" : d.content_type.includes("csv") ? "CSV" : "TXT/MD")}</span></td>
       <td class="mono">${(d.file_size_bytes / 1024).toFixed(1)} KB</td>
       <td>${fmtDate(d.uploaded_at)}</td>
       <td><div class="row-actions">
         <a class="act-btn" href="/api/projects/${S.project.id}/requirements/documents/${d.id}">Download</a>
+        ${d.has_analysis ? `<button class="act-btn view-brd-analysis" data-id="${d.id}" data-filename="${esc(d.filename)}">View analysis</button>
+          <a class="act-btn" href="/api/projects/${S.project.id}/requirements/documents/${d.id}/analysis.md">Markdown</a>` : ""}
       </div></td>
     </tr>`).join("");
   return `
     <div class="workflow-box panel">
       <div class="panel-title">Upload Business Requirements Document</div>
       <div class="panel-sub" style="margin-bottom:12px">
-        Supported formats: DOCX, TXT, Markdown. Ollama will extract and structure requirements automatically.
-        Falls back to rule-based extraction if Ollama is unavailable.
+        Supported formats: PDF, DOCX, CSV, TXT, and Markdown. Rule-based extraction alone creates confirmed requirements with source evidence.
+        AI can provide a separate use-case analysis and suggestions; every suggestion requires an explicit reviewer decision before it can be used for test generation.
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary" id="uploadBrdBtn">↑ Upload BRD file</button>
@@ -463,6 +567,8 @@ function brdView() {
         <button class="btn btn-primary" id="pasteBtn">Analyze with AI</button>
       </details>
     </div>
+    ${brdAnalysisView()}
+    ${requirementSuggestionsView()}
     <div class="panel">
       <div class="panel-head">
         <div><div class="panel-title">Uploaded documents</div><div class="panel-sub">Original files are stored in project storage with version tracking.</div></div>
@@ -480,14 +586,20 @@ function brdView() {
 /* ── Requirements ─────────────────────────────────────────────────── */
 function requirementsView() {
   const rows = S.requirements.map(r => `
-    <tr data-search="${esc(`${r.requirement_key} ${r.title} ${r.description} ${r.module_type || ""}`.toLowerCase())}">
+    <tr data-search="${esc(`${r.requirement_key} ${r.title} ${r.description} ${r.requirement_type || ""} ${r.module_type || ""} ${r.scope_classification || ""}`.toLowerCase())}">
       <td><span class="mono cell-main">${esc(r.requirement_key)}</span><span class="cell-sub">${esc(r.title)}</span></td>
-      <td><span class="badge ${r.module_type === "Non-Functional" ? "badge-purple" : "badge-blue"}">${esc(r.module_type || "Functional")}</span></td>
+      <td>
+        <span class="badge ${r.module_type === "Non-Functional" ? "badge-purple" : "badge-blue"}">${esc(r.requirement_type || "Functional Requirement")}</span>
+        <span class="cell-sub">${esc(r.module_type || "Functional")}</span>
+      </td>
       <td>${esc(r.module_category || "Functional")}</td>
       <td><span class="badge ${r.priority === "High" ? "badge-red" : r.priority === "Low" ? "badge-muted" : "badge-amber"}">${esc(r.priority)}</span></td>
       <td><span class="badge ${r.test_case_count ? "badge-green" : "badge-muted"}">${r.test_case_count ? `${r.test_case_count} linked` : "Not covered"}</span></td>
-      <td><span class="badge ${r.review_status === "Reviewed" ? "badge-green" : "badge-amber"}">${esc(r.review_status)}</span></td>
-      <td class="mono" style="color:var(--muted)">${esc(r.source_document || "Manual")}</td>
+      <td><span class="badge ${r.review_status === "Reviewed" ? "badge-green" : r.review_status === "Rejected" ? "badge-red" : "badge-amber"}">${esc(r.review_status)}</span></td>
+      <td class="mono" style="color:var(--muted)">${esc(r.source_document || "Manual")}
+        <span class="cell-sub"><span class="badge ${r.origin === "extracted" ? "badge-green" : r.origin === "ai_suggestion" ? "badge-amber" : "badge-muted"}">${r.origin === "extracted" ? "EXTRACTED" : r.origin === "ai_suggestion" ? "AI SUGGESTION · APPROVED" : r.origin === "legacy_import" ? "LEGACY IMPORT · VERIFY ORIGIN" : "MANUAL"}</span></span>
+        ${r.source_evidence ? `<span class="cell-sub">${esc(r.source_evidence.slice(0, 220))}</span>` : ""}
+      </td>
       <td><div class="row-actions">
         <button class="act-btn edit-req" data-id="${r.id}">Edit</button>
         <button class="act-btn act-btn-danger del-req" data-id="${r.id}">Delete</button>
@@ -497,7 +609,7 @@ function requirementsView() {
     <div class="workflow-box panel info-box" style="margin-bottom:14px">
       <strong>Step 1 — Provide requirement source</strong><br>
       Upload a BRD from the <button class="act-btn" id="goBrdFromReq">BRD Documents</button> section or add requirements manually below.
-      Requirements extracted by AI need QA review before test-case generation.
+      Review each requirement and mark it <strong>Reviewed</strong> to approve it for test-case generation.
     </div>
     <div class="filter-row">
       <input class="search-input" id="searchTable" placeholder="⌕  Search requirements…">
@@ -512,17 +624,45 @@ function requirementsView() {
 
 /* ── Test Cases ───────────────────────────────────────────────────── */
 function casesView() {
-  const genOk = S.caseGenerator !== "ollama" || Boolean(S.aiSettings.ollama_model);
-  const aiMsg = S.caseGenerator === "ollama" && !S.aiSettings.ollama_model
-    ? '<div class="info-box warn-box" style="margin-top:8px">Configure an Ollama model in <button class="act-btn" id="goAiSettings">Settings → AI Module</button> to enable AI generation.</div>' : "";
+  const genOk = S.caseGenerator === "deterministic" || Boolean(S.aiSettings.configured);
+  const provider = S.aiSettings.providers?.find(item => item.id === S.aiSettings.provider);
+  const assistedGenOk = Boolean(S.aiSettings.configured && provider?.id !== "local");
+  const reviewedRequirementCount = S.requirements.filter(r => r.review_status === "Reviewed").length;
+  const unreviewedRequirementCount = S.requirements.length - reviewedRequirementCount;
+  const aiMsg = S.caseGenerator !== "deterministic" && !S.aiSettings.configured
+    ? `<div class="info-box warn-box" style="margin-top:8px">Configure ${esc(provider?.name || "the selected AI provider")} in <button class="act-btn" id="goAiSettings">Settings → AI Module</button> to enable AI generation.</div>` : "";
+  const assistedAnalysis = S.assistedAnalysis
+    ? `<div class="info-box" style="margin-top:12px">
+        <strong>AI analysis · review before approval</strong>
+        <div class="panel-sub">Explicit input facts are separated from AI assumptions and recommendations. Cases remain editable drafts.</div>
+        ${S.assistedAnalysis.explicit_facts?.length ? `<p><strong>Explicitly stated</strong><br>${S.assistedAnalysis.explicit_facts.map(esc).join("<br>")}</p>` : ""}
+        ${S.assistedAnalysis.category_assessment?.length ? `<p><strong>Category applicability</strong><br>${S.assistedAnalysis.category_assessment.map(item => `${esc(item.category)}: ${item.applicable ? "Applicable" : "Not applicable"} — ${esc(item.reason)}`).join("<br>")}</p>` : ""}
+        ${[
+          ["Clarification questions", "clarification_questions"],
+          ["Assumptions", "assumptions"],
+          ["Traceability warnings", "traceability_warnings"],
+          ["Coverage gaps", "coverage_gaps"],
+          ["Duplicates or overlap", "duplicates"],
+          ["Unclear or conflicting", "unclear_or_conflicting"],
+          ["Additional recommendations", "additional_recommendations"],
+        ].filter(([, key]) => S.assistedAnalysis[key]?.length).map(([label, key]) =>
+          `<p><strong>${label}</strong><br>${S.assistedAnalysis[key].map(esc).join("<br>")}</p>`).join("")}
+      </div>` : "";
   const rows = S.cases.map(c => `
-    <tr data-search="${esc(`${c.case_key} ${c.scenario} ${c.requirement_key || ""} ${c.test_type}`.toLowerCase())}">
+    <tr data-search="${esc(`${c.case_key} ${c.title || ""} ${c.scenario} ${c.requirement_key || ""} ${c.use_case_id || ""} ${c.test_type} ${c.test_category || ""} ${c.classification || ""} ${c.status} ${c.priority} ${c.preconditions || ""} ${c.test_data || ""} ${c.assumptions || ""} ${c.source_reference || ""}`.toLowerCase())}">
       <td class="mono">${esc(c.case_key)}<br>${c.generation_key ? '<span class="gen-label">AI DRAFT</span>' : ""}</td>
-      <td class="mono">${esc(c.requirement_key || "—")}</td>
-      <td><span class="badge">${esc(c.test_type || "Functional")}</span></td>
-      <td>${esc(c.scenario)}</td>
+      <td class="mono">${esc(c.requirement_key || "—")}
+        ${(c.requirement_origin || c.requirement_current_origin) === "ai_suggestion" ? `<span class="cell-sub"><span class="badge badge-amber">AI APPROVED · ${esc(c.requirement_approval_status || c.requirement_current_approval_status || "Reviewed")}</span></span>` : (c.requirement_origin || c.requirement_current_origin) === "extracted" ? '<span class="cell-sub"><span class="badge badge-green">EXTRACTED</span></span>' : ""}
+      </td>
+      <td class="mono">${esc(c.use_case_id || "—")}</td>
+      <td><span class="badge">${esc(c.test_category || "Functional")}</span><span class="cell-sub">${esc(c.test_type || "Functional")} · ${esc(c.classification || "Unclassified")}</span></td>
+      <td><span class="badge">${esc(c.priority || "Not specified")}</span></td>
+      <td><strong>${esc(c.title || c.scenario)}</strong><span class="cell-sub">${esc(c.scenario)}</span></td>
+      <td class="case-long">${pretty(c.preconditions || "—")}</td>
+      <td class="case-long">${pretty(c.test_data || "—")}</td>
       <td class="case-long">${pretty(c.steps || "—")}</td>
       <td class="case-long">${pretty(c.expected_result || "—")}</td>
+      <td class="case-long">${c.assumptions ? `<strong>Assumptions</strong><br>${pretty(c.assumptions)}<br>` : ""}${c.source_reference ? `<strong>Source</strong><br>${pretty(c.source_reference)}` : "—"}</td>
       <td>
         <select class="exec-select" data-id="${c.id}" aria-label="Status for ${esc(c.case_key)}">
           ${["Not Executed","In Progress","Pass","Fail","Blocked","Skipped"].map(s =>
@@ -539,33 +679,62 @@ function casesView() {
     </tr>`).join("");
   return `
     <div class="gen-note info-box">
-      <strong>Step 2 — Generate test cases from approved requirements.</strong>
-      Every generated case is linked to its source requirement.
-      ${!S.requirements.length ? "<br>Add requirements first." : ""}
+      <strong>Step 2 — Generate test cases from reviewed requirements.</strong>
+      Reviewed is the approval state. Cases are linked to their source requirement; use-case traceability is included when stated.
+      ${!S.requirements.length
+        ? "<br>Add or import requirements for BRD-based generation, or use the AI-assisted generator below without a BRD."
+        : !reviewedRequirementCount
+          ? "<br>Mark a requirement Reviewed for BRD-based generation, or use the AI-assisted generator below."
+          : `<br>${reviewedRequirementCount} requirement(s) ready for generation${unreviewedRequirementCount ? `; ${unreviewedRequirementCount} not reviewed and excluded` : ""}.`}
     </div>
     <div class="panel">
       <div class="panel-head">
-        <div><div class="panel-title">Test-case generator</div><div class="panel-sub">Local deterministic or Ollama AI generation.</div></div>
+        <div><div class="panel-title">Test-case generator</div><div class="panel-sub">Generate coverage from approved requirements using the test-case skill.</div></div>
         <span class="badge">OPTIONAL AI</span>
       </div>
       <div class="gen-select">
         <label>Generation method
           <select id="caseGenerator">
             <option value="deterministic" ${S.caseGenerator === "deterministic" ? "selected" : ""}>Local deterministic (no model needed)</option>
-            <option value="ollama" ${S.caseGenerator === "ollama" ? "selected" : ""}>Ollama AI model</option>
+            ${provider && provider.id !== "local" ? `<option value="${esc(provider.id)}" ${S.caseGenerator === provider.id ? "selected" : ""}>${esc(provider.name)} · ${esc(provider.model)}</option>` : ""}
           </select>
         </label>
         <label>&nbsp;</label>
       </div>
       ${aiMsg}
     </div>
+    <div class="panel" style="margin-top:14px">
+      <div class="panel-head">
+        <div><div class="panel-title">AI-assisted generation · no BRD required</div><div class="panel-sub">Paste draft requirements, feature notes, workflows, or existing cases to analyze coverage and generate editable drafts.</div></div>
+        <span class="badge">AI DRAFTS</span>
+      </div>
+      <div class="field full">
+        <label for="assistedInput">Feature description, use cases, notes, or existing test cases</label>
+        <textarea id="assistedInput" maxlength="20000" placeholder="Describe the workflow and any known expected behavior. You can also paste current test cases for gap and duplicate analysis.">${esc(S.assistedInput)}</textarea>
+        <span class="cell-sub">Up to 20,000 characters. Unclear details are reported as assumptions or clarification questions, not confirmed rules.</span>
+      </div>
+      <div class="category-select">
+        <fieldset class="field full" style="border:0;padding:0;margin:0">
+          <legend>Testing categories · AI marks unsupported categories not applicable</legend>
+          <div class="category-options">
+            ${["Functional", "Non-Functional", "Sanity", "Smoke"].map(category =>
+              `<label><input type="checkbox" name="assistedCategory" value="${category}" ${S.assistedCategories.includes(category) ? "checked" : ""}> ${category}</label>`).join("")}
+          </div>
+        </fieldset>
+      </div>
+      ${!assistedGenOk
+        ? `<div class="info-box warn-box" style="margin-top:8px">Configure a model-based provider (Ollama, Google Gemini, or OpenAI-compatible) in <button class="act-btn" id="goAiSettings">Settings → AI Module</button> to use AI-assisted generation.</div>`
+        : ""}
+      <button class="btn btn-primary" id="assistedGenerateBtn" style="margin-top:12px" ${assistedGenOk ? "" : "disabled"}>✦ Analyze and generate</button>
+      ${assistedAnalysis}
+    </div>
     <div class="filter-row">
       <input class="search-input" id="searchTable" placeholder="⌕  Search test cases…">
     </div>
     <div class="table-wrap">
       <table class="data-table tc-table">
-        <thead><tr><th>Case ID</th><th>Req ID</th><th>Type</th><th>Scenario</th><th>Steps</th><th>Expected result</th><th>Status</th><th>Actual result</th><th>Actions</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="9" class="empty-row"><strong>No test cases yet</strong>Generate cases from reviewed requirements.</td></tr>'}</tbody>
+      <thead><tr><th>Case ID</th><th>Req ID</th><th>Use Case</th><th>Category / Type</th><th>Priority</th><th>Title / Scenario</th><th>Preconditions</th><th>Test data</th><th>Steps</th><th>Expected result</th><th>Assumptions / Source</th><th>Status</th><th>Actual result</th><th>Actions</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="14" class="empty-row"><strong>No test cases yet</strong>Generate cases from reviewed requirements or use AI-assisted generation above.</td></tr>'}</tbody>
       </table>
     </div>`;
 }
@@ -708,7 +877,7 @@ function applicationsView() {
           ${[["Files",an.total_files||inv.length],["Scanned",an.scanned_source_files||0],["Routes",an.route_count||0],["Components",an.component_count||0]].map(([l,v])=>`<div class="app-stat"><span>${l}</span><strong>${v}</strong></div>`).join("")}
         </div>
         <div class="info-box" style="margin:12px 0">
-          <strong>Validate requirements against source</strong> — Ollama will review source excerpts for coverage evidence.
+          <strong>Validate requirements against source</strong> — the configured AI provider will review source excerpts for coverage evidence.
           <button class="btn btn-ghost btn-sm validate-cov" data-app="${app.id}" style="margin-top:8px">Validate requirement coverage</button>
         </div>
         <div class="table-wrap">
@@ -816,30 +985,68 @@ function settingsView() {
 
   let pane = "";
   if (tab === "ai") {
-    const models = S.ollamaModels.length ? S.ollamaModels : S.aiSettings.ollama_model ? [S.aiSettings.ollama_model] : [];
-    const opts = models.map(m => `<option value="${esc(m)}" ${m === S.aiSettings.ollama_model ? "selected" : ""}>${esc(m)}</option>`).join("");
-    pane = `
-      <h2>AI Module</h2>
-      <div class="pane-sub">Connect a local Ollama model for AI-powered requirement extraction and test-case generation.</div>
+    const providerRows = S.aiSettings.providers || [];
+    const draft = S.aiDraft || {
+      provider: S.aiSettings.provider || "local",
+      model: S.aiSettings.model || "deterministic",
+      base_url: S.aiSettings.base_url || "",
+      api_key: "",
+      clear_api_key: false,
+    };
+    const selected = providerRows.find(item => item.id === draft.provider);
+    const setupStatus = S.aiSettings.configuration_error
+      || (S.aiSettings.configured
+        ? `${selected?.name || "Provider"} configuration is ready.`
+        : "Complete the provider settings and test the connection.");
+    const adminForm = !S.auth.authenticated ? `
+      <form id="adminLoginForm" class="ai-login-form">
+        <h3>Admin sign-in</h3>
+        <p class="pane-sub">${S.auth.admin_configured
+          ? "Sign in to manage AI providers and run AI analysis."
+          : "Copy qa-platform/.env.example to qa-platform/.env, set QA_ADMIN_PASSWORD to a unique password of at least 12 characters, then restart the server."}</p>
+        <label for="adminPassword">Admin password
+          <input id="adminPassword" type="password" autocomplete="current-password" required
+            ${S.auth.admin_configured ? "" : "disabled"}>
+        </label>
+        <button class="btn btn-primary" type="submit" ${S.auth.admin_configured ? "" : "disabled"}>Sign in</button>
+        <div class="ai-status" id="loginStatus" role="status"></div>
+      </form>` : "";
+    const settingsForm = S.auth.authenticated ? `
       <div class="ai-fields">
-        <label>Ollama local URL<input id="ollamaUrl" value="${esc(S.aiSettings.ollama_base_url)}" placeholder="http://127.0.0.1:11434"></label>
-        <label for="ollamaModel">Installed model
-          <select id="ollamaModel">
-            <option value="">${S.ollamaModels.length ? "Select a model" : "Connect to load models"}</option>
-            ${opts}
+        <label for="aiProvider">Provider
+          <select id="aiProvider">
+            ${providerRows.map(item => `<option value="${esc(item.id)}" ${item.id === draft.provider ? "selected" : ""}>${esc(item.name)}</option>`).join("")}
           </select>
         </label>
+        <label for="aiModel">Model
+          <input id="aiModel" value="${esc(draft.model)}" ${selected?.id === "local" ? "readonly" : ""}
+            ${selected?.id !== "local" ? "required" : ""} maxlength="200">
+        </label>
+        ${selected?.requires_base_url ? `<label for="aiBaseUrl">API base URL
+          <input id="aiBaseUrl" type="url" value="${esc(draft.base_url)}" required maxlength="500"
+            placeholder="${selected.id === "ollama" ? "http://127.0.0.1:11434/v1" : "https://provider.example/v1"}">
+        </label>` : ""}
+        ${selected?.requires_api_key ? `<label for="aiApiKey">API key
+          <input id="aiApiKey" type="password" autocomplete="new-password" maxlength="4096"
+            placeholder="${selected.api_key_configured ? "Saved securely; leave blank to keep it" : "Enter provider API key"}">
+        </label>` : ""}
       </div>
+      ${selected?.api_key_configured ? `<label class="ai-clear-key"><input id="aiClearKey" type="checkbox" ${draft.clear_api_key ? "checked" : ""}> Clear the saved API key</label>` : ""}
       <div class="ai-actions">
-        <button class="btn btn-ghost" id="saveAi">Save settings</button>
-        <button class="btn btn-ghost" id="testAi">Connect &amp; refresh model list</button>
+        <button class="btn btn-primary" id="saveAi">Save provider settings</button>
+        <button class="btn btn-ghost" id="testAi" ${S.aiDraft || !S.aiSettings.configured ? "disabled" : ""}>Test connection</button>
+        <button class="btn btn-ghost" id="logoutAdmin">Sign out</button>
       </div>
-      <div class="ai-status" id="aiStatus">${esc(S.ollamaStatus)}</div>
+      <div class="ai-status" id="aiStatus" role="status">${esc(S.aiStatus || setupStatus)}</div>
       <div class="info-box" style="margin-top:14px">
-        <strong>Install a model:</strong> <code>ollama pull llama3.1:8b</code>
-        then click "Connect". Only loopback URLs are accepted.
-        Requirement text and source excerpts are sent only to your local model — never to the cloud.
-      </div>`;
+        API keys are encrypted in the local database using <code>QA_AI_ENCRYPTION_KEY</code> and are never returned to the browser.
+        Local mode stays on this machine. Ollama uses its local server. Gemini and Other send analysis text to the selected provider.
+      </div>` : "";
+    pane = `
+      <h2>AI Module</h2>
+      <div class="pane-sub">Configure Local deterministic, Ollama, Google Gemini, or an OpenAI-compatible model.</div>
+      ${adminForm}
+      ${settingsForm}`;
   } else if (tab === "archive") {
     pane = `<h2>Archive</h2><div class="pane-sub">Files retained from deleted projects.</div><div id="archiveContent"><div style="color:var(--muted);font-size:12px">Loading…</div></div>`;
   } else {
@@ -869,8 +1076,8 @@ function bindWorkspaceActions() {
     const kinds = { requirements: "requirement", cases: "case", defects: "bug" };
     openModal(kinds[S.view] || "requirement");
   });
-  $("#importBtn")?.addEventListener("click", importBrd);
-  $("#uploadBrdBtn")?.addEventListener("click", importBrd);
+  $("#importBtn")?.addEventListener("click", () => importBrd());
+  $("#uploadBrdBtn")?.addEventListener("click", () => importBrd());
   $("#configAiBtn")?.addEventListener("click", () => { S.settingsTab = "ai"; navigate("settings"); render(); });
   $("#pasteBtn")?.addEventListener("click", pasteRequirement);
   $("#goBrdFromReq")?.addEventListener("click", () => { navigate("brd"); render(); });
@@ -880,6 +1087,11 @@ function bindWorkspaceActions() {
 
   $("#genCasesBtn")?.addEventListener("click", generateCases);
   $("#caseGenerator")?.addEventListener("change", e => { S.caseGenerator = e.target.value; render(); });
+  $("#assistedInput")?.addEventListener("input", e => { S.assistedInput = e.target.value; });
+  $$('input[name="assistedCategory"]').forEach(input => input.addEventListener("change", () => {
+    S.assistedCategories = $$('input[name="assistedCategory"]:checked').map(item => item.value);
+  }));
+  $("#assistedGenerateBtn")?.addEventListener("click", generateAdHocCases);
 
   $("#apiImportBtn")?.addEventListener("click", importApiDoc);
   $("#appUploadBtn")?.addEventListener("click", importAppZip);
@@ -906,6 +1118,18 @@ function bindWorkspaceActions() {
   });
 
   /* Requirement actions */
+  $$(".view-brd-analysis").forEach(b => b.addEventListener("click", () =>
+    showBrdAnalysis(b.dataset.id, b.dataset.filename)));
+  $$(".suggestion-accept").forEach(b => b.addEventListener("click", () =>
+    decideRequirementSuggestion(b.dataset.id, "accept")));
+  $$(".suggestion-reject").forEach(b => b.addEventListener("click", () =>
+    decideRequirementSuggestion(b.dataset.id, "reject")));
+  $$(".suggestion-edit-toggle").forEach(b => b.addEventListener("click", () => {
+    const editor = $(`#suggestion-editor-${b.dataset.id}`);
+    if (editor) editor.open = !editor.open;
+  }));
+  $$(".suggestion-save").forEach(b => b.addEventListener("click", () =>
+    decideRequirementSuggestion(b.dataset.id, "edit")));
   $$(".edit-req").forEach(b => b.addEventListener("click", () => openModal("requirement", b.dataset.id)));
   $$(".del-req").forEach(b => b.addEventListener("click", () => deleteRequirement(b.dataset.id)));
 
@@ -944,13 +1168,54 @@ function bindSettingsActions() {
     render();
     if (S.settingsTab === "archive") loadArchive();
   }));
-  /* AI */
-  $("#ollamaModel")?.addEventListener("change", async e => {
-    S.aiSettings.ollama_model = e.target.value;
-    await saveAiSettings();
+  $("#adminLoginForm")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const password = $("#adminPassword")?.value || "";
+    const status = $("#loginStatus");
+    if (status) status.textContent = "Signing in…";
+    try {
+      await api("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ password }),
+      });
+      S.auth = await api("/api/auth/status");
+      S.aiSettings = await api("/api/ai/settings");
+      S.aiDraft = null;
+      S.aiStatus = "";
+      render();
+    } catch (error) {
+      if (status) status.textContent = error.message;
+    } finally {
+      const input = $("#adminPassword");
+      if (input) input.value = "";
+    }
+  });
+
+  $("#aiProvider")?.addEventListener("change", event => {
+    const next = S.aiSettings.providers.find(item => item.id === event.target.value);
+    if (!next) return;
+    S.aiDraft = {
+      provider: next.id,
+      model: next.model,
+      base_url: next.base_url,
+      api_key: "",
+      clear_api_key: false,
+    };
+    S.aiStatus = "";
+    render();
   });
   $("#saveAi")?.addEventListener("click", saveAiSettings);
-  $("#testAi")?.addEventListener("click", testOllama);
+  $("#testAi")?.addEventListener("click", testAiConnection);
+  $("#logoutAdmin")?.addEventListener("click", async () => {
+    try {
+      await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+      S.auth = await api("/api/auth/status");
+      S.aiSettings = await api("/api/ai/settings");
+      S.aiDraft = null;
+      S.aiStatus = "";
+      render();
+    } catch (error) { toast(error.message); }
+  });
 }
 
 async function loadArchive() {
@@ -978,38 +1243,47 @@ async function loadArchive() {
 }
 
 async function saveAiSettings() {
-  try {
-    S.aiSettings = await api("/api/ai/settings", {
-      method: "POST",
-      body: JSON.stringify({ ollama_base_url: $("#ollamaUrl")?.value, ollama_model: $("#ollamaModel")?.value }),
-    });
-    S.ollamaStatus = "Settings saved.";
-    toast("AI settings saved");
-    render();
-  } catch (e) { toast(e.message); }
-}
-async function testOllama() {
+  const provider = $("#aiProvider")?.value;
+  const model = $("#aiModel")?.value || "";
+  const base_url = $("#aiBaseUrl")?.value || "";
+  const api_key = $("#aiApiKey")?.value || "";
+  const clear_api_key = Boolean($("#aiClearKey")?.checked);
   const status = $("#aiStatus");
-  const save = $("#saveAi"), test = $("#testAi");
-  if (save) save.disabled = true;
-  if (test) test.disabled = true;
-  if (status) status.textContent = "Connecting to Ollama…";
+  const button = $("#saveAi");
+  if (button) button.disabled = true;
+  if (status) status.textContent = "Saving provider settings…";
   try {
     S.aiSettings = await api("/api/ai/settings", {
       method: "POST",
-      body: JSON.stringify({ ollama_base_url: $("#ollamaUrl")?.value, ollama_model: $("#ollamaModel")?.value }),
+      body: JSON.stringify({ provider, model, base_url, api_key, clear_api_key }),
     });
-    const r = await api("/api/ai/ollama/test", { method: "POST", body: JSON.stringify({}) });
-    S.ollamaModels = r.models;
-    S.ollamaStatus = r.models.length
-      ? `Connected · ${r.models.length} model${r.models.length > 1 ? "s" : ""} available: ${r.models.join(", ")}`
-      : "Connected but no models installed. Run: ollama pull llama3.1:8b";
+    S.auth = { ...S.auth, authenticated: true };
+    S.aiDraft = null;
+    S.caseGenerator = provider === "local" ? "deterministic" : provider;
+    S.aiStatus = "Provider settings saved. Test the connection before running analysis.";
     render();
-  } catch (e) {
-    S.ollamaStatus = e.message;
-    if (status) status.textContent = e.message;
+  } catch (error) {
+    S.aiStatus = error.message;
+    if (status) status.textContent = error.message;
   } finally {
     if ($("#saveAi")) $("#saveAi").disabled = false;
+  }
+}
+
+async function testAiConnection() {
+  const status = $("#aiStatus");
+  const test = $("#testAi");
+  if (test) test.disabled = true;
+  if (status) status.textContent = "Testing provider connection…";
+  try {
+    const result = await api("/api/ai/test", { method: "POST", body: JSON.stringify({}) });
+    S.aiSettings = await api("/api/ai/settings");
+    S.aiStatus = `Connected to ${result.provider} · ${result.model}`;
+    if (status) status.textContent = S.aiStatus;
+  } catch (error) {
+    S.aiStatus = error.message;
+    if (status) status.textContent = error.message;
+  } finally {
     if ($("#testAi")) $("#testAi").disabled = false;
   }
 }
@@ -1020,7 +1294,13 @@ async function testOllama() {
 
 /* ── Open project ─────────────────────────────────────────────────── */
 async function openProject(id, view = "overview") {
-  S.project = S.projects.find(p => String(p.id) === String(id)) || null;
+  const project = S.projects.find(p => String(p.id) === String(id)) || null;
+  if (String(project?.id || "") !== String(S.project?.id || "")) {
+    S.assistedInput = "";
+    S.assistedAnalysis = null;
+    S.assistedCategories = ["Functional", "Non-Functional", "Sanity", "Smoke"];
+  }
+  S.project = project;
   navigate(view);
   const sel = $("#projectSelect");
   if (sel) sel.value = S.project?.id || "";
@@ -1063,22 +1343,254 @@ async function deleteCase(id) {
   } catch (e) { toast(e.message); }
 }
 
+/* ── BRD report rendering ─────────────────────────────────────────── */
+function brdReportMarkup(analysis) {
+  const summary = analysis.brd_summary || {};
+  const useCases = analysis.use_cases || [];
+  const groups = analysis.functional_groups || [];
+  const nfrs = analysis.non_functional_requirements || [];
+  const constraints = analysis.scope_constraints || [];
+  const traceability = analysis.traceability || [];
+  const gaps = analysis.requirement_gaps || [];
+  const requirements = analysis.requirements || [];
+  const applicationFlow = analysis.application_flow || [];
+  const scope = analysis.scope || { in_scope: [], out_of_scope: [], requires_clarification: [] };
+  const analysisLabel = analysis.analysis_status || "NEEDS REVIEW";
+  const analysisBadge = `<span class="badge ${analysisLabel === "AI SUGGESTION" ? "badge-amber" : "badge-muted"}">${esc(analysisLabel)}</span>`;
+  const table = (headers, rows, emptyMessage) => `
+    <div class="table-wrap"><table class="data-table">
+      <thead><tr>${headers.map(header => `<th>${esc(header)}</th>`).join("")}</tr></thead>
+      <tbody>${rows || `<tr><td colspan="${headers.length}" class="empty-row">${esc(emptyMessage)}</td></tr>`}</tbody>
+    </table></div>`;
+  const useCaseRows = useCases.map(item => `
+    <tr><td>${esc(item.id)}</td><td>${esc(item.name)}</td><td>${esc(item.actor || "Not specified")}</td><td>${esc(item.goal || "Not specified")}</td><td>${esc(item.source_reference || "Not specified")}</td></tr>`).join("");
+  const functional = groups.map((group, groupIndex) => `
+    <section class="analysis-group">
+      <h4><strong>FR-${groupIndex + 1}:</strong> ${esc(group.name)}</h4>
+      ${table(
+        ["ID", "Functional Requirement", "Source Use Case", "Scenario / Acceptance Criterion", "Source Reference", "Priority"],
+        (group.requirements || []).map(item => `
+          <tr><td>${esc(item.id)}</td><td>${esc(item.title ? `${item.title}: ` : "")}${esc(item.statement)}</td>
+            <td>${esc(item.source_use_case || "Not specified")}</td>
+            <td>${esc(item.source_step || "Not specified")}</td>
+            <td>${esc(item.source_reference || "Not specified")}</td>
+            <td>${esc(item.priority || "Not specified")}</td></tr>`).join(""),
+        "No functional requirements identified.",
+      )}
+    </section>`).join("") || '<p class="analysis-empty">No functional requirements identified.</p>';
+  const nfrRows = nfrs.map(item => `
+    <tr><td>${esc(item.id)}</td><td>${esc(item.statement)}</td>
+      <td>${esc(item.source_use_case || "Not specified")}</td>
+      <td>${esc(item.source_step || "Not specified")}</td>
+      <td>${esc(item.source_reference || "Not specified")}</td>
+      <td>${esc(item.category)}</td></tr>`).join("");
+  const constraintRows = constraints.map(item => `
+    <tr><td>${esc(item.id)}</td><td>${esc(item.statement)}</td>
+      <td>${esc(item.source || item.basis || "Not specified")}${item.basis === "Inferred" ? " (Inferred — requires confirmation)" : ""}</td></tr>`).join("");
+  const traceRows = traceability.map(item => `
+    <tr><td>${esc(item.use_case)}</td><td>${esc(item.scenario_step)}</td>
+      <td>${esc((item.requirement_ids || []).join(", ") || "No requirement extracted")}</td></tr>`).join("");
+  const gapRows = gaps.map(item => `
+    <tr><td>${esc(item.id)}</td><td>${esc(item.missing_information)}</td>
+      <td>${esc(item.related_use_case || "Not specified")}</td><td>${esc(item.impact)}</td></tr>`).join("");
+  const scopeList = entries => (entries || []).length
+    ? entries.map(item => `<li>${esc(item)}</li>`).join("")
+    : '<li class="analysis-empty">Not specified in the document.</li>';
+  const requirementRecords = requirements.map(item => `
+    <details class="brd-preview-item">
+      <summary><strong>${esc(item.requirement_key || "Suggestion")}: ${esc(item.title)}</strong>
+        <span class="badge badge-amber">AI SUGGESTION</span>
+        <span class="badge ${item.module_type === "Non-Functional" ? "badge-purple" : "badge-blue"}">${esc(item.requirement_type || item.module_type)}</span>
+      </summary>
+      <p>${esc(item.description || "Description not specified.")}</p>
+      <p><strong>Acceptance criteria:</strong> ${esc(item.acceptance_criteria || "Not specified.")}</p>
+      <p><strong>Dependencies:</strong> ${esc(item.dependencies || "Not specified.")}</p>
+      <p><strong>Validation rules:</strong> ${esc(item.validation_rules || "Not specified.")}</p>
+      <p><strong>Business rules:</strong> ${esc(item.business_rules || "Not specified.")}</p>
+      <p><strong>Scope:</strong> ${esc(item.scope_classification || "Requires Clarification")}
+        · <strong>Review:</strong> ${esc(item.ai_confidence_status || "Needs clarification")}</p>
+      <p><strong>Source:</strong> ${esc(item.source_section || "Not specified")}
+        · <strong>Actor:</strong> ${esc(item.actor || "Not specified")}</p>
+      ${item.preconditions ? `<p><strong>Preconditions:</strong> ${esc(item.preconditions)}</p>` : ""}
+      ${item.trigger ? `<p><strong>Trigger:</strong> ${esc(item.trigger)}</p>` : ""}
+      ${item.main_flow ? `<p><strong>Main flow:</strong> ${esc(item.main_flow)}</p>` : ""}
+      ${item.alternative_flow ? `<p><strong>Alternative flow:</strong> ${esc(item.alternative_flow)}</p>` : ""}
+      ${item.exception_flow ? `<p><strong>Exception flow:</strong> ${esc(item.exception_flow)}</p>` : ""}
+      ${item.related_requirements ? `<p><strong>Related requirements:</strong> ${esc(item.related_requirements)}</p>` : ""}
+      <p><strong>Priority:</strong> ${esc(item.priority || "Not specified")}</p>
+    </details>`).join("");
+  const flowRows = applicationFlow.map((item, index) => `
+    <tr><td>${index + 1}</td><td>${esc(item.actor || "Not specified")}</td>
+      <td>${esc(item.action)}</td><td>${esc(item.system_response || "Not specified")}</td>
+      <td>${esc(item.source_status)}</td></tr>`).join("");
+  const steps = useCases.map(item => `
+    ${(item.steps || []).map(step => `
+      <li><strong>${esc(item.id)} ${esc(step.step)}:</strong> ${esc(step.summary)}</li>`).join("")}
+    ${(item.acceptance_criteria || []).map((criterion, index) => `
+      <li><strong>${esc(item.id)} Acceptance Criterion ${index + 1}:</strong> ${esc(criterion)}</li>`).join("")}
+  `).join("");
+
+  return `
+    <h3>1. BRD Summary ${analysisBadge}</h3>
+    ${table(["Item", "Details"], [
+      ["BRD name", summary.brd_name || "Not specified"],
+      ["Product", summary.product || "Not specified"],
+      ["Platform", summary.platform || "Not specified"],
+      ["Primary users", (summary.primary_users || []).join(", ") || "Not specified"],
+      ["Use cases identified", summary.use_case_count ?? useCases.length],
+    ].map(([label, value]) => `<tr><td>${esc(label)}</td><td>${esc(value)}</td></tr>`).join(""), "Not specified in the document.")}
+    <p>${esc(analysis.summary || "")}</p>
+    <h3>Requirement Records ${analysisBadge}</h3>
+    ${requirementRecords || '<p class="analysis-empty">No requirement records generated.</p>'}
+    <h3>2. Use Cases Identified ${analysisBadge}</h3>
+    ${table(["Use Case ID", "Use Case", "Actor", "Goal", "Source Reference"], useCaseRows, "No use cases identified.")}
+    ${steps ? `<h4>Scenarios and Acceptance Criteria</h4><ul>${steps}</ul>` : ""}
+    <h3>3. Functional Requirements ${analysisBadge}</h3>
+    ${functional}
+    <h3>4. Non-Functional Requirements ${analysisBadge}</h3>
+    ${table(["ID", "Non-Functional Requirement", "Source Use Case", "Scenario / Acceptance Criterion", "Source Reference", "Category"], nfrRows, "No source-supported quality requirements identified.")}
+    <h3>5. Business Rules / Constraints (separate from Functional and Non-Functional Requirements) ${analysisBadge}</h3>
+    ${table(["ID", "Rule or Constraint", "Source"], constraintRows, "No business rules or constraints identified.")}
+    <h4>Scope context</h4>
+    <div class="analysis-columns">
+      <div><h4>In scope</h4><ul>${scopeList(scope.in_scope)}</ul></div>
+      <div><h4>Out of scope</h4><ul>${scopeList(scope.out_of_scope)}</ul></div>
+      <div><h4>Requires clarification</h4><ul>${scopeList(scope.requires_clarification)}</ul></div>
+    </div>
+    <h3>Application Flow ${analysisBadge}</h3>
+    ${table(["Step", "Actor", "Action", "System response", "Source status"], flowRows, "No application flow was identified.")}
+    <h3>6. Requirement Traceability Matrix ${analysisBadge}</h3>
+    ${table(["Use Case", "Scenario Step", "Requirement IDs"], traceRows, "No traceability entries identified.")}
+    <h3>7. Requirement Gaps ${analysisBadge}</h3>
+    ${table(["Gap ID", "Missing Information", "Related Use Case / Requirement", "Testing Impact"], gapRows, "No requirement gaps identified.")}
+    <h3>8. QA Readiness Notes <span class="badge badge-muted">NEEDS REVIEW</span></h3>
+    <p>${useCases.length && traceability.length
+      ? "Requirements are organized around identified use cases and mapped to scenario steps."
+      : "Use-case detail or traceability is incomplete; review the reported gaps before test-case generation."}</p>`;
+}
+
+async function decideRequirementSuggestion(id, action) {
+  try {
+    const payload = { action };
+    if (action === "edit") {
+      const editor = $(`#suggestion-editor-${id}`);
+      const current = S.requirementSuggestions.find(item => String(item.id) === String(id));
+      if (!editor || !current) throw new Error("AI suggestion editor is unavailable.");
+      payload.content = { ...current.content };
+      $$(".suggestion-field", editor).forEach(field => {
+        payload.content[field.dataset.field] = field.value;
+      });
+    }
+    await api(pp(`requirements/suggestions/${id}`), {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+    await refresh();
+    render();
+    toast(action === "accept" ? "AI suggestion accepted and approved for test generation"
+      : action === "reject" ? "AI suggestion rejected" : "AI suggestion edit saved");
+  } catch (e) { toast(e.message); }
+}
+
 /* ── Import BRD ───────────────────────────────────────────────────── */
+function confirmBrdRequirements(preview) {
+  const analysis = preview.analysis;
+  const requirements = preview.requirements.map((item, index) => `
+    <article class="brd-preview-item">
+      <div class="brd-preview-item-head">
+        <strong>${esc(item.requirement_key || `Requirement ${index + 1}`)}</strong>
+        <span class="badge badge-green">EXTRACTED</span>
+      </div>
+      <h3>${esc(item.title)}</h3>
+      ${item.description ? `<p>${esc(item.description)}</p>` : ""}
+      <p><strong>Requirement type:</strong> ${esc(item.requirement_type || item.module_type || "Functional Requirement")}
+        · <strong>Scope:</strong> ${esc(item.scope_classification || "Requires Clarification")}
+        · <strong>AI confidence:</strong> ${esc(item.ai_confidence_status || "Needs clarification")}</p>
+      ${item.acceptance_criteria ? `<p><strong>Acceptance criteria:</strong> ${esc(item.acceptance_criteria)}</p>` : ""}
+      ${item.business_rules ? `<p><strong>Business rules:</strong> ${esc(item.business_rules)}</p>` : ""}
+      ${item.validation_rules ? `<p><strong>Validation:</strong> ${esc(item.validation_rules)}</p>` : ""}
+      ${item.dependencies ? `<p><strong>Dependencies:</strong> ${esc(item.dependencies)}</p>` : ""}
+      ${item.source_section ? `<p><strong>Source reference:</strong> ${esc(item.source_section)}</p>` : ""}
+      ${item.source_evidence ? `<blockquote class="source-evidence">${esc(item.source_evidence)}</blockquote>` : ""}
+      ${item.actor ? `<p><strong>Actor:</strong> ${esc(item.actor)}</p>` : ""}
+      ${item.main_flow ? `<p><strong>Main flow:</strong> ${esc(item.main_flow)}</p>` : ""}
+    </article>`).join("");
+  const suggestions = (preview.suggestions || []).map(item => `
+    <article class="brd-preview-item">
+      <div class="brd-preview-item-head"><span class="badge badge-amber">AI SUGGESTION</span></div>
+      <h3>${esc(item.content.title)}</h3>
+      <p>${esc(item.content.description || "No description supplied.")}</p>
+      <p><strong>Reason:</strong> ${esc(item.reason)}</p>
+      <p><strong>Related extracted requirement:</strong> ${esc(item.related_requirement_key || "None identified")}
+        · <strong>Source reference:</strong> ${esc(item.source_reference || "No exact source reference identified")}</p>
+      ${item.source_evidence ? `<blockquote class="source-evidence">${esc(item.source_evidence)}</blockquote>` : ""}
+    </article>`).join("");
+  const functionalCount = preview.requirements.filter(item => item.module_type === "Functional").length;
+  const nonFunctionalCount = preview.requirements.length - functionalCount;
+  $("#saveModal").hidden = false;
+  $("#modalEyebrow").textContent = "REVIEW BRD REQUIREMENTS";
+  $("#modalTitle").textContent = `${preview.requirements.length} requirement${preview.requirements.length === 1 ? "" : "s"} found`;
+  $("#modalFields").innerHTML = `
+    <div class="field full">
+      <div class="info-box">
+        Rule-based extraction is the only source for confirmed requirements. AI proposals are saved separately for review and are not added to the confirmed list.
+        <br><strong>${preview.requirements.length}</strong> EXTRACTED (${functionalCount} Functional · ${nonFunctionalCount} Non-Functional)
+        · <strong>${(preview.suggestions || []).length}</strong> AI SUGGESTION(S)
+        ${preview.analysis_warning ? `<br><span class="analysis-empty">${esc(preview.analysis_warning)}</span>` : ""}
+      </div>
+    </div>
+    <div class="field full brd-preview-list">
+      <section class="brd-preview-report">
+        ${brdReportMarkup(analysis)}
+      </section>
+      <details class="brd-preview-requirements">
+        <summary>Review the ${preview.requirements.length} extracted requirement record(s) that will be confirmed</summary>
+        ${requirements || '<p class="analysis-empty">No source-supported requirement was identified by the deterministic extraction rules.</p>'}
+      </details>
+      <details class="brd-preview-requirements" ${suggestions ? "open" : ""}>
+        <summary>Review ${preview.suggestions?.length || 0} separate AI suggestion(s)</summary>
+        ${suggestions || '<p class="analysis-empty">No AI suggestions were generated.</p>'}
+      </details>
+    </div>`;
+  $("#formError").textContent = "";
+  $("#saveModal").textContent = "Confirm extracted requirements and save suggestions separately";
+  $("#saveModal").onclick = e => {
+    e.preventDefault();
+    modal.close("confirm");
+  };
+  $("#cancelModal").onclick = () => modal.close();
+  modalForm.onsubmit = e => e.preventDefault();
+  modal.returnValue = "";
+  return new Promise(resolve => {
+    modal.addEventListener("close", () => resolve(modal.returnValue === "confirm"), { once: true });
+    modal.showModal();
+  });
+}
+
+async function showBrdAnalysis(documentId, filename) {
+  try {
+    const result = await api(pp(`requirements/documents/${documentId}/analysis`));
+    S.brdAnalysis = { documentId, filename, analysis: result.analysis };
+    navigate("brd");
+    render();
+  } catch (e) { toast(e.message); }
+}
+
 function importBrd(generator = "auto") {
   const picker = document.createElement("input");
   picker.type = "file";
-  picker.accept = ".docx,.txt,.md";
+  picker.accept = ".pdf,.docx,.csv,.txt,.md";
   picker.onchange = async () => {
     const file = picker.files[0]; if (!file) return;
-    if (!/\.(docx|txt|md)$/i.test(file.name)) { toast("Choose DOCX, TXT, or Markdown"); return; }
-    const isDocx = /\.docx$/i.test(file.name);
-    if (file.size > (isDocx ? 5 : 1) * 1024 * 1024) { toast(`File too large (max ${isDocx ? "5 MB" : "1 MB"})`); return; }
+    if (!/\.(pdf|docx|csv|txt|md)$/i.test(file.name)) { toast("Choose PDF, DOCX, CSV, TXT, or Markdown"); return; }
+    const isBinaryDocument = /\.(pdf|docx)$/i.test(file.name);
+    if (file.size > (isBinaryDocument ? 5 : 1) * 1024 * 1024) { toast(`File too large (max ${isBinaryDocument ? "5 MB" : "1 MB"})`); return; }
     const btn = $("#uploadBrdBtn") || $("#importBtn");
-    if (btn) { btn.disabled = true; btn.textContent = "Analyzing…"; }
-    toast("Analyzing document with AI…");
+    if (btn) { btn.disabled = true; btn.textContent = "Analyzing BRD…"; }
+    toast("Analyzing the BRD with the configured provider. Large documents may take a few minutes.");
     try {
       const payload = { filename: file.name, generator };
-      if (isDocx) {
+      if (isBinaryDocument) {
         const dataUrl = await new Promise((res, rej) => {
           const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(new Error("Read failed")); fr.readAsDataURL(file);
         });
@@ -1086,11 +1598,31 @@ function importBrd(generator = "auto") {
       } else {
         payload.content = await file.text();
       }
-      const r = await api(pp("requirements/import"), { method: "POST", body: JSON.stringify(payload) });
+      const previewResult = await api(pp("requirements/import"), {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      if (!previewResult.preview_required) throw new Error("BRD analysis preview was not returned.");
+      const confirmed = await confirmBrdRequirements(previewResult.preview);
+      if (!confirmed) {
+        await api(pp(`requirements/previews/${previewResult.preview.preview_id}`), {
+          method: "DELETE",
+        });
+        toast("BRD analysis cancelled; no requirements were saved.");
+        return;
+      }
+      const r = await api(pp("requirements/import"), {
+        method: "POST",
+        body: JSON.stringify({ ...payload, preview_id: previewResult.preview.preview_id }),
+      });
       await refresh();
-      const label = r.generator === "ollama" ? "AI-extracted" : "rule-based";
-      toast(`${r.count} ${label} requirement(s) added (${r.functional_count} Functional, ${r.non_functional_count} Non-Functional)${r.skipped_duplicates ? `; ${r.skipped_duplicates} duplicate(s) skipped` : ""}${r.analysis_warning ? " · " + r.analysis_warning : ""}`);
-      navigate("requirements"); render();
+      S.brdAnalysis = {
+        documentId: r.document.id,
+        filename: r.document.filename,
+        analysis: r.analysis,
+      };
+      toast(`${r.count} EXTRACTED requirement(s) added (${r.functional_count} Functional, ${r.non_functional_count} Non-Functional); ${r.suggestions_added} AI suggestion(s) saved separately${r.skipped_duplicates ? `; ${r.skipped_duplicates} duplicate(s) skipped` : ""}${r.analysis_warning ? " · " + r.analysis_warning : ""}`);
+      navigate("brd"); render();
     } catch (e) { toast(e.message); }
     finally { if (btn) { btn.disabled = false; btn.textContent = "↑ Upload BRD file"; } }
   };
@@ -1102,16 +1634,39 @@ async function pasteRequirement() {
   const content = ta?.value || "";
   if (!content.trim()) { toast("Enter requirement text first"); return; }
   const btn = $("#pasteBtn");
-  if (btn) { btn.disabled = true; btn.textContent = "Analyzing…"; }
-  toast("Analyzing with AI…");
+  if (btn) { btn.disabled = true; btn.textContent = "Analyzing BRD…"; }
+  toast("Analyzing the BRD with the configured provider. Large documents may take a few minutes.");
   try {
+    const payload = {
+      filename: "pasted-requirements.txt",
+      content,
+      generator: "auto",
+    };
+    const previewResult = await api(pp("requirements/import"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (!previewResult.preview_required) throw new Error("BRD analysis preview was not returned.");
+    const confirmed = await confirmBrdRequirements(previewResult.preview);
+    if (!confirmed) {
+      await api(pp(`requirements/previews/${previewResult.preview.preview_id}`), {
+        method: "DELETE",
+      });
+      toast("BRD analysis cancelled; no requirements were saved.");
+      return;
+    }
     const r = await api(pp("requirements/import"), {
       method: "POST",
-      body: JSON.stringify({ filename: "pasted-requirements.txt", content, generator: "ollama" }),
+      body: JSON.stringify({ ...payload, preview_id: previewResult.preview.preview_id }),
     });
     await refresh();
-    toast(`${r.count} requirement(s) extracted${r.analysis_warning ? " · " + r.analysis_warning : ""}`);
-    navigate("requirements"); render();
+    S.brdAnalysis = {
+      documentId: r.document.id,
+      filename: r.document.filename,
+      analysis: r.analysis,
+    };
+    toast(`${r.count} EXTRACTED requirement(s) added; ${r.suggestions_added} AI suggestion(s) saved separately${r.analysis_warning ? " · " + r.analysis_warning : ""}`);
+    navigate("brd"); render();
   } catch (e) { toast(e.message); }
   finally { if (btn) { btn.disabled = false; btn.textContent = "Analyze with AI"; } }
 }
@@ -1119,18 +1674,61 @@ async function pasteRequirement() {
 /* ── Generate test cases ──────────────────────────────────────────── */
 async function generateCases() {
   const btn = $("#genCasesBtn");
-  if (btn) { btn.disabled = true; btn.textContent = S.caseGenerator === "ollama" ? "Generating with AI…" : "Generating…"; }
+  if (btn) { btn.disabled = true; btn.textContent = S.caseGenerator === "google" ? "Generating with AI…" : "Generating…"; }
   try {
     const r = await api(pp("test-cases/generate"), { method: "POST", body: JSON.stringify({ generator: S.caseGenerator }) });
     await refresh();
+    const coverage = r.coverage;
+    const uncoveredMore = coverage?.uncovered_count > coverage?.uncovered_requirements?.length
+      ? ` and ${coverage.uncovered_count - coverage.uncovered_requirements.length} more`
+      : "";
+    const coverageMessage = coverage
+      ? ` Coverage: ${coverage.covered_requirements}/${coverage.reviewed_requirements} reviewed requirement(s).${coverage.uncovered_count ? ` Uncovered: ${coverage.uncovered_requirements.map(item => item.requirement_key).join(", ")}${uncoveredMore}.` : ""}`
+      : "";
     if (r.count) {
-      toast(`${r.count} case(s) generated; ${r.skipped_existing} skipped.${r.truncated ? " 300-case limit reached." : ""}`);
+      toast(`${r.count} case(s) generated; ${r.skipped_existing} skipped.${r.truncated ? " 300-case limit reached." : ""}${coverageMessage}`);
       navigate("cases"); render();
     } else {
-      toast(`No new cases; ${r.skipped_existing} existing case(s) already cover the requirements.`);
+      toast(`No new cases; ${r.skipped_existing} matching case(s) already exist.${coverageMessage}`);
     }
   } catch (e) { toast(e.message); }
   finally { if ($("#genCasesBtn")) { $("#genCasesBtn").disabled = false; $("#genCasesBtn").textContent = "✦ Generate test cases"; } }
+}
+
+async function generateAdHocCases() {
+  const btn = $("#assistedGenerateBtn");
+  const input = $("#assistedInput");
+  if (input) S.assistedInput = input.value;
+  const categories = $$('input[name="assistedCategory"]:checked').map(item => item.value);
+  S.assistedCategories = categories;
+  if (btn) { btn.disabled = true; btn.textContent = "Analyzing and generating…"; }
+  try {
+    const result = await api(pp("test-cases/generate"), {
+      method: "POST",
+      body: JSON.stringify({
+        mode: "ai_assisted",
+        source_text: S.assistedInput,
+        categories,
+        generator: S.aiSettings.provider,
+      }),
+    });
+    S.assistedAnalysis = result.analysis;
+    if (result.status === "needs_clarification") {
+      await render();
+      toast("More detail is needed. Review the clarification questions before retrying.");
+      return;
+    }
+    await refresh();
+    toast(result.count
+      ? `${result.count} AI-assisted case(s) added; ${result.skipped_existing} duplicate(s) skipped. Review and edit before execution.`
+      : `No new cases; ${result.skipped_existing} matching case(s) already exist.`);
+  } catch (e) { toast(e.message); }
+  finally {
+    if ($("#assistedGenerateBtn")) {
+      $("#assistedGenerateBtn").disabled = false;
+      $("#assistedGenerateBtn").textContent = "✦ Analyze and generate";
+    }
+  }
 }
 
 /* ── Import API doc ───────────────────────────────────────────────── */
@@ -1277,6 +1875,8 @@ function openModal(kind, id = null, linkCase = null) {
   const linkedCase = kind === "bug" && linkCase ? S.cases.find(x => x.id == linkCase) : null;
 
   $("#saveModal").hidden = false;
+  $("#saveModal").onclick = null;
+  $("#cancelModal").onclick = () => modal.close();
   $("#modalEyebrow").textContent = eyebrows[kind] || kind.toUpperCase();
   $("#modalTitle").textContent = titles[kind] || "Edit";
   $("#formError").textContent = "";
@@ -1303,19 +1903,41 @@ function openModal(kind, id = null, linkCase = null) {
       field("business_rules", "Business rules", data?.business_rules || "", "textarea", false, "Business rules") +
       field("validation_rules", "Validation rules", data?.validation_rules || "", "textarea", false, "Input constraints") +
       field("dependencies", "Dependencies", data?.dependencies || "", "textarea", false, "Related requirements") +
-      selectField("priority", "Priority", ["High", "Medium", "Low"], data?.priority || "Medium") +
+      selectField("requirement_type", "Requirement type", ["Use Case", "User Story", "Feature", "Functional Requirement", "Non-Functional Requirement"], data?.requirement_type || "Functional Requirement") +
+      selectField("scope_classification", "Scope classification", ["In Scope", "Out of Scope", "Requires Clarification"], data?.scope_classification || "Requires Clarification") +
+      selectField("ai_confidence_status", "AI confidence / review", ["Supported", "Needs clarification"], data?.ai_confidence_status || "Needs clarification") +
+      field("source_section", "Source reference", data?.source_section || "", "text", false, "Source heading, feature ID, or excerpt") +
+      field("actor", "Actor / user role", data?.actor || "", "text", false, "If specified in the source") +
+      field("preconditions", "Preconditions", data?.preconditions || "", "textarea", false, "If specified") +
+      field("trigger", "Trigger", data?.trigger || "", "textarea", false, "If specified") +
+      field("main_flow", "Main flow", data?.main_flow || "", "textarea", false, "If specified") +
+      field("alternative_flow", "Alternative flow", data?.alternative_flow || "", "textarea", false, "If specified") +
+      field("exception_flow", "Exception flow", data?.exception_flow || "", "textarea", false, "If specified") +
+      field("related_requirements", "Related requirements", data?.related_requirements || "", "textarea", false, "Related or parent requirement references") +
+      selectField("priority", "Priority", ["High", "Medium", "Low", "Not specified"], data?.priority || "Medium") +
       selectField("module_type", "Type", ["Functional", "Non-Functional"], data?.module_type || "Functional") +
       selectField("module_category", "Category", ["Functional", "Performance", "Security", "Usability", "Compatibility", "Reliability", "Other"], data?.module_category || "Functional") +
-      selectField("review_status", "Review status", ["Needs review", "Reviewed"], data?.review_status || "Needs review");
+      selectField("review_status", "Review status", ["Needs review", "Reviewed", "Rejected"], data?.review_status || "Needs review");
   }
   if (kind === "case") {
     fields =
+      field("title", "Test case title", data?.title || data?.scenario || "", "text", true, "e.g. Submit valid registration details", true) +
       field("scenario", "Scenario", data?.scenario || "", "text", true, "e.g. Login with valid credentials", true) +
       selectField("requirement_id", "Requirement", reqOpts, data?.requirement_id || "") +
+      field("use_case_id", "Use Case ID", data?.use_case_id || "", "text", false, "e.g. UC-1") +
       selectField("test_type", "Type", ["Functional","Negative","Boundary","Validation","Permission","API","Integration","Performance","Security","Usability","Compatibility","Reliability","Non-Functional"], data?.test_type || "Functional") +
+      selectField("test_category", "Test category", ["Functional","Non-Functional","Sanity","Smoke"], data?.test_category || "Functional") +
+      selectField("classification", "Classification", [
+        { value: "", label: "Not classified" }, "Positive", "Negative",
+      ], data?.classification || "") +
+      selectField("priority", "Priority", ["Critical","High","Medium","Low","Not specified"], data?.priority || "Not specified") +
       field("description", "Description", data?.description || "", "textarea", true, "What this test verifies") +
+      field("preconditions", "Preconditions", data?.preconditions || "", "textarea", false, "Required setup only") +
+      field("test_data", "Test data", data?.test_data || "", "textarea", false, "Values or descriptive placeholders") +
       field("steps", "Steps", data?.steps || "", "textarea", true, "Steps, one per line") +
       field("expected_result", "Expected result", data?.expected_result || "", "textarea", true, "Observable outcome") +
+      field("assumptions", "Assumptions / dependencies", data?.assumptions || "", "textarea", true, "Keep unconfirmed assumptions explicitly labeled") +
+      field("source_reference", "Source statement / traceability", data?.source_reference || "", "textarea", true, "Input statement this case is based on") +
       selectField("status", "Status", ["Not Executed","In Progress","Pass","Fail","Blocked","Skipped"], data?.status || "Not Executed") +
       field("actual_result", "Actual result", data?.actual_result || "", "textarea", false, "What happened");
   }
@@ -1417,10 +2039,17 @@ async function uploadEvidence(execId, file) {
    BOOTSTRAP
 ════════════════════════════════════════════════════════════════════ */
 $("#projectSelect").addEventListener("change", async e => {
-  S.project = S.projects.find(p => String(p.id) === e.target.value) || null;
+  const project = S.projects.find(p => String(p.id) === e.target.value) || null;
+  if (String(project?.id || "") !== String(S.project?.id || "")) {
+    S.assistedInput = "";
+    S.assistedAnalysis = null;
+    S.assistedCategories = ["Functional", "Non-Functional", "Sanity", "Smoke"];
+  }
+  S.project = project;
+  S.brdAnalysis = null;
   S.view = "overview"; S.viewHistory = [];
   if (S.project) await refresh();
-  else { S.requirements=[]; S.requirementDocs=[]; S.cases=[]; S.bugs=[]; S.apiDocs=[]; S.applications=[]; S.analyses=[]; render(); }
+  else { S.requirements=[]; S.requirementSuggestions=[]; S.requirementDocs=[]; S.cases=[]; S.bugs=[]; S.apiDocs=[]; S.applications=[]; S.analyses=[]; render(); }
 });
 
 /* Top nav */

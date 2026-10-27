@@ -1,0 +1,11 @@
+.env
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+qa_platform.sqlite3
+qa_platform.sqlite3-shm
+qa_platform.sqlite3-wal
+storage/projects/
+storage/archived-projects/

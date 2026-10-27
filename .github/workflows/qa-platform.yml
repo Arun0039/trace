@@ -1,0 +1,43 @@
+name: QA Platform checks
+
+on:
+  push:
+    paths:
+      - "qa-platform/**"
+      - ".github/workflows/qa-platform.yml"
+  pull_request:
+    paths:
+      - "qa-platform/**"
+      - ".github/workflows/qa-platform.yml"
+  workflow_dispatch:
+
+jobs:
+  test-and-audit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: qa-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: qa-platform/package-lock.json
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -v
+      - name: Audit Python dependencies
+        run: |
+          python -m pip install pip-audit
+          pip-audit -r requirements.txt
+      - name: Install Node dependencies
+        run: npm ci
+      - name: Run Node tests
+        run: npm test
+      - name: Audit Node dependencies
+        run: npm audit --audit-level=high

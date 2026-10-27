@@ -1,0 +1,17 @@
+{
+  "name": "trace-qa-ai-provider",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^4.0.105",
+    "@ai-sdk/openai-compatible": "^3.0.78",
+    "ai": "^7.0.153",
+    "zod": "^4.1.8"
+  }
+}

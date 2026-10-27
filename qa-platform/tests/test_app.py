@@ -1,6 +1,10 @@
 import base64
+import copy
+import errno
 import io
 import json
+import os
+import secrets
 import stat
 import struct
 import tempfile
@@ -11,19 +15,210 @@ import urllib.error
 import urllib.request
 import zipfile
 import zlib
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 import app
 from application_zip import MAX_FILE_UNCOMPRESSED, analyze_application_zip, source_code_excerpts
 from ollama_integration import (
-    generate_requirements as generate_ollama_requirements,
-    generate_test_cases as generate_ollama_cases,
+    analyze_brd as analyze_ai_brd,
+    brd_analysis_markdown,
+    fallback_brd_analysis,
+    generate_brd_analysis as generate_ai_brd_analysis,
+    generate_requirements as generate_ai_requirements,
+    generate_test_cases as generate_ai_cases,
     validate_base_url,
+    validate_brd_analysis,
     validate_requirement_coverage,
 )
 from requirement_documents import extract_requirement_document
 from test_case_generator import generate_requirement_cases
+from ollama_integration import generate_ad_hoc_test_cases
+from ai_provider import active_provider_config, provider_settings, save_provider_settings
+import ai_provider
+
+
+class ServerStartupTests(unittest.TestCase):
+    def test_default_port_conflict_uses_an_available_port(self):
+        fallback_server = object()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QA_PORT", None)
+            with patch.object(
+                app,
+                "create_server",
+                side_effect=[OSError(errno.EADDRINUSE, "address already in use"), fallback_server],
+            ) as create_server:
+                self.assertIs(app.create_startup_server("127.0.0.1", 8001), fallback_server)
+
+        self.assertEqual(
+            create_server.call_args_list,
+            [
+                unittest.mock.call("127.0.0.1", 8001),
+                unittest.mock.call("127.0.0.1", 0),
+            ],
+        )
+
+    def test_explicit_port_conflict_is_not_silently_changed(self):
+        conflict = OSError(errno.EADDRINUSE, "address already in use")
+        with patch.dict(os.environ, {"QA_PORT": "8123"}):
+            with patch.object(app, "create_server", side_effect=conflict) as create_server:
+                with self.assertRaises(OSError):
+                    app.create_startup_server("127.0.0.1", 8123)
+
+        create_server.assert_called_once_with("127.0.0.1", 8123)
+
+
+def brd_analysis_fixture(**overrides):
+    analysis = {
+        "summary": "A user signs in to access the account.",
+        "brd_summary": {
+            "brd_name": "Account BRD",
+            "product": "Account Portal",
+            "platform": "Web",
+            "primary_users": ["User"],
+            "use_case_count": 1,
+        },
+        "use_cases": [{
+            "id": "UC-1",
+            "name": "Sign in",
+            "actor": "User",
+            "goal": "Access the account.",
+            "steps": [{"step": "Step 1", "summary": "User submits valid credentials."}],
+        }],
+        "functional_groups": [{
+            "name": "Authentication",
+            "requirements": [{
+                "id": "FR-1.1",
+                "title": "Sign in",
+                "statement": "The system shall allow users to sign in.",
+                "source_use_case": "UC-1",
+                "source_step": "Step 1",
+                "priority": "Not specified",
+            }],
+        }],
+        "non_functional_requirements": [],
+        "scope": {"in_scope": ["User sign in"], "out_of_scope": []},
+        "scope_constraints": [],
+        "traceability": [{
+            "use_case": "UC-1",
+            "scenario_step": "Step 1",
+            "requirement_ids": ["FR-1.1"],
+        }],
+        "requirement_gaps": [],
+    }
+    analysis.update(copy.deepcopy(overrides))
+    return analysis
+
+
+class AiProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])
+        self.db_path = Path(self.temp.name) / "ai-provider.sqlite3"
+        self.env = patch.dict(os.environ, {
+            "QA_AI_ENCRYPTION_KEY": "a" * 64,
+            "QA_ADMIN_PASSWORD": "test-admin-password-123",
+        })
+        self.env.start()
+        app.initialize(self.db_path)
+        self.db = app.connect(self.db_path)
+
+    def tearDown(self):
+        self.db.close()
+        self.env.stop()
+        self.temp.cleanup()
+
+    def test_provider_settings_encrypt_credentials_and_never_return_them(self):
+        settings = provider_settings(self.db)
+        self.assertEqual(settings["provider"], "google")
+        self.assertEqual(settings["model"], "gemini-2.5-flash")
+        self.assertFalse(settings["configured"])
+        self.assertEqual(
+            [provider["id"] for provider in settings["providers"]],
+            ["local", "ollama", "google", "openai-compatible"],
+        )
+        configured = save_provider_settings(self.db, {
+            "provider": "google",
+            "model": "gemini-2.5-flash",
+            "api_key": "test-secret-key",
+        })
+        self.assertTrue(configured["configured"])
+        self.assertNotIn("test-secret-key", json.dumps(configured))
+        stored = self.db.execute(
+            "SELECT api_key_ciphertext FROM ai_provider_configs WHERE provider='google'"
+        ).fetchone()["api_key_ciphertext"]
+        self.assertNotIn(b"test-secret-key", stored)
+        self.assertEqual(active_provider_config(self.db)["api_key"], "test-secret-key")
+
+    def test_provider_validation_and_encryption_key_rotation_errors(self):
+        with self.assertRaisesRegex(ValueError, "Choose Local deterministic"):
+            save_provider_settings(self.db, {"provider": "unknown"})
+        with self.assertRaisesRegex(ValueError, "Provider URL must use HTTPS"):
+            save_provider_settings(self.db, {
+                "provider": "openai-compatible",
+                "model": "some-model",
+                "base_url": "http://models.example/v1",
+                "api_key": "key",
+            })
+        save_provider_settings(self.db, {
+            "provider": "google",
+            "model": "gemini-2.5-flash",
+            "api_key": "test-secret-key",
+        })
+        with patch.dict(os.environ, {"QA_AI_ENCRYPTION_KEY": "b" * 64}):
+            with self.assertRaisesRegex(ValueError, "Could not decrypt stored provider credentials"):
+                active_provider_config(self.db)
+
+    def test_text_generation_calls_server_side_adapter_and_returns_text(self):
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps({"text": '{"requirements":[]}'}),
+            stderr="",
+        )
+        configuration = {
+            "provider": "google",
+            "model": "gemini-2.5-flash",
+            "base_url": "",
+            "api_key": "secret-test-key",
+        }
+        with (
+            patch("ai_provider.shutil.which", return_value="node"),
+            patch("ai_provider.subprocess.run", return_value=completed) as run,
+        ):
+            result = ai_provider.generate_text(
+                configuration, "system text", "BRD text", 0.1
+            )
+        self.assertEqual(result, '{"requirements":[]}')
+        request = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(request["provider"], "google")
+        self.assertEqual(request["model"], "gemini-2.5-flash")
+        self.assertEqual(request["prompt"], "BRD text")
+        self.assertEqual(request["apiKey"], "secret-test-key")
+
+    def test_text_generation_surfaces_provider_errors(self):
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=1,
+            stdout=json.dumps({"error": "Google Gemini rejected the API key."}),
+            stderr="",
+        )
+        with (
+            patch("ai_provider.shutil.which", return_value="node"),
+            patch("ai_provider.subprocess.run", return_value=completed),
+            self.assertRaisesRegex(ValueError, "rejected the API key"),
+        ):
+            ai_provider.generate_text(
+                {
+                    "provider": "google",
+                    "model": "gemini-2.5-flash",
+                    "base_url": "",
+                    "api_key": "secret-test-key",
+                },
+                "system text",
+                "BRD text",
+                0.1,
+            )
 
 
 class TestCaseGeneratorTests(unittest.TestCase):
@@ -76,7 +271,399 @@ class TestCaseGeneratorTests(unittest.TestCase):
         self.assertIn("performance", generated[0]["expected_result"].lower())
 
 
-class OllamaIntegrationTests(unittest.TestCase):
+class AdHocTestGenerationTests(unittest.TestCase):
+    source_text = "A user can submit a valid registration form."
+
+    def response(self, cases=None, questions=None):
+        return {
+            "test_cases": cases or [],
+            "analysis": {
+                "explicit_facts": ["A user can submit a valid registration form."],
+                "assumptions": [],
+                "coverage_gaps": ["Invalid input behavior is unspecified."],
+                "duplicates": [],
+                "unclear_or_conflicting": [],
+                "clarification_questions": questions or [],
+                "additional_recommendations": [],
+                "category_assessment": [
+                    {"category": category, "applicable": category == "Functional", "reason": "Supported by the supplied workflow."}
+                    for category in ("Functional", "Non-Functional", "Sanity", "Smoke")
+                ],
+            },
+        }
+
+    def case(self, **overrides):
+        item = {
+            "title": "Submit a valid registration",
+            "scenario": "A user submits a valid registration form",
+            "test_category": "Functional",
+            "test_type": "Functional",
+            "preconditions": "",
+            "test_data": "",
+            "steps": "1. Enter valid registration details.\n2. Submit the form.",
+            "expected_result": "The form is submitted.",
+            "priority": "Not specified",
+            "classification": "Positive",
+            "assumptions": "",
+            "source_reference": self.source_text,
+        }
+        return {**item, **overrides}
+
+    def generate(self, response):
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(response)}
+        }):
+            return generate_ad_hoc_test_cases(
+                "google", "gemini-2.5-flash", self.source_text,
+                ["Functional", "Non-Functional", "Sanity", "Smoke"],
+            )
+
+    def test_validates_traceable_cases_and_preserves_analysis(self):
+        result = self.generate(self.response([self.case()]))
+        self.assertEqual(len(result["test_cases"]), 1)
+        self.assertEqual(result["test_cases"][0]["classification"], "Positive")
+        self.assertEqual(result["test_cases"][0]["source_reference"], self.source_text)
+        self.assertEqual(
+            result["analysis"]["category_assessment"][1]["category"],
+            "Non-Functional",
+        )
+        self.assertTrue(result["test_cases"][0]["generation_key"])
+
+    def test_allows_no_cases_when_clarification_is_needed(self):
+        result = self.generate(self.response(questions=["What should happen for an invalid email?"]))
+        self.assertEqual(result["test_cases"], [])
+        self.assertTrue(result["analysis"]["clarification_questions"])
+
+    def test_flags_unverified_source_references_and_rejects_unexplained_empty_results(self):
+        result = self.generate(self.response([
+            self.case(source_reference="A made-up requirement")
+        ]))
+        self.assertEqual(result["test_cases"][0]["source_reference"], "")
+        self.assertIn(
+            "could not be verified",
+            result["analysis"]["traceability_warnings"][0],
+        )
+        self.assertIn(
+            "Source traceability needs review",
+            result["test_cases"][0]["assumptions"],
+        )
+        with self.assertRaisesRegex(ValueError, "did not provide clarification"):
+            self.generate(self.response())
+
+
+class AIIntegrationTests(unittest.TestCase):
+    def test_combined_brd_analysis_uses_one_model_request(self):
+        response = {
+            "requirements": [{
+                "title": "User login",
+                "description": "Users can sign in.",
+                "acceptance_criteria": "Valid credentials open the dashboard.",
+                "business_rules": "",
+                "validation_rules": "",
+                "dependencies": "",
+                "priority": "High",
+                "module_type": "Functional",
+                "module_category": "Functional",
+            }],
+            **brd_analysis_fixture(),
+        }
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(response)}
+        }) as request:
+            requirements, analysis = generate_ai_brd_analysis(
+                "http://127.0.0.1:11434", "llama3.1:8b", "Users can sign in."
+            )
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(requirements[0]["title"], "User login")
+        self.assertEqual(analysis["functional_groups"][0]["requirements"][0]["id"], "FR-1.1")
+
+    def test_brd_analysis_uses_the_provider_abstraction(self):
+        response = {
+            "requirements": [{
+                "title": "User login",
+                "description": "Users can sign in.",
+                "acceptance_criteria": "Valid credentials open the dashboard.",
+                "business_rules": "",
+                "validation_rules": "",
+                "dependencies": "",
+                "priority": "High",
+                "module_type": "Functional",
+                "module_category": "Functional",
+            }],
+            **brd_analysis_fixture(),
+        }
+        with patch(
+            "ollama_integration.generate_text",
+            return_value=json.dumps(response),
+        ) as generate:
+            requirements, analysis = generate_ai_brd_analysis(
+                "google", "gemini-4-argon", "Users can sign in."
+            )
+        self.assertEqual(requirements[0]["title"], "User login")
+        self.assertEqual(analysis["functional_groups"][0]["requirements"][0]["id"], "FR-1.1")
+        self.assertEqual(generate.call_args.args[:2], ("google", "gemini-4-argon"))
+        self.assertEqual(generate.call_args.kwargs["response_format"], "json")
+
+    def test_brd_analysis_is_structured_validated_and_exportable(self):
+        output = brd_analysis_fixture(
+            summary="Kanban boards support ticket triage and organization.",
+            functional_groups=[{
+                "name": "Board Configuration & Settings",
+                "requirements": [{
+                    "id": "FR-1.1",
+                    "title": "Configure columns",
+                    "statement": "The system shall let administrators configure board columns.",
+                    "source_use_case": "UC-1",
+                    "source_step": "Step 1",
+                    "priority": "Not specified",
+                }],
+            }],
+            non_functional_requirements=[{
+                "id": "NFR-1",
+                "category": "Platform & Integration",
+                "statement": "The system shall protect OAuth credentials.",
+                "source_step": "Security requirements",
+            }],
+            scope={"in_scope": ["Kanban board workspace"], "out_of_scope": []},
+            scope_constraints=[{
+                "id": "SC-1",
+                "basis": "Explicit",
+                "statement": "A board supports no more than 10 columns.",
+                "source": "Use Case 1",
+            }],
+        )
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(output)}
+        }) as request:
+            analysis = analyze_ai_brd(
+                "http://127.0.0.1:11434",
+                "llama3.1:8b",
+                "The board supports no more than 10 columns.",
+            )
+        self.assertEqual(analysis["functional_groups"][0]["requirements"][0]["id"], "FR-1.1")
+        self.assertEqual(
+            analysis["non_functional_requirements"][0]["category"],
+            "Platform & Integration",
+        )
+        prompt = request.call_args.args[2]["messages"][1]["content"]
+        self.assertIn("no more than 10 columns", prompt)
+        self.assertIn("Do not convert headings", prompt)
+        self.assertIn("Functional Requirements (FR)", prompt)
+        self.assertIn("Non-Functional Requirements (NFR)", prompt)
+        self.assertIn("Keep the Business Rules / Constraints section", prompt)
+        self.assertIn("traceability", prompt)
+        self.assertIn("requirement_gaps", prompt)
+        markdown = brd_analysis_markdown(analysis)
+        self.assertIn("## 6. Requirement Traceability Matrix", markdown)
+        self.assertIn("## 7. Requirement Gaps", markdown)
+        self.assertIn("| SC-1 | A board supports no more than 10 columns. | Use Case 1 |", markdown)
+        self.assertIn("## 8. QA Readiness Notes", markdown)
+
+        output["scope_constraints"][0]["id"] = "FR-1.1"
+        with self.assertRaisesRegex(ValueError, "invalid or duplicate SC identifier"):
+            validate_brd_analysis(output)
+
+    def test_brd_analysis_rejects_heading_only_reports_and_local_fallback_marks_gap(self):
+        with self.assertRaisesRegex(ValueError, "must contain a BRD summary"):
+            validate_brd_analysis({
+                "summary": "A BRD report",
+                "functional_groups": [{
+                    "name": "Business Requirements Document",
+                    "requirements": [{
+                        "id": "FR-1.1",
+                        "statement": "Business Requirements Document (BRD)",
+                    }],
+                }],
+                "non_functional_requirements": [],
+                "scope": {"in_scope": [], "out_of_scope": []},
+                "scope_constraints": [],
+            })
+
+        fallback = fallback_brd_analysis(
+            "# Goals\nUsers need a dashboard.\n# Use Case\nAgent opens dashboard.",
+        )
+        self.assertEqual(fallback["functional_groups"], [])
+        self.assertEqual(fallback["use_cases"], [])
+        self.assertEqual(fallback["requirement_gaps"][0]["impact"], "High")
+        self.assertIn("## 7. Requirement Gaps", brd_analysis_markdown(fallback))
+
+    def test_feature_table_requirements_do_not_require_a_use_case(self):
+        output = brd_analysis_fixture(
+            use_cases=[],
+            functional_groups=[{
+                "name": "Template selection",
+                "requirements": [{
+                    "id": "FR-1.1",
+                    "title": "Preview templates",
+                    "statement": "Administrators can preview templates.",
+                    "source_use_case": "",
+                    "source_step": "",
+                    "source_reference": "Feature matrix row A01",
+                    "priority": "Not specified",
+                }],
+            }],
+            traceability=[],
+            requirement_gaps=[],
+        )
+        analysis = validate_brd_analysis(output)
+        self.assertEqual(
+            analysis["functional_groups"][0]["requirements"][0]["source_reference"],
+            "Feature matrix row A01",
+        )
+
+    def test_generated_requirement_records_include_review_metadata_and_flow(self):
+        response = {
+            "requirements": [{
+                "title": "Build and save a board",
+                "description": "Allow an agent to configure a board and save it.",
+                "requirement_type": "Use Case",
+                "acceptance_criteria": "Source-defined: Given a valid configuration, when it is saved, then it is available to the agent.",
+                "business_rules": "",
+                "validation_rules": "",
+                "dependencies": "Inferred — board configuration; requires confirmation.",
+                "priority": "Not specified",
+                "module_type": "Functional",
+                "module_category": "Functional",
+                "source_section": "Use Case 1: Build and save a board",
+                "scope_classification": "In Scope",
+                "ai_confidence_status": "Supported",
+                "actor": "Agent",
+                "preconditions": "",
+                "trigger": "Agent chooses to create a board.",
+                "main_flow": "Configure and save board settings.",
+                "alternative_flow": "",
+                "exception_flow": "",
+                "related_requirements": "",
+            }],
+            **brd_analysis_fixture(
+                use_cases=[{
+                    "id": "UC-1",
+                    "name": "Build and save a board",
+                    "actor": "Agent",
+                    "goal": "Save a configured board.",
+                    "source_reference": "Use Case 1",
+                    "acceptance_criteria": [
+                        "A valid board can be saved.",
+                        "Invalid board settings show a source-defined validation error.",
+                    ],
+                    "steps": [
+                        {"step": "Step 1", "summary": "Agent configures board settings."},
+                        {"step": "Step 2", "summary": "Agent saves the board."},
+                    ],
+                }],
+                scope={
+                    "in_scope": ["Board configuration"],
+                    "out_of_scope": [],
+                    "requires_clarification": [],
+                },
+                application_flow=[{
+                    "step": "Create board",
+                    "actor": "Agent",
+                    "action": "Configure and save a board.",
+                    "system_response": "The board is saved.",
+                    "source_status": "Source-defined",
+                }],
+            ),
+        }
+        response["functional_groups"][0]["requirements"].append({
+            "id": "FR-1.2",
+            "title": "Save configured board",
+            "statement": "The system shall save the board configuration.",
+            "source_use_case": "UC-1",
+            "source_step": "Step 2",
+            "source_reference": "Use Case 1, Step 2",
+            "priority": "Not specified",
+        })
+        response["non_functional_requirements"] = [{
+            "id": "NFR-1",
+            "category": "Performance",
+            "statement": "The system shall save the board within the source-stated response threshold.",
+            "source_use_case": "UC-1",
+            "source_step": "Step 2",
+            "source_reference": "Use Case 1, Step 2",
+        }]
+        response["traceability"] = [{
+            "use_case": "UC-1",
+            "scenario_step": "Step 1",
+            "requirement_ids": ["FR-1.1"],
+        }, {
+            "use_case": "UC-1",
+            "scenario_step": "Step 2",
+            "requirement_ids": ["FR-1.2", "NFR-1"],
+        }]
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(response)}
+        }) as request:
+            requirements, analysis = generate_ai_brd_analysis(
+                "http://127.0.0.1:11434",
+                "llama3.1:8b",
+                "Use Case 1: Build and save a board. "
+                "Step 1: Agent configures the board. "
+                "Step 2: Agent saves the board within 2 seconds. "
+                "Acceptance criteria: A valid board can be saved.",
+            )
+        prompt = request.call_args.args[2]["messages"][1]["content"]
+        self.assertIn("one record for each distinct use case", prompt)
+        self.assertIn("do not make a separate canonical record", prompt.lower())
+        self.assertEqual(requirements[0]["requirement_type"], "Use Case")
+        self.assertEqual(requirements[0]["priority"], "Not specified")
+        self.assertEqual(len(requirements), 1)
+        self.assertEqual(len(analysis["functional_groups"][0]["requirements"]), 2)
+        self.assertEqual(analysis["non_functional_requirements"][0]["source_use_case"], "UC-1")
+        self.assertEqual(len(analysis["use_cases"][0]["acceptance_criteria"]), 2)
+        markdown = brd_analysis_markdown(analysis)
+        self.assertIn(
+            "| ID | Functional Requirement | Source Use Case | Scenario / Acceptance Criterion |",
+            markdown,
+        )
+        self.assertIn(
+            "| ID | Non-Functional Requirement | Source Use Case | Scenario / Acceptance Criterion |",
+            markdown,
+        )
+        self.assertIn("Acceptance Criterion 1: A valid board can be saved.", markdown)
+        self.assertEqual(analysis["application_flow"][0]["source_status"], "Source-defined")
+        self.assertIn("## Requirement Records", markdown)
+        self.assertIn("AI confidence / review: Supported", markdown)
+        self.assertIn("## Application Flow", markdown)
+        self.assertIn("| NFR-1 |", markdown)
+
+    def test_brd_analysis_fills_missing_traceability_rows_for_use_case_steps(self):
+        output = brd_analysis_fixture(
+            use_cases=[{
+                "id": "UC-1",
+                "name": "Sign in",
+                "actor": "User",
+                "goal": "Access the account.",
+                "steps": [
+                    {"step": "Step 1", "summary": "User submits credentials."},
+                    {"step": "Step 2", "summary": "System validates credentials."},
+                ],
+            }],
+            traceability=[{
+                "use_case": "UC-1",
+                "scenario_step": "Step 1",
+                "requirement_ids": ["FR-1.1"],
+            }],
+        )
+
+        analysis = validate_brd_analysis(output)
+
+        self.assertEqual(
+            analysis["traceability"],
+            [
+                {
+                    "use_case": "UC-1",
+                    "scenario_step": "Step 1",
+                    "requirement_ids": ["FR-1.1"],
+                },
+                {
+                    "use_case": "UC-1",
+                    "scenario_step": "Step 2",
+                    "requirement_ids": [],
+                },
+            ],
+        )
+
     def test_connection_is_local_and_generated_cases_are_validated(self):
         self.assertEqual(validate_base_url("http://127.0.0.1:11434/"), "http://127.0.0.1:11434")
         with self.assertRaisesRegex(ValueError, "local URL"):
@@ -84,10 +671,14 @@ class OllamaIntegrationTests(unittest.TestCase):
         output = {
             "test_cases": [{
                 "requirement_id": 4,
+                "use_case_id": "UC-1",
                 "scenario": "Verify valid login",
                 "description": "Generated from login acceptance criteria.",
+                "preconditions": "The login page is available.",
+                "test_data": "<Valid credentials>",
                 "steps": "1. Submit valid credentials.",
                 "expected_result": "The dashboard is displayed.",
+                "priority": "High",
                 "test_type": "Functional",
             }]
         }
@@ -99,27 +690,33 @@ class OllamaIntegrationTests(unittest.TestCase):
             "acceptance_criteria": "Valid credentials open the dashboard.",
             "business_rules": "",
             "validation_rules": "",
+            "priority": "High",
+            "source_section": "UC-1, Step 2",
         }
         with patch("ollama_integration._request", return_value={
             "message": {"content": json.dumps(output)}
         }) as request:
-            cases = generate_ollama_cases(
+            cases = generate_ai_cases(
                 "http://127.0.0.1:11434", "llama3.1:8b", [requirement],
                 [{"method": "GET", "path": "/login", "summary": "", "operation_id": "", "tags": '["auth"]'}],
                 {"routes": [], "components": [], "api_integrations": []},
             )
         self.assertEqual(len(cases), 1)
         self.assertEqual(cases[0]["requirement_id"], 4)
+        self.assertEqual(cases[0]["use_case_id"], "UC-1")
+        self.assertEqual(cases[0]["priority"], "High")
+        self.assertEqual(cases[0]["preconditions"], "The login page is available.")
         self.assertEqual(len(cases[0]["generation_key"]), 64)
         request_payload = request.call_args.args[2]
         self.assertIn('"tags": ["auth"]', request_payload["messages"][1]["content"])
         self.assertIn("must not repeat the scenario", request_payload["messages"][1]["content"])
+        self.assertIn("Requirement-to-Test-Case Generation", request_payload["messages"][0]["content"])
         output["test_cases"][0]["expected_result"] = output["test_cases"][0]["scenario"]
         with patch("ollama_integration._request", return_value={
             "message": {"content": json.dumps(output)}
         }):
             with self.assertRaisesRegex(ValueError, "scenario and expected result distinct"):
-                generate_ollama_cases(
+                generate_ai_cases(
                     "http://127.0.0.1:11434", "llama3.1:8b", [requirement], [], {}
                 )
         output["test_cases"][0]["expected_result"] = "The dashboard is displayed."
@@ -128,7 +725,7 @@ class OllamaIntegrationTests(unittest.TestCase):
             "message": {"content": json.dumps(output)}
         }):
             with self.assertRaisesRegex(ValueError, "unknown requirement"):
-                generate_ollama_cases(
+                generate_ai_cases(
                     "http://127.0.0.1:11434", "llama3.1:8b", [requirement], [],
                     {"routes": [], "components": [], "api_integrations": []},
                 )
@@ -138,9 +735,39 @@ class OllamaIntegrationTests(unittest.TestCase):
             "message": {"content": json.dumps(output)}
         }):
             with self.assertRaisesRegex(ValueError, "unsupported test type"):
-                generate_ollama_cases(
+                generate_ai_cases(
                     "http://127.0.0.1:11434", "llama3.1:8b", [requirement], [],
                     {"routes": [], "components": [], "api_integrations": []},
+                )
+        output["test_cases"][0]["test_type"] = "Functional"
+        output["test_cases"][0]["priority"] = "Critical"
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(output)}
+        }):
+            with self.assertRaisesRegex(ValueError, "priority not supplied"):
+                generate_ai_cases(
+                    "http://127.0.0.1:11434", "llama3.1:8b", [requirement], [], {}
+                )
+        output["test_cases"][0]["priority"] = "High"
+        output["test_cases"][0]["use_case_id"] = "UC-99"
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(output)}
+        }):
+            with self.assertRaisesRegex(ValueError, "use case not present"):
+                generate_ai_cases(
+                    "http://127.0.0.1:11434", "llama3.1:8b", [requirement], [], {}
+                )
+        output["test_cases"][0]["use_case_id"] = "UC-1"
+        output["test_cases"].append({
+            **output["test_cases"][0],
+            "test_data": "<Different credentials>",
+        })
+        with patch("ollama_integration._request", return_value={
+            "message": {"content": json.dumps(output)}
+        }):
+            with self.assertRaisesRegex(ValueError, "duplicates a scenario"):
+                generate_ai_cases(
+                    "http://127.0.0.1:11434", "llama3.1:8b", [requirement], [], {}
                 )
 
     def test_ai_requirement_extraction_and_evidence_cited_coverage_are_validated(self):
@@ -156,7 +783,7 @@ class OllamaIntegrationTests(unittest.TestCase):
         with patch("ollama_integration._request", return_value={
             "message": {"content": json.dumps(requirement_output)}
         }) as request:
-            requirements = generate_ollama_requirements(
+            requirements = generate_ai_requirements(
                 "http://127.0.0.1:11434", "llama3.1:8b", "Users need account login."
             )
         self.assertEqual(requirements[0]["title"], "Account login")
@@ -210,7 +837,7 @@ class OllamaIntegrationTests(unittest.TestCase):
         with patch("ollama_integration._request", return_value={
             "message": {"content": json.dumps(output)}
         }):
-            requirements = generate_ollama_requirements(
+            requirements = generate_ai_requirements(
                 "http://127.0.0.1:11434", "llama3.1:8b", "Login page must load in 2 seconds."
             )
         self.assertEqual(requirements[0]["module_type"], "Non-Functional")
@@ -223,7 +850,7 @@ class OllamaIntegrationTests(unittest.TestCase):
         with patch("ollama_integration._request", return_value={
             "message": {"content": json.dumps(output)}
         }):
-            requirements = generate_ollama_requirements(
+            requirements = generate_ai_requirements(
                 "http://127.0.0.1:11434", "llama3.1:8b", "Passwords must be encrypted."
             )
         self.assertEqual(requirements[0]["module_type"], "Non-Functional")
@@ -242,6 +869,10 @@ class RequirementDocumentTests(unittest.TestCase):
             <w:p><w:r><w:t>Valid credentials open the dashboard.</w:t></w:r></w:p>
             <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Validation Rules</w:t></w:r></w:p>
             <w:p><w:r><w:t>Email is required.</w:t></w:r></w:p>
+            <w:tbl><w:tr>
+              <w:tc><w:p><w:r><w:t>Feature ID</w:t></w:r></w:p></w:tc>
+              <w:tc><w:p><w:r><w:t>Feature</w:t></w:r></w:p></w:tc>
+            </w:tr></w:tbl>
             <w:sectPr/>
           </w:body>
         </w:document>"""
@@ -250,11 +881,39 @@ class RequirementDocumentTests(unittest.TestCase):
             archive.writestr("word/document.xml", document)
         return output.getvalue()
 
+    @staticmethod
+    def pdf_bytes():
+        stream = b"BT /F1 12 Tf 20 200 Td (Users can export reports.) Tj ET"
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream",
+        ]
+        output = bytearray(b"%PDF-1.4\n")
+        offsets = [0]
+        for index, body in enumerate(objects, 1):
+            offsets.append(len(output))
+            output.extend(f"{index} 0 obj\n".encode() + body + b"\nendobj\n")
+        xref_offset = len(output)
+        output.extend(f"xref\n0 {len(offsets)}\n".encode())
+        output.extend(b"0000000000 65535 f \n")
+        for offset in offsets[1:]:
+            output.extend(f"{offset:010} 00000 n \n".encode())
+        output.extend(
+            f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n".encode()
+        )
+        return bytes(output)
+
     def test_extracts_docx_headings_ids_acceptance_validation_and_source(self):
         text, records = extract_requirement_document(
             "requirements.docx", document_data=self.docx_bytes()
         )
         self.assertIn("Acceptance Criteria", text)
+        self.assertIn("Feature ID | Feature", text)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["requirement_key"], "REQ-105")
         self.assertEqual(records[0]["title"], "User login")
@@ -305,15 +964,55 @@ class RequirementDocumentTests(unittest.TestCase):
     def test_rejects_invalid_or_unsupported_documents(self):
         with self.assertRaisesRegex(ValueError, "valid document"):
             extract_requirement_document("broken.docx", document_data=b"not a document")
-        with self.assertRaisesRegex(ValueError, "Only DOCX, TXT, and Markdown"):
-            extract_requirement_document("requirements.pdf", content="ignored")
+        with self.assertRaisesRegex(ValueError, "Only PDF, DOCX, CSV, TXT, and Markdown"):
+            extract_requirement_document("requirements.rtf", content="ignored")
         with self.assertRaisesRegex(ValueError, "too large"):
             extract_requirement_document("requirements.txt", content="x" * 1_000_001)
+        _, heading_only_records = extract_requirement_document(
+            "headings.md",
+            content="\n".join(f"# REQ-{number:03d}: Item {number}" for number in range(101)),
+        )
+        self.assertEqual(heading_only_records, [])
         with self.assertRaisesRegex(ValueError, "too many requirements"):
             extract_requirement_document(
                 "many.md",
-                content="\n".join(f"# REQ-{number:03d}: Item {number}" for number in range(101)),
+                content="\n\n".join(
+                    f"# REQ-{number:03d}: Item {number}\nThe system shall process item {number}."
+                    for number in range(101)
+                ),
             )
+
+    def test_extracts_csv_feature_table_rows(self):
+        text, records = extract_requirement_document(
+            "features.csv",
+            content=(
+                "Feature ID,Feature,Description,Priority,Version\n"
+                "A01,Modern templates,Admins can preview templates before selection.,P0,v0.1\n"
+            ),
+        )
+        self.assertIn("A01 | Modern templates", text)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["title"], "Modern templates")
+        self.assertIn("preview templates", records[0]["description"])
+        self.assertEqual(records[0]["priority"], "High")
+        self.assertIn("A01", records[0]["source_evidence"])
+
+    def test_unstructured_background_text_is_not_promoted_to_a_requirement(self):
+        _, records = extract_requirement_document(
+            "background.txt",
+            content="# Product overview\nThe portal supports several account types.",
+        )
+        self.assertEqual(records, [])
+
+    def test_extracts_text_and_page_traceability_from_pdf(self):
+        text, records = extract_requirement_document(
+            "reports.pdf", document_data=self.pdf_bytes()
+        )
+        self.assertIn("[Page 1]", text)
+        self.assertIn("Users can export reports", text)
+        self.assertEqual(len(records), 1)
+        self.assertIn("export reports", records[0]["description"])
+        self.assertIn("Page 1", records[0]["source_section"])
 
     def test_initialize_migrates_existing_requirement_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -342,18 +1041,54 @@ class RequirementDocumentTests(unittest.TestCase):
                         updated_at TEXT NOT NULL, UNIQUE(project_id, case_key)
                     );"""
                 )
+                db.execute(
+                    """INSERT INTO projects
+                    (project_key,name,description,version,environment,qa_owner,created_at,updated_at)
+                    VALUES('LEGACY','Legacy project','','','','QA','2024-01-01','2024-01-01')"""
+                )
+                db.execute(
+                    """INSERT INTO requirements
+                    (project_id,requirement_key,title,source_document,review_status,created_at)
+                    VALUES(1,'REQ-001','Imported requirement','old.md','Reviewed','2024-01-01')"""
+                )
             app.initialize(db_path)
             with app.database(db_path) as db:
                 columns = {row["name"] for row in db.execute("PRAGMA table_info(requirements)")}
                 self.assertTrue({
                     "business_rules", "validation_rules", "dependencies", "source_section",
-                    "module_type", "module_category",
+                    "module_type", "module_category", "requirement_type",
+                    "scope_classification", "ai_confidence_status", "actor", "main_flow",
+                    "source_evidence", "origin", "source_suggestion_id",
                 }.issubset(columns))
                 case_columns = {row["name"] for row in db.execute("PRAGMA table_info(test_cases)")}
-                self.assertTrue({"test_type", "generation_key"}.issubset(case_columns))
+                self.assertTrue({
+                    "test_type", "generation_key", "requirement_origin",
+                    "requirement_approval_status", "source_suggestion_id",
+                    "source_requirement_key", "source_requirement_title",
+                    "title", "test_category", "classification", "assumptions",
+                    "source_reference",
+                }.issubset(case_columns))
+                self.assertEqual(
+                    tuple(db.execute(
+                        "SELECT origin,review_status FROM requirements WHERE requirement_key='REQ-001'"
+                    ).fetchone()),
+                    ("legacy_import", "Reviewed"),
+                )
                 self.assertIsNotNone(db.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='requirement_documents'"
                 ).fetchone())
+                for table_name in (
+                    "requirement_analysis_previews", "requirement_suggestions",
+                    "requirement_suggestion_history",
+                ):
+                    self.assertIsNotNone(db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                        (table_name,),
+                    ).fetchone())
+                document_columns = {
+                    row["name"] for row in db.execute("PRAGMA table_info(requirement_documents)")
+                }
+                self.assertIn("analysis_json", document_columns)
                 self.assertIsNotNone(db.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='ai_settings'"
                 ).fetchone())
@@ -404,7 +1139,9 @@ class ApplicationZipAnalysisTests(unittest.TestCase):
         self.assertIn("React", result["analysis"]["frameworks"])
         self.assertEqual(result["analysis"]["scanned_source_files"], 1)
         self.assertTrue(any(item["name"] == "AccountPage" for item in result["analysis"]["components"]))
-        self.assertTrue(any(item["route"] == "/api/account" for item in result["analysis"]["routes"]))
+        self.assertTrue(any(
+            "fetch" in item["kind"] for item in result["analysis"]["api_integrations"]
+        ))
 
     def test_rejects_traversal_absolute_and_windows_paths_without_writing_outside(self):
         malicious_paths = (
@@ -490,29 +1227,53 @@ class PlatformApiTests(unittest.TestCase):
         cls.thread.join(timeout=3)
         cls.temp.cleanup()
 
-    def request(self, path, method="GET", payload=None):
+    def request(self, path, method="GET", payload=None, authenticated=True):
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"}
+        if authenticated and getattr(self, "auth_cookie", None):
+            headers["Cookie"] = self.auth_cookie
         request = urllib.request.Request(
             self.base + path,
             data=body,
             method=method,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request) as response:
                 content = response.read()
                 if "application/json" in response.headers.get("Content-Type", ""):
-                    return response.status, json.loads(content)
-                return response.status, content
+                    result = (response.status, json.loads(content))
+                else:
+                    result = (response.status, content)
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
+        if (
+            method == "POST"
+            and path.endswith("/requirements/import")
+            and isinstance(payload, dict)
+            and "preview_id" not in payload
+            and "confirmed_preview" not in payload
+            and result[0] == 200
+            and isinstance(result[1], dict)
+            and result[1].get("preview_required")
+        ):
+            return self.request(
+                path,
+                method,
+                {**payload, "preview_id": result[1]["preview"]["preview_id"]},
+                authenticated=authenticated,
+            )
+        return result
 
-    def raw_request(self, path, body, content_type, method="POST"):
+    def raw_request(self, path, body, content_type, method="POST", authenticated=True):
+        headers = {"Content-Type": content_type}
+        if authenticated and getattr(self, "auth_cookie", None):
+            headers["Cookie"] = self.auth_cookie
         request = urllib.request.Request(
             self.base + path,
             data=body,
             method=method,
-            headers={"Content-Type": content_type},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request) as response:
@@ -521,31 +1282,85 @@ class PlatformApiTests(unittest.TestCase):
             return error.code, json.loads(error.read())
 
     def setUp(self):
+        ai_env = patch.dict(os.environ, {
+            "QA_ADMIN_PASSWORD": "test-admin-password-123",
+            "QA_AI_ENCRYPTION_KEY": "a" * 64,
+        })
+        ai_env.start()
+        self.addCleanup(ai_env.stop)
+        token = secrets.token_urlsafe(32)
+        with self.server.admin_session_lock:
+            self.server.admin_sessions.clear()
+            self.server.admin_sessions[token] = time.time() + 3600
+        self.auth_cookie = f"trace_admin_session={token}"
         with app.database(self.db_path) as db:
             db.execute("DELETE FROM projects")
+            db.execute("DELETE FROM ai_provider_configs WHERE provider != 'local'")
             db.execute(
-                """UPDATE ai_settings SET ollama_base_url='http://127.0.0.1:11434',
-                ollama_model='',updated_at=? WHERE id=1""",
+                "UPDATE ai_settings SET provider='local',updated_at=? WHERE id=1",
                 (app.timestamp(),),
             )
 
-    def test_ollama_settings_are_local_and_persisted(self):
+    def test_ai_settings_show_enabled_provider_without_exposing_credentials(self):
         status, settings = self.request("/api/ai/settings")
         self.assertEqual(status, 200)
-        self.assertEqual(settings["ollama_base_url"], "http://127.0.0.1:11434")
+        self.assertEqual(settings["provider"], "local")
+        self.assertEqual(settings["model"], "deterministic")
+        self.assertTrue(settings["configured"])
+        self.assertEqual(
+            [item["id"] for item in settings["providers"]],
+            ["local", "ollama", "google", "openai-compatible"],
+        )
+        self.assertNotIn("api_key", settings)
         status, error = self.request("/api/ai/settings", "POST", {
-            "ollama_base_url": "http://192.168.1.10:11434",
-            "ollama_model": "model:tag",
-        })
-        self.assertEqual(status, 400)
-        self.assertIn("local URL", error["error"])
-        status, saved = self.request("/api/ai/settings", "POST", {
-            "ollama_base_url": "http://127.0.0.1:11434/",
-            "ollama_model": "llama3.1:8b",
+            "provider": "google", "model": "gemini-2.5-flash",
+            "api_key": "test-key",
+        }, authenticated=False)
+        self.assertEqual(status, 401)
+        status, error = self.request(
+            "/api/auth/login", "POST", {"password": "incorrect"}, authenticated=False
+        )
+        self.assertEqual(status, 401)
+        self.assertIn("incorrect", error["error"])
+
+        login_request = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({"password": "test-admin-password-123"}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(login_request) as response:
+            self.assertEqual(response.status, 200)
+            login = json.loads(response.read())
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertTrue(login["authenticated"])
+        self.assertTrue(self.auth_cookie.startswith("trace_admin_session="))
+
+        status, configured = self.request("/api/ai/settings", "POST", {
+            "provider": "google",
+            "model": "gemini-2.5-flash",
+            "api_key": "test-secret-key",
         })
         self.assertEqual(status, 200)
-        self.assertEqual(saved["ollama_base_url"], "http://127.0.0.1:11434")
-        self.assertEqual(saved["ollama_model"], "llama3.1:8b")
+        self.assertTrue(configured["configured"])
+        self.assertNotIn("test-secret-key", json.dumps(configured))
+        status, configured = self.request("/api/ai/settings")
+        self.assertEqual(status, 200)
+        self.assertTrue(configured["configured"])
+        self.assertNotIn("test-secret-key", json.dumps(configured))
+
+        with patch("app.generate_provider_text", return_value="OK") as generate:
+            status, result = self.request("/api/ai/test", "POST", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(result["connected"])
+        self.assertEqual(result["provider"], "google")
+        self.assertEqual(result["model"], "gemini-2.5-flash")
+        self.assertNotIn("test-key", json.dumps(result))
+        self.assertEqual(generate.call_args.args[0]["provider"], "google")
+        status, _ = self.request("/api/auth/logout", "POST", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.request("/api/auth/status")[1]["authenticated"], False)
+        self.assertEqual(self.request("/api/ai/test", "POST", {}, authenticated=False)[0], 401)
 
     def test_project_isolation_and_required_validation(self):
         status, one = self.request("/api/projects", "POST", {
@@ -656,6 +1471,8 @@ class PlatformApiTests(unittest.TestCase):
             "requirement_id": requirement["id"], "scenario": "Check sign in",
             "test_type": "Functional", "description": "Verify sign in",
             "steps": "Enter valid credentials", "expected_result": "Dashboard appears",
+            "use_case_id": "UC-1", "preconditions": "Login page is available.",
+            "test_data": "<Valid credentials>", "priority": "Medium",
         })
         self.assertEqual(status, 201)
         _, edited = self.request(
@@ -664,12 +1481,18 @@ class PlatformApiTests(unittest.TestCase):
                 "steps": "Enter user credentials\nSubmit form",
                 "expected_result": "Dashboard appears", "test_type": "Negative",
                 "requirement_id": requirement["id"],
+                "use_case_id": "UC-2", "preconditions": "User is logged out.",
+                "test_data": "<Invalid credentials>", "priority": "High",
             }
         )
         self.assertEqual(edited["scenario"], "Check successful sign in")
         self.assertEqual(edited["description"], "Updated description")
         self.assertEqual(edited["steps"], "Enter user credentials\nSubmit form")
         self.assertEqual(edited["test_type"], "Negative")
+        self.assertEqual(edited["use_case_id"], "UC-2")
+        self.assertEqual(edited["preconditions"], "User is logged out.")
+        self.assertEqual(edited["test_data"], "<Invalid credentials>")
+        self.assertEqual(edited["priority"], "High")
         _, execution = self.request(f"/api/projects/{project['id']}/executions/{case['id']}", "POST", {
             "status": "Pass", "actual_result": "Dashboard appeared", "executed_by": "QA",
         })
@@ -701,7 +1524,11 @@ class PlatformApiTests(unittest.TestCase):
         _, case = self.request(f"/api/projects/{project['id']}/test-cases", "POST", {
             "scenario": "Valid sign in", "requirement_id": imported["created"][0]["id"],
             "steps": "Enter credentials", "expected_result": "Dashboard opens",
+            "use_case_id": "UC-1", "preconditions": "Login page is open.",
+            "test_data": "<Valid credentials>", "priority": "High",
         })
+        self.assertEqual(case["use_case_id"], "UC-1")
+        self.assertEqual(case["priority"], "High")
         _, edited_case = self.request(
             f"/api/projects/{project['id']}/test-cases/{case['id']}",
             "PATCH", {"description": "Positive login path"},
@@ -725,6 +1552,9 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(csv_bytes.startswith(b"\xef\xbb\xbf"))
         self.assertIn(b"Valid sign in", csv_bytes)
+        self.assertIn(b"Use Case ID", csv_bytes)
+        self.assertIn(b"Preconditions", csv_bytes)
+        self.assertIn(b"<Valid credentials>", csv_bytes)
         self.assertIn(b"Not Covered", csv_bytes)
         self.assertIn(b"Sign in fails", csv_bytes)
         saved_report = (
@@ -810,6 +1640,143 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(distinct["requirement_key"], "REQ-003")
 
+    def test_requirement_import_rejects_non_string_generator(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Invalid generator", "project_key": "INVALIDGEN", "qa_owner": "QA"
+        })
+        status, error = self.request(
+            f"/api/projects/{project['id']}/requirements/import",
+            "POST",
+            {
+                "filename": "spec.txt",
+                "content": "Users can sign in.",
+                "generator": {},
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            error["error"],
+            "Choose Local deterministic or a configured AI provider.",
+        )
+
+    def test_requirement_import_waits_for_explicit_preview_confirmation(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Preview before save", "project_key": "PREVIEW", "qa_owner": "QA"
+        })
+        path = f"/api/projects/{project['id']}/requirements/import"
+        payload = {
+            "filename": "spec.md",
+            "content": "# Sign in\nUsers can sign in with an email address.",
+            "generator": "deterministic",
+        }
+        status, preview_response = self.raw_request(
+            path,
+            json.dumps(payload).encode("utf-8"),
+            "application/json",
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(preview_response["preview_required"])
+        preview = preview_response["preview"]
+        self.assertEqual(len(preview["requirements"]), 1)
+        self.assertEqual(preview["requirements"][0]["title"], "Sign in")
+        with app.database(self.db_path) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM requirements WHERE project_id=?", (project["id"],)).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM requirement_documents WHERE project_id=?",
+                    (project["id"],),
+                ).fetchone()[0],
+                0,
+            )
+
+        status, imported = self.request(
+            path,
+            "POST",
+            {**payload, "preview_id": preview["preview_id"]},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(imported["count"], 1)
+        self.assertEqual(imported["created"][0]["title"], "Sign in")
+
+    def test_requirement_import_preview_is_server_issued_and_source_bound(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Bound preview", "project_key": "BOUND", "qa_owner": "QA"
+        })
+        path = f"/api/projects/{project['id']}/requirements/import"
+        payload = {
+            "filename": "spec.md",
+            "content": "# Sign in\nUsers can sign in.",
+            "generator": "deterministic",
+        }
+        status, result = self.raw_request(
+            path, json.dumps(payload).encode("utf-8"), "application/json"
+        )
+        self.assertEqual(status, 200)
+        preview_id = result["preview"]["preview_id"]
+        status, changed_source = self.request(
+            path,
+            "POST",
+            {
+                **payload,
+                "content": "# Sign in\nUsers can sign in using a different flow.",
+                "preview_id": preview_id,
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("source changed after preview", changed_source["error"])
+        status, forged_preview = self.request(
+            path,
+            "POST",
+            {**payload, "confirmed_preview": result["preview"]},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("preview is no longer valid", forged_preview["error"])
+        with app.database(self.db_path) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM requirements WHERE project_id=?", (project["id"],)).fetchone()[0],
+                0,
+            )
+        status, imported = self.request(
+            path, "POST", {**payload, "preview_id": preview_id}
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(imported["created"][0]["origin"], "extracted")
+        status, cancelled_preview = self.raw_request(
+            path, json.dumps(payload).encode("utf-8"), "application/json"
+        )
+        self.assertEqual(status, 200)
+        cancelled_id = cancelled_preview["preview"]["preview_id"]
+        status, deleted = self.request(
+            f"/api/projects/{project['id']}/requirements/previews/{cancelled_id}",
+            "DELETE",
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(deleted["deleted"])
+
+    def test_requirement_import_never_falls_back_to_the_whole_document(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "No fallback requirement", "project_key": "NOFALLBACK", "qa_owner": "QA"
+        })
+        status, imported = self.request(
+            f"/api/projects/{project['id']}/requirements/import", "POST",
+            {
+                "filename": "overview.txt",
+                "content": "# Product overview\nThe portal supports several account types.",
+                "generator": "deterministic",
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(imported["count"], 0)
+        self.assertEqual(imported["total_extracted"], 0)
+        status, requirements = self.request(
+            f"/api/projects/{project['id']}/requirements"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(requirements, [])
+
     def test_ai_requirement_import_and_requirement_only_case_generation(self):
         _, project = self.request("/api/projects", "POST", {
             "name": "AI requirement flow", "project_key": "AIREQ", "qa_owner": "QA"
@@ -822,38 +1789,197 @@ class PlatformApiTests(unittest.TestCase):
             "validation_rules": "Email address is required.",
             "dependencies": "",
             "priority": "High",
+            "source_section": "Users need a way to reset their password.",
         }
-        with patch("app.generate_ollama_requirements", return_value=[generated_requirement]):
+        generated_analysis = brd_analysis_fixture(
+            summary="A password reset flow with security and validation requirements.",
+            functional_groups=[{
+                "name": "Account Management",
+                "requirements": [{
+                    "id": "FR-1.1",
+                    "title": "Request password reset",
+                    "statement": "The system shall allow users to request a password reset.",
+                    "source_use_case": "UC-1",
+                    "source_step": "Step 1",
+                    "priority": "High",
+                }],
+            }],
+            non_functional_requirements=[{
+                "id": "NFR-1",
+                "category": "Security",
+                "statement": "The system shall validate the reset request.",
+                "source_use_case": "UC-1",
+                "source_step": "Step 1",
+            }],
+            scope={"in_scope": ["Password reset"], "out_of_scope": []},
+            scope_constraints=[{
+                "id": "SC-1",
+                "basis": "Explicit",
+                "statement": "The user must provide a registered email address.",
+                "source": "UC-1, Step 1",
+            }],
+        )
+        with app.database(self.db_path) as db:
+            save_provider_settings(db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+                "api_key": "test-key",
+            })
+        with patch(
+            "app.generate_brd_analysis",
+            return_value=([generated_requirement], generated_analysis),
+        ) as generate:
             status, imported = self.request(
                 f"/api/projects/{project['id']}/requirements/import", "POST",
                 {
                     "filename": "raw.txt",
                     "content": "Users need a way to reset their password.",
-                    "generator": "ollama",
+                    "generator": "google",
                 },
             )
         self.assertEqual(status, 201)
-        self.assertEqual(imported["generator"], "ollama")
+        self.assertEqual(imported["generator"], "google")
         self.assertEqual(imported["count"], 1)
+        self.assertEqual(imported["analysis_source"], "google")
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(imported["analysis"]["summary"], generated_analysis["summary"])
+        self.assertEqual(imported["analysis"]["requirements"][0]["title"], "Reset password")
+        self.assertEqual(imported["analysis"]["requirements"][0]["requirement_key"], "")
+        self.assertEqual(imported["suggestions_added"], 1)
+        document_id = imported["document"]["id"]
+        status, saved_analysis = self.request(
+            f"/api/projects/{project['id']}/requirements/documents/{document_id}/analysis"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(saved_analysis["analysis"], imported["analysis"])
+        status, markdown = self.request(
+            f"/api/projects/{project['id']}/requirements/documents/{document_id}/analysis.md"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"FR-1.1", markdown)
+        self.assertIn(b"## 5. Business Rules / Constraints", markdown)
         requirement = imported["created"][0]
-        self.assertEqual(requirement["priority"], "High")
+        self.assertEqual(requirement["origin"], "extracted")
+        self.assertEqual(requirement["review_status"], "Needs review")
+        self.assertTrue(requirement["source_evidence"])
+        status, suggestions = self.request(
+            f"/api/projects/{project['id']}/requirements/suggestions"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0]["status"], "Pending")
+        self.assertEqual(suggestions[0]["original_content"]["title"], "Reset password")
+        self.assertEqual(
+            suggestions[0]["source_reference"],
+            "Users need a way to reset their password.",
+        )
+        self.assertTrue(suggestions[0]["source_evidence"])
+        status, blocked = self.request(
+            f"/api/projects/{project['id']}/test-cases/generate", "POST",
+            {"generator": "deterministic"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("mark at least one as Reviewed", blocked["error"])
+        status, accepted = self.request(
+            f"/api/projects/{project['id']}/requirements/suggestions/{suggestions[0]['id']}",
+            "PATCH",
+            {"action": "accept"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(accepted["status"], "Accepted")
+        self.assertEqual(len(accepted["history"]), 1)
+        accepted_requirement_id = accepted["accepted_requirement_id"]
+        status, protected = self.request(
+            f"/api/projects/{project['id']}/requirements/analyze", "POST", {}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("are protected from AI overwrites", protected["error"])
+        status, edited_requirement = self.request(
+            f"/api/projects/{project['id']}/requirements/{accepted_requirement_id}",
+            "PATCH",
+            {"title": "Approved password reset", "review_status": "Reviewed"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(edited_requirement["origin"], "ai_suggestion")
+        with patch(
+            "app.generate_brd_analysis",
+            return_value=([generated_requirement], generated_analysis),
+        ):
+            status, rerun = self.request(
+                f"/api/projects/{project['id']}/requirements/import", "POST",
+                {
+                    "filename": "raw.txt",
+                    "content": "Users need a way to reset their password.",
+                    "generator": "google",
+                },
+            )
+        self.assertEqual(status, 201)
+        self.assertEqual(rerun["count"], 0)
+        status, current_requirements = self.request(
+            f"/api/projects/{project['id']}/requirements"
+        )
+        self.assertEqual(status, 200)
+        unchanged = next(item for item in current_requirements if item["id"] == accepted_requirement_id)
+        self.assertEqual(unchanged["title"], "Approved password reset")
+        self.assertEqual(unchanged["origin"], "ai_suggestion")
+        status, all_suggestions = self.request(
+            f"/api/projects/{project['id']}/requirements/suggestions"
+        )
+        accepted_saved = next(item for item in all_suggestions if item["status"] == "Accepted")
+        self.assertEqual(len(accepted_saved["history"]), 2)
+        pending = next(item for item in all_suggestions if item["status"] == "Pending")
+        status, edited_suggestion = self.request(
+            f"/api/projects/{project['id']}/requirements/suggestions/{pending['id']}",
+            "PATCH",
+            {
+                "action": "edit",
+                "content": {**pending["content"], "title": "Edited proposal"},
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(edited_suggestion["content"]["title"], "Edited proposal")
+        self.assertEqual(len(edited_suggestion["history"]), 1)
+        status, rejected = self.request(
+            f"/api/projects/{project['id']}/requirements/suggestions/{pending['id']}",
+            "PATCH",
+            {"action": "reject"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(rejected["status"], "Rejected")
+        self.assertEqual(len(rejected["history"]), 2)
         status, generated = self.request(
             f"/api/projects/{project['id']}/test-cases/generate", "POST",
             {"generator": "deterministic"},
         )
         self.assertEqual(status, 200)
         self.assertEqual(generated["count"], 2)
-        self.assertTrue(all(item["requirement_id"] == requirement["id"] for item in generated["created"]))
+        self.assertTrue(all(item["requirement_id"] == accepted_requirement_id for item in generated["created"]))
+        status, cases = self.request(f"/api/projects/{project['id']}/test-cases")
+        self.assertEqual(status, 200)
+        self.assertTrue(all(item["requirement_origin"] == "ai_suggestion" for item in cases))
+        self.assertTrue(all(item["requirement_approval_status"] == "Reviewed" for item in cases))
+        self.assertTrue(all(item["source_suggestion_id"] == accepted["id"] for item in cases))
+        self.assertTrue(all(item["source_requirement_key"] for item in cases))
+        self.assertTrue(all(
+            item["source_requirement_title"] == "Approved password reset"
+            for item in cases
+        ))
         self.assertIn(requirement["module_type"], {"Functional", "Non-Functional"})
         self.assertTrue(requirement["module_category"])
 
-    def test_file_import_falls_back_to_rule_classification_when_ollama_is_unavailable(self):
+    def test_file_import_falls_back_to_rule_classification_when_gemini_is_unavailable(self):
         _, project = self.request("/api/projects", "POST", {
             "name": "Rule fallback", "project_key": "RULEFALL", "qa_owner": "QA"
         })
+        with app.database(self.db_path) as db:
+            save_provider_settings(db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+                "api_key": "test-key",
+            })
         with patch(
-            "app.generate_ollama_requirements",
-            side_effect=ValueError("Select an installed Ollama model."),
+            "app.generate_brd_analysis",
+            side_effect=ValueError("Google Gemini request failed."),
         ):
             status, imported = self.request(
                 f"/api/projects/{project['id']}/requirements/import", "POST",
@@ -865,6 +1991,8 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(imported["generator"], "deterministic")
         self.assertIn("Local AI analysis was unavailable", imported["analysis_warning"])
+        self.assertEqual(imported["analysis_source"], "rule-based")
+        self.assertIn("Use-case analysis was unavailable", imported["analysis"]["summary"])
         requirement = imported["created"][0]
         self.assertEqual(requirement["module_type"], "Non-Functional")
         self.assertEqual(requirement["module_category"], "Security")
@@ -881,7 +2009,13 @@ class PlatformApiTests(unittest.TestCase):
             f"/api/projects/{project['id']}/requirements", "POST",
             {"title": "Checkout latency", "description": "Checkout responds quickly."},
         )
-        with patch("app.classify_ollama_requirements", return_value=[
+        with app.database(self.db_path) as db:
+            save_provider_settings(db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+                "api_key": "test-key",
+            })
+        with patch("app.classify_requirements", return_value=[
             {
                 "requirement_id": functional["id"],
                 "module_type": "Functional",
@@ -936,6 +2070,8 @@ class PlatformApiTests(unittest.TestCase):
         _, cases = self.request(f"/api/projects/{project['id']}/test-cases")
         remaining_case = next(item for item in cases if item["id"] == case["id"])
         self.assertIsNone(remaining_case["requirement_id"])
+        self.assertEqual(remaining_case["requirement_key"], requirement["requirement_key"])
+        self.assertEqual(remaining_case["source_requirement_title"], requirement["title"])
 
     def test_only_text_import_and_execution_status_validation(self):
         _, project = self.request("/api/projects", "POST", {"name": "Only text", "project_key": "TEXT", "qa_owner": "QA"})
@@ -943,7 +2079,7 @@ class PlatformApiTests(unittest.TestCase):
             "filename": "application.zip", "content": "not actually a zip"
         })
         self.assertEqual(status, 400)
-        self.assertIn("Only DOCX, TXT, and Markdown", error["error"])
+        self.assertIn("Only PDF, DOCX, CSV, TXT, and Markdown", error["error"])
         _, case = self.request(f"/api/projects/{project['id']}/test-cases", "POST", {"scenario": "Case"})
         status, error = self.request(f"/api/projects/{project['id']}/executions/{case['id']}", "POST", {
             "status": "Maybe"
@@ -999,6 +2135,8 @@ class PlatformApiTests(unittest.TestCase):
             "name": "Other requirements", "project_key": "REQOTHER", "qa_owner": "QA"
         })
         docx = RequirementDocumentTests.docx_bytes()
+        stored_path = Path(self.server.storage_root) / "projects" / str(project["id"]) / "requirements"
+        existing_files = set(stored_path.iterdir()) if stored_path.exists() else set()
         status, imported = self.request(
             f"/api/projects/{project['id']}/requirements/import",
             "POST",
@@ -1015,13 +2153,18 @@ class PlatformApiTests(unittest.TestCase):
         self.assertIn("required", requirement["validation_rules"])
         self.assertEqual(requirement["source_document"], "login.docx")
         self.assertEqual(imported["document"]["file_size_bytes"], len(docx))
-        stored_path = Path(self.server.storage_root) / "projects" / str(project["id"]) / "requirements"
-        self.assertEqual(len(list(stored_path.iterdir())), 1)
+        self.assertEqual(len(list(stored_path.iterdir())), len(existing_files) + 1)
 
         _, documents = self.request(
             f"/api/projects/{project['id']}/requirements/documents"
         )
         self.assertEqual(documents[0]["filename"], "login.docx")
+        self.assertTrue(documents[0]["has_analysis"])
+        status, saved_analysis = self.request(
+            f"/api/projects/{project['id']}/requirements/documents/{documents[0]['id']}/analysis"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Use-case analysis was unavailable", saved_analysis["analysis"]["summary"])
         status, original = self.request(
             f"/api/projects/{project['id']}/requirements/documents/{documents[0]['id']}"
         )
@@ -1053,7 +2196,7 @@ class PlatformApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("already exists", error["error"])
-        self.assertEqual(len(list(stored_path.iterdir())), 1)
+        self.assertEqual(len(list(stored_path.iterdir())), len(existing_files) + 1)
 
     def test_application_zip_upload_persists_analysis_and_is_project_scoped(self):
         _, project = self.request("/api/projects", "POST", {
@@ -1122,7 +2265,13 @@ class PlatformApiTests(unittest.TestCase):
                 "snippet": "export function login()",
             }],
         }]
-        with patch("app.validate_ollama_requirement_coverage", return_value=report) as validate:
+        with app.database(self.db_path) as db:
+            save_provider_settings(db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+                "api_key": "test-key",
+            })
+        with patch("app.validate_requirement_coverage", return_value=report) as validate:
             status, result = self.request(
                 f"/api/projects/{project['id']}/applications/{uploaded['id']}/validate-requirements",
                 "POST", {},
@@ -1219,9 +2368,32 @@ class PlatformApiTests(unittest.TestCase):
         status, error = self.request(
             f"/api/projects/{project['id']}/test-cases/generate", "POST", {}
         )
+        self.assertEqual(status, 400)
+        self.assertIn("mark at least one as Reviewed", error["error"])
+        status, error = self.request(
+            f"/api/projects/{project['id']}/test-cases/generate",
+            "POST",
+            {"requirement_ids": [requirement["id"]]},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("marked Reviewed", error["error"])
+        status, error = self.request(
+            f"/api/projects/{project['id']}/requirements/{requirement['id']}",
+            "PATCH",
+            {"review_status": "Reviewed"},
+        )
+        self.assertEqual(status, 200)
+        status, error = self.request(
+            f"/api/projects/{project['id']}/test-cases/generate", "POST", {}
+        )
         self.assertEqual(status, 200)
         self.assertEqual(error["count"], 4)
+        self.assertEqual(error["coverage"]["reviewed_requirements"], 1)
+        self.assertEqual(error["coverage"]["covered_requirements"], 1)
+        self.assertEqual(error["coverage"]["uncovered_requirements"], [])
         self.assertTrue(all(case["requirement_id"] == requirement["id"] for case in error["created"]))
+        self.assertTrue(all(case["priority"] == "Medium" for case in error["created"]))
+        self.assertTrue(all("preconditions" in case and "test_data" in case for case in error["created"]))
         api_spec = {
             "openapi": "3.0.3",
             "info": {"title": "Accounts API", "version": "1.0"},
@@ -1280,40 +2452,69 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(repeated["skipped_existing"], 4)
         _, cases = self.request(f"/api/projects/{project['id']}/test-cases")
         self.assertEqual(len(cases), 4)
-        _, settings = self.request("/api/ai/settings", "POST", {
-            "ollama_base_url": "http://127.0.0.1:11434",
-            "ollama_model": "llama3.1:8b",
-        })
-        self.assertEqual(settings["ollama_model"], "llama3.1:8b")
+        _, uncovered_requirement = self.request(
+            f"/api/projects/{project['id']}/requirements",
+            "POST",
+            {"title": "Account recovery"},
+        )
+        self.request(
+            f"/api/projects/{project['id']}/requirements/{uncovered_requirement['id']}",
+            "PATCH",
+            {"review_status": "Reviewed"},
+        )
+        with app.database(self.db_path) as db:
+            save_provider_settings(db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+            })
+        status, result = self.request(
+            f"/api/projects/{project['id']}/test-cases/generate",
+            "POST",
+            {"generator": "google"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("Add the API key", result["error"])
+        with app.database(self.db_path) as db:
+            save_provider_settings(db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+                "api_key": "test-key",
+            })
         with patch(
-            "app.generate_ollama_test_cases",
-            side_effect=ValueError("Could not connect to Ollama at http://127.0.0.1:11434."),
+            "app.generate_test_cases",
+            side_effect=ValueError("Google Gemini request failed."),
         ):
             status, result = self.request(
                 f"/api/projects/{project['id']}/test-cases/generate",
                 "POST",
-                {"generator": "ollama"},
+                {"generator": "google"},
             )
         self.assertEqual(status, 400)
-        self.assertIn("Could not connect to Ollama", result["error"])
-        with patch("app.generate_ollama_test_cases", return_value=[{
+        self.assertIn("Google Gemini request failed", result["error"])
+        with patch("app.generate_test_cases", return_value=[{
             "requirement_id": requirement["id"],
             "scenario": "AI draft case",
             "description": "Generated from the requirement.",
             "steps": "1. Follow the login workflow.",
             "expected_result": "The documented result is shown.",
             "test_type": "Functional",
-            "generation_key": "ollama-test-key",
+            "generation_key": "google-test-key",
         }]):
             status, result = self.request(
                 f"/api/projects/{project['id']}/test-cases/generate",
                 "POST",
-                {"generator": "ollama"},
+                {"generator": "google"},
             )
         self.assertEqual(status, 200)
-        self.assertEqual(result["generator"], "ollama")
+        self.assertEqual(result["generator"], "google")
         self.assertEqual(result["count"], 1)
-        self.assertEqual(result["created"][0]["generation_key"], "ollama-test-key")
+        self.assertEqual(result["created"][0]["generation_key"], "google-test-key")
+        self.assertEqual(result["coverage"]["reviewed_requirements"], 2)
+        self.assertEqual(result["coverage"]["covered_requirements"], 1)
+        self.assertEqual(
+            result["coverage"]["uncovered_requirements"][0]["requirement_key"],
+            uncovered_requirement["requirement_key"],
+        )
         _, isolated = self.request(f"/api/projects/{other['id']}/test-cases")
         self.assertEqual(isolated, [])
         status, error = self.request(
@@ -1323,6 +2524,135 @@ class PlatformApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("do not belong", error["error"])
+
+    def test_ai_assisted_generation_works_without_requirements_and_preserves_case_metadata(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Ad hoc generation", "project_key": "ADHOC", "qa_owner": "QA"
+        })
+        path = f"/api/projects/{project['id']}/test-cases/generate"
+        payload = {
+            "mode": "ai_assisted",
+            "source_text": "A user can submit a valid registration form.",
+            "categories": ["Functional", "Non-Functional", "Sanity", "Smoke"],
+            "generator": "local",
+        }
+        status, error = self.request(path, "POST", payload)
+        self.assertEqual(status, 400)
+        self.assertIn("model-based provider", error["error"])
+        with app.database(self.db_path) as db:
+            save_provider_settings(db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+                "api_key": "test-key",
+            })
+        case = {
+            "title": "Submit a valid registration",
+            "scenario": "A user submits a valid registration form",
+            "description": "AI-assisted draft from user-provided content.",
+            "steps": "1. Enter valid details.\n2. Submit the form.",
+            "expected_result": "The form is submitted.",
+            "preconditions": "",
+            "test_data": "",
+            "priority": "Not specified",
+            "test_type": "Functional",
+            "test_category": "Functional",
+            "classification": "Positive",
+            "assumptions": "Assumption: the registration page is available.",
+            "source_reference": "A user can submit a valid registration form.",
+            "generation_key": "ad-hoc-generation-key",
+        }
+        analysis = {
+            "explicit_facts": ["A user can submit a valid registration form."],
+            "assumptions": ["The registration page is available."],
+            "coverage_gaps": ["Invalid input behavior is unspecified."],
+            "duplicates": [],
+            "unclear_or_conflicting": [],
+            "clarification_questions": [],
+            "additional_recommendations": [],
+            "category_assessment": [
+                {"category": category, "applicable": category == "Functional", "reason": "Not supported by input."}
+                for category in payload["categories"]
+            ],
+        }
+        with patch("app.generate_ad_hoc_test_cases", return_value={
+            "test_cases": [case], "analysis": analysis,
+        }) as generate:
+            status, result = self.request(path, "POST", {**payload, "generator": "google"})
+        self.assertEqual(status, 200)
+        generate.assert_called_once()
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["analysis"]["coverage_gaps"], analysis["coverage_gaps"])
+        created = result["created"][0]
+        self.assertIsNone(created["requirement_id"])
+        self.assertEqual(created["title"], case["title"])
+        self.assertEqual(created["classification"], "Positive")
+        self.assertEqual(created["source_reference"], case["source_reference"])
+
+        status, updated = self.request(
+            f"/api/projects/{project['id']}/test-cases/{created['id']}",
+            "PATCH",
+            {
+                "title": "Updated registration test",
+                "test_category": "Sanity",
+                "classification": "Negative",
+                "assumptions": "Assumption: an invalid email is rejected.",
+            },
+        )
+        self.assertEqual(status, 200)
+        _, listed = self.request(f"/api/projects/{project['id']}/test-cases")
+        self.assertEqual(listed[0]["title"], "Updated registration test")
+        self.assertEqual(listed[0]["test_category"], "Sanity")
+        self.assertEqual(listed[0]["classification"], "Negative")
+        _, report = self.request(f"/api/projects/{project['id']}/report/csv")
+        self.assertIn(b"Test Category", report)
+        self.assertIn(b"Source Reference", report)
+        self.assertIn(b"Updated registration test", report)
+
+    def test_ai_assisted_generation_requires_input_and_returns_clarification_without_cases(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Clarification", "project_key": "CLARIFY", "qa_owner": "QA"
+        })
+        path = f"/api/projects/{project['id']}/test-cases/generate"
+        status, error = self.request(path, "POST", {
+            "mode": "ai_assisted", "source_text": "   ", "generator": "local",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("required", error["error"])
+        with app.database(self.db_path) as db:
+            save_provider_settings(db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+                "api_key": "test-key",
+            })
+        clarification = {
+            "explicit_facts": [],
+            "assumptions": [],
+            "coverage_gaps": [],
+            "duplicates": [],
+            "unclear_or_conflicting": [],
+            "clarification_questions": ["What outcome should follow submission?"],
+            "additional_recommendations": [],
+            "category_assessment": [{
+                "category": "Functional",
+                "applicable": False,
+                "reason": "No workflow was supplied.",
+            }],
+        }
+        with patch("app.generate_ad_hoc_test_cases", return_value={
+            "test_cases": [], "analysis": clarification,
+        }):
+            status, result = self.request(path, "POST", {
+                "mode": "ai_assisted",
+                "source_text": "Something should happen after submission.",
+                "categories": ["Functional"],
+                "generator": "google",
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(result["status"], "needs_clarification")
+        self.assertEqual(result["count"], 0)
+        self.assertTrue(result["analysis"]["clarification_questions"])
+        _, listed = self.request(f"/api/projects/{project['id']}/test-cases")
+        self.assertEqual(listed, [])
 
     def test_execution_evidence_storage_access_and_report_reference(self):
         _, project = self.request("/api/projects", "POST", {"name": "Evidence", "project_key": "EVID", "qa_owner": "QA"})

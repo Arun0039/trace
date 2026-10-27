@@ -181,6 +181,10 @@ def generate_requirement_cases(requirement: dict[str, Any]) -> list[dict[str, st
         result.append({
             "scenario": scenario[:200],
             "description": f"Draft generated from {requirement_key}: {source_text}",
+            "preconditions": "",
+            "test_data": "",
+            "use_case_id": "",
+            "priority": str(requirement.get("priority") or "Not specified"),
             "steps": steps,
             "expected_result": expected,
             "test_type": case_type,
@@ -216,6 +220,10 @@ def generate_project_cases(
                 f"Draft generated from the imported API specification"
                 f"{': ' + operation if operation else ''}. Confirm request and response details against the contract."
             )[:12000],
+            "preconditions": "",
+            "test_data": "",
+            "use_case_id": "",
+            "priority": str(requirement.get("priority") or "Not specified") if requirement else "Not specified",
             "steps": (
                 f"1. Prepare a valid request for {method} {path} using the API contract.\n"
                 "2. Send the request to the configured test environment.\n"
@@ -243,6 +251,10 @@ def generate_project_cases(
                     f"Draft generated from a static source-code route candidate in "
                     f"{route_item.get('file', 'source code')}. Verify the route manually."
                 ),
+                "preconditions": "",
+                "test_data": "",
+                "use_case_id": "",
+                "priority": str(requirement.get("priority") or "Not specified") if requirement else "Not specified",
                 "steps": (
                     f"1. Open the application in the test environment.\n"
                     f"2. Navigate to route {route}.\n"

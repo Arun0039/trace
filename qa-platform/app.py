@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import ipaddress
+import hmac
 import io
 import json
 import mimetypes
@@ -14,6 +16,7 @@ import sqlite3
 import base64
 import binascii
 import shutil
+import secrets
 import struct
 import subprocess
 import threading
@@ -24,23 +27,36 @@ import uuid
 import webbrowser
 import zlib
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+from qa_platform.core.config import ROOT, database_path, server_address
 from application_zip import (
     MAX_ARCHIVE_BYTES,
     analyze_application_zip,
     source_code_excerpts,
 )
+from ai_provider import (
+    active_provider_config,
+    generate_text as generate_provider_text,
+    provider_settings,
+    save_provider_settings,
+)
 from ollama_integration import (
-    classify_requirements as classify_ollama_requirements,
-    generate_test_cases as generate_ollama_test_cases,
-    generate_requirements as generate_ollama_requirements,
-    list_models as list_ollama_models,
-    validate_requirement_coverage as validate_ollama_requirement_coverage,
-    validate_base_url as validate_ollama_base_url,
-    validate_model_name as validate_ollama_model_name,
+    MAX_AD_HOC_INPUT_LENGTH,
+    classify_requirements,
+    classify_requirements_locally,
+    validate_brd_analysis,
+    generate_brd_analysis,
+    generate_test_cases,
+    generate_ad_hoc_test_cases,
+    AD_HOC_TEST_CATEGORIES,
+    brd_analysis_markdown,
+    fallback_brd_analysis,
+    validate_generated_requirements,
+    validate_requirement_coverage,
 )
 from requirement_documents import (
     MAX_DOCUMENT_BYTES,
@@ -50,10 +66,9 @@ from requirement_documents import (
 from test_case_generator import MAX_GENERATED_CASES, TEST_TYPES, generate_project_cases
 
 
-ROOT = Path(__file__).resolve().parent
 REA_ROOT = ROOT.parent / "rea"
 REA_CLI = REA_ROOT / "scripts" / "rea.mjs"
-DB_PATH = Path(os.environ.get("QA_PLATFORM_DB", ROOT / "qa_platform.sqlite3"))
+DB_PATH = database_path()
 MAX_BODY = 27 * 1024 * 1024
 MAX_OPENAPI_SIZE = 1_000_000
 MAX_EVIDENCE_SIZE = 5 * 1024 * 1024
@@ -140,8 +155,21 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
                 priority TEXT NOT NULL DEFAULT 'Medium',
                 module_type TEXT NOT NULL DEFAULT 'Functional',
                 module_category TEXT NOT NULL DEFAULT 'Functional',
+                requirement_type TEXT NOT NULL DEFAULT 'Functional Requirement',
+                scope_classification TEXT NOT NULL DEFAULT 'Requires Clarification',
+                ai_confidence_status TEXT NOT NULL DEFAULT 'Needs clarification',
+                actor TEXT NOT NULL DEFAULT '',
+                preconditions TEXT NOT NULL DEFAULT '',
+                trigger TEXT NOT NULL DEFAULT '',
+                main_flow TEXT NOT NULL DEFAULT '',
+                alternative_flow TEXT NOT NULL DEFAULT '',
+                exception_flow TEXT NOT NULL DEFAULT '',
+                related_requirements TEXT NOT NULL DEFAULT '',
                 source_document TEXT NOT NULL DEFAULT '',
                 source_section TEXT NOT NULL DEFAULT '',
+                source_evidence TEXT NOT NULL DEFAULT '',
+                origin TEXT NOT NULL DEFAULT 'manual',
+                source_suggestion_id INTEGER,
                 review_status TEXT NOT NULL DEFAULT 'Needs review',
                 created_at TEXT NOT NULL,
                 UNIQUE(project_id, requirement_key)
@@ -155,7 +183,41 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
                 file_size_bytes INTEGER NOT NULL,
                 requirement_count INTEGER NOT NULL,
                 version INTEGER NOT NULL DEFAULT 1,
-                uploaded_at TEXT NOT NULL
+                uploaded_at TEXT NOT NULL,
+                analysis_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS requirement_analysis_previews (
+                id TEXT PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL,
+                preview_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS requirement_suggestions (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                document_id INTEGER NOT NULL REFERENCES requirement_documents(id) ON DELETE CASCADE,
+                related_requirement_id INTEGER REFERENCES requirements(id) ON DELETE SET NULL,
+                related_requirement_key TEXT NOT NULL DEFAULT '',
+                accepted_requirement_id INTEGER REFERENCES requirements(id) ON DELETE SET NULL,
+                original_content_json TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                source_reference TEXT NOT NULL DEFAULT '',
+                source_evidence TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Pending'
+                    CHECK(status IN ('Pending', 'Accepted', 'Rejected')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS requirement_suggestion_history (
+                id INTEGER PRIMARY KEY,
+                suggestion_id INTEGER NOT NULL REFERENCES requirement_suggestions(id) ON DELETE CASCADE,
+                action TEXT NOT NULL CHECK(action IN ('Edited', 'Accepted', 'Rejected')),
+                content_json TEXT NOT NULL,
+                reviewer TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS test_cases (
                 id INTEGER PRIMARY KEY,
@@ -166,8 +228,22 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
                 description TEXT NOT NULL DEFAULT '',
                 steps TEXT NOT NULL DEFAULT '',
                 expected_result TEXT NOT NULL DEFAULT '',
+                preconditions TEXT NOT NULL DEFAULT '',
+                test_data TEXT NOT NULL DEFAULT '',
+                use_case_id TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'Not specified',
                 test_type TEXT NOT NULL DEFAULT 'Functional',
+                title TEXT NOT NULL DEFAULT '',
+                test_category TEXT NOT NULL DEFAULT 'Functional',
+                classification TEXT NOT NULL DEFAULT '',
+                assumptions TEXT NOT NULL DEFAULT '',
+                source_reference TEXT NOT NULL DEFAULT '',
                 generation_key TEXT NOT NULL DEFAULT '',
+                requirement_origin TEXT NOT NULL DEFAULT '',
+                requirement_approval_status TEXT NOT NULL DEFAULT '',
+                source_suggestion_id INTEGER,
+                source_requirement_key TEXT NOT NULL DEFAULT '',
+                source_requirement_title TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(project_id, case_key)
@@ -252,10 +328,20 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 ollama_base_url TEXT NOT NULL,
                 ollama_model TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'google'
+            );
+            CREATE TABLE IF NOT EXISTS ai_provider_configs (
+                provider TEXT PRIMARY KEY,
+                model TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL DEFAULT '',
+                api_key_ciphertext BLOB,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS ix_requirements_project ON requirements(project_id);
             CREATE INDEX IF NOT EXISTS ix_requirement_documents_project ON requirement_documents(project_id, id DESC);
+            CREATE INDEX IF NOT EXISTS ix_requirement_suggestions_project
+                ON requirement_suggestions(project_id, status, id DESC);
             CREATE INDEX IF NOT EXISTS ix_cases_project ON test_cases(project_id);
             CREATE INDEX IF NOT EXISTS ix_exec_case_time ON executions(test_case_id, executed_at);
             CREATE INDEX IF NOT EXISTS ix_bugs_project ON bugs(project_id);
@@ -269,10 +355,27 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
         requirement_columns = {
             row["name"] for row in db.execute("PRAGMA table_info(requirements)")
         }
+        migrate_requirement_origins = "origin" not in requirement_columns
+        ai_settings_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(ai_settings)")
+        }
+        if "provider" not in ai_settings_columns:
+            db.execute(
+                "ALTER TABLE ai_settings ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'"
+            )
         project_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
         req_doc_columns = {row["name"] for row in db.execute("PRAGMA table_info(requirement_documents)")}
         if "version" not in req_doc_columns:
             db.execute("ALTER TABLE requirement_documents ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+        if "analysis_json" not in req_doc_columns:
+            db.execute("ALTER TABLE requirement_documents ADD COLUMN analysis_json TEXT")
+        suggestion_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(requirement_suggestions)")
+        }
+        if "related_requirement_key" not in suggestion_columns:
+            db.execute(
+                "ALTER TABLE requirement_suggestions ADD COLUMN related_requirement_key TEXT NOT NULL DEFAULT ''"
+            )
         if "product_type" not in project_columns:
             db.execute("ALTER TABLE projects ADD COLUMN product_type TEXT NOT NULL DEFAULT ''")
         if "status" not in project_columns:
@@ -282,18 +385,81 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
             ("validation_rules", "TEXT NOT NULL DEFAULT ''"),
             ("dependencies", "TEXT NOT NULL DEFAULT ''"),
             ("source_section", "TEXT NOT NULL DEFAULT ''"),
+            ("source_evidence", "TEXT NOT NULL DEFAULT ''"),
+            ("origin", "TEXT NOT NULL DEFAULT 'manual'"),
+            ("source_suggestion_id", "INTEGER"),
             ("module_type", "TEXT NOT NULL DEFAULT 'Functional'"),
             ("module_category", "TEXT NOT NULL DEFAULT 'Functional'"),
+            ("requirement_type", "TEXT NOT NULL DEFAULT 'Functional Requirement'"),
+            ("scope_classification", "TEXT NOT NULL DEFAULT 'Requires Clarification'"),
+            ("ai_confidence_status", "TEXT NOT NULL DEFAULT 'Needs clarification'"),
+            ("actor", "TEXT NOT NULL DEFAULT ''"),
+            ("preconditions", "TEXT NOT NULL DEFAULT ''"),
+            ("trigger", "TEXT NOT NULL DEFAULT ''"),
+            ("main_flow", "TEXT NOT NULL DEFAULT ''"),
+            ("alternative_flow", "TEXT NOT NULL DEFAULT ''"),
+            ("exception_flow", "TEXT NOT NULL DEFAULT ''"),
+            ("related_requirements", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in requirement_columns:
                 db.execute(f"ALTER TABLE requirements ADD COLUMN {column} {declaration}")
+        if migrate_requirement_origins:
+            db.execute(
+                """UPDATE requirements SET origin='legacy_import'
+                WHERE source_document!='' AND origin='manual'"""
+            )
         case_columns = {row["name"] for row in db.execute("PRAGMA table_info(test_cases)")}
         for column, declaration in (
+            ("preconditions", "TEXT NOT NULL DEFAULT ''"),
+            ("test_data", "TEXT NOT NULL DEFAULT ''"),
+            ("use_case_id", "TEXT NOT NULL DEFAULT ''"),
+            ("priority", "TEXT NOT NULL DEFAULT 'Not specified'"),
             ("test_type", "TEXT NOT NULL DEFAULT 'Functional'"),
+            ("title", "TEXT NOT NULL DEFAULT ''"),
+            ("test_category", "TEXT NOT NULL DEFAULT 'Functional'"),
+            ("classification", "TEXT NOT NULL DEFAULT ''"),
+            ("assumptions", "TEXT NOT NULL DEFAULT ''"),
+            ("source_reference", "TEXT NOT NULL DEFAULT ''"),
             ("generation_key", "TEXT NOT NULL DEFAULT ''"),
+            ("requirement_origin", "TEXT NOT NULL DEFAULT ''"),
+            ("requirement_approval_status", "TEXT NOT NULL DEFAULT ''"),
+            ("source_suggestion_id", "INTEGER"),
+            ("source_requirement_key", "TEXT NOT NULL DEFAULT ''"),
+            ("source_requirement_title", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in case_columns:
                 db.execute(f"ALTER TABLE test_cases ADD COLUMN {column} {declaration}")
+        db.execute(
+            """UPDATE test_cases SET
+            title=CASE WHEN title='' THEN scenario ELSE title END,
+            test_category=CASE
+                WHEN test_category='Functional' AND test_type IN
+                    ('Performance','Security','Usability','Compatibility','Reliability','Non-Functional')
+                THEN 'Non-Functional' ELSE test_category END,
+            classification=CASE
+                WHEN classification='' AND generation_key!='' AND test_type IN ('Negative','Validation')
+                THEN 'Negative'
+                WHEN classification='' AND generation_key!='' THEN 'Positive'
+                ELSE classification END"""
+        )
+        db.execute(
+            """UPDATE test_cases SET
+            requirement_origin=CASE WHEN requirement_origin='' THEN COALESCE(
+                (SELECT origin FROM requirements WHERE id=test_cases.requirement_id),''
+            ) ELSE requirement_origin END,
+            requirement_approval_status=CASE WHEN requirement_approval_status='' THEN COALESCE(
+                (SELECT review_status FROM requirements WHERE id=test_cases.requirement_id),''
+            ) ELSE requirement_approval_status END,
+            source_suggestion_id=COALESCE(source_suggestion_id,
+                (SELECT source_suggestion_id FROM requirements WHERE id=test_cases.requirement_id)),
+            source_requirement_key=CASE WHEN source_requirement_key='' THEN COALESCE(
+                (SELECT requirement_key FROM requirements WHERE id=test_cases.requirement_id),''
+            ) ELSE source_requirement_key END,
+            source_requirement_title=CASE WHEN source_requirement_title='' THEN COALESCE(
+                (SELECT title FROM requirements WHERE id=test_cases.requirement_id),''
+            ) ELSE source_requirement_title END
+            WHERE requirement_id IS NOT NULL"""
+        )
         application_columns = {
             row["name"] for row in db.execute("PRAGMA table_info(application_uploads)")
         }
@@ -322,6 +488,12 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
         db.execute(
             """INSERT OR IGNORE INTO ai_settings(id,ollama_base_url,ollama_model,updated_at)
             VALUES(1,'http://127.0.0.1:11434','',?)""",
+            (timestamp(),),
+        )
+        db.execute(
+            """INSERT OR IGNORE INTO ai_provider_configs
+            (provider,model,base_url,api_key_ciphertext,updated_at)
+            VALUES('google','gemini-2.5-flash','',NULL,?)""",
             (timestamp(),),
         )
 
@@ -384,6 +556,124 @@ def find_duplicate_requirement(
         (row for row in rows if requirement_fingerprint(dict(row)) == fingerprint),
         None,
     )
+
+
+def insert_requirement_record(
+    db: sqlite3.Connection,
+    project_id: int,
+    record: dict,
+    source_document: str,
+    source_evidence: str,
+    created_at: str,
+    *,
+    origin: str,
+    review_status: str = "Needs review",
+    source_suggestion_id: int | None = None,
+) -> dict:
+    key = record.get("requirement_key") or next_key(
+        db, "requirements", "requirement_key", project_id, "REQ"
+    )
+    module_type, module_category = normalize_requirement_module(
+        record.get("module_type"),
+        record.get("module_category"),
+        record.get("title", ""),
+        record.get("description", ""),
+        record.get("acceptance_criteria", ""),
+        record.get("business_rules", ""),
+        record.get("validation_rules", ""),
+        record.get("dependencies", ""),
+    )
+    cursor = db.execute(
+        """INSERT INTO requirements
+        (project_id,requirement_key,title,description,acceptance_criteria,business_rules,
+        validation_rules,dependencies,priority,module_type,module_category,requirement_type,
+        scope_classification,ai_confidence_status,actor,preconditions,trigger,main_flow,
+        alternative_flow,exception_flow,related_requirements,source_document,source_section,
+        source_evidence,origin,source_suggestion_id,review_status,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            project_id, key, record["title"], record.get("description", ""),
+            record.get("acceptance_criteria", ""), record.get("business_rules", ""),
+            record.get("validation_rules", ""), record.get("dependencies", ""),
+            record.get("priority", "Not specified"), module_type, module_category,
+            record.get("requirement_type", "Functional Requirement"),
+            record.get("scope_classification", "Requires Clarification"),
+            record.get("ai_confidence_status", "Needs clarification"),
+            record.get("actor", ""), record.get("preconditions", ""),
+            record.get("trigger", ""), record.get("main_flow", ""),
+            record.get("alternative_flow", ""), record.get("exception_flow", ""),
+            record.get("related_requirements", ""), source_document,
+            record.get("source_section", record["title"]), source_evidence, origin,
+            source_suggestion_id, review_status, created_at,
+        ),
+    )
+    return dict(db.execute(
+        "SELECT * FROM requirements WHERE id=?", (cursor.lastrowid,)
+    ).fetchone())
+
+
+def requirement_suggestion_dict(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    suggestion = dict(row)
+    suggestion["content"] = json.loads(suggestion.pop("content_json"))
+    suggestion["original_content"] = json.loads(suggestion.pop("original_content_json"))
+    suggestion["history"] = [
+        {
+            **dict(entry),
+            "content": json.loads(entry["content_json"]),
+        }
+        for entry in db.execute(
+            """SELECT action,content_json,reviewer,created_at
+            FROM requirement_suggestion_history WHERE suggestion_id=? ORDER BY id""",
+            (suggestion["id"],),
+        )
+    ]
+    for entry in suggestion["history"]:
+        del entry["content_json"]
+    return suggestion
+
+
+def build_ai_requirement_suggestions(
+    candidates: list[dict],
+    source_text: str,
+    extracted_records: list[dict],
+) -> list[dict]:
+    source_folded = source_text.casefold()
+    extracted_fingerprints = {
+        requirement_fingerprint(record) for record in extracted_records
+    }
+    suggestions = []
+    for candidate in candidates:
+        if requirement_fingerprint(candidate) in extracted_fingerprints:
+            continue
+        candidate = {**candidate, "requirement_key": ""}
+        section = candidate.get("source_section", "").strip()
+        source_reference = (
+            section if section and section.casefold() in source_folded else ""
+        )
+        related_key = next(
+            (
+                record.get("requirement_key", "")
+                for record in extracted_records
+                if candidate.get("title", "").strip().casefold()
+                in {
+                    record.get("title", "").strip().casefold(),
+                    record.get("source_section", "").strip().casefold(),
+                }
+            ),
+            "",
+        )
+        suggestions.append({
+            "content": candidate,
+            "reason": (
+                "AI interpretation of the BRD; verify each detail against the original source."
+                if source_reference else
+                "AI-proposed content has no exact source reference; verify or edit before approval."
+            ),
+            "related_requirement_key": related_key,
+            "source_reference": source_reference,
+            "source_evidence": source_reference,
+        })
+    return suggestions
 
 
 def project_exists(db: sqlite3.Connection, project_id: int) -> bool:
@@ -930,8 +1220,86 @@ class QAHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_json(self, data, status=200):
-        self.send_bytes(json.dumps(data, ensure_ascii=True).encode("utf-8"), "application/json; charset=utf-8", status)
+    def send_json(self, data, status=200, extra=None):
+        self.send_bytes(
+            json.dumps(data, ensure_ascii=True).encode("utf-8"),
+            "application/json; charset=utf-8",
+            status,
+            extra,
+        )
+
+    def is_admin(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+            session_cookie = cookie.get("trace_admin_session")
+        except CookieError:
+            return False
+        if not session_cookie:
+            return False
+        token = session_cookie.value
+        with self.server.admin_session_lock:
+            expiry = self.server.admin_sessions.get(token)
+            if expiry is None:
+                return False
+            if expiry <= time.time():
+                self.server.admin_sessions.pop(token, None)
+                return False
+        return True
+
+    def auth_status(self):
+        password = os.environ.get("QA_ADMIN_PASSWORD", "")
+        return {
+            "authenticated": self.is_admin(),
+            "admin_configured": len(password.strip()) >= 12,
+        }
+
+    def ai_auth_required(self, method: str, path: str) -> bool:
+        if method != "POST":
+            return False
+        parts = path.strip("/").split("/")
+        if parts[:2] == ["api", "ai"] and parts[2:] in (
+            ["settings"], ["test"], ["ollama", "test"]
+        ):
+            return True
+        if len(parts) == 5 and parts[1] == "projects":
+            return (
+                parts[3:] in (
+                    ["requirements", "import"],
+                    ["requirements", "analyze"],
+                    ["test-cases", "generate"],
+                )
+            )
+        if (
+            len(parts) == 6
+            and parts[1] == "projects"
+            and parts[3] == "applications"
+            and parts[5] == "validate-requirements"
+        ):
+            return True
+        return False
+
+    def issue_admin_session(self):
+        token = secrets.token_urlsafe(32)
+        with self.server.admin_session_lock:
+            self.server.admin_sessions[token] = time.time() + 12 * 60 * 60
+        return token
+
+    def logout_admin(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            cookie = SimpleCookie()
+        session_cookie = cookie.get("trace_admin_session")
+        if session_cookie:
+            with self.server.admin_session_lock:
+                self.server.admin_sessions.pop(session_cookie.value, None)
+        return {
+            "Set-Cookie": (
+                "trace_admin_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+            )
+        }
 
     def body(self):
         try:
@@ -980,9 +1348,13 @@ class QAHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         analysis_id = None
         try:
+            request_path = urlparse(self.path).path
+            if self.ai_auth_required("POST", request_path) and not self.is_admin():
+                self.send_json({"error": "Admin sign-in is required for AI settings and analysis."}, 401)
+                return
             data = self.body()
             with database(self.server.db_path) as db:
-                analysis_id = self.post_api(db, urlparse(self.path).path, data)
+                analysis_id = self.post_api(db, request_path, data)
             if analysis_id is not None:
                 self.server.schedule_analysis(analysis_id)
         except sqlite3.IntegrityError as exc:
@@ -1111,14 +1483,14 @@ class QAHandler(BaseHTTPRequestHandler):
             archives.sort(key=lambda item: item["archived_at"], reverse=True)
             self.send_json({"archives": archives})
             return
+        if parts == ["api", "auth", "status"]:
+            self.send_json(self.auth_status())
+            return
         if parts == ["api", "rea", "runtime"]:
             self.send_json(self.server.rea_runtime())
             return
         if parts == ["api", "ai", "settings"]:
-            settings = db.execute(
-                "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
-            ).fetchone()
-            self.send_json(dict(settings))
+            self.send_json(provider_settings(db, self.is_admin()))
             return
         if parts == ["api", "projects"]:
             rows = db.execute("SELECT * FROM projects ORDER BY id DESC").fetchall()
@@ -1299,13 +1671,63 @@ class QAHandler(BaseHTTPRequestHandler):
                     GROUP BY r.id ORDER BY r.id""", (pid,)
                 )])
                 return
+            if len(parts) == 5 and parts[3:5] == ["requirements", "suggestions"]:
+                suggestions = [
+                    requirement_suggestion_dict(db, row)
+                    for row in db.execute(
+                        """SELECT * FROM requirement_suggestions
+                        WHERE project_id=? ORDER BY id DESC""",
+                        (pid,),
+                    )
+                ]
+                self.send_json(suggestions)
+                return
             if len(parts) == 5 and parts[3:5] == ["requirements", "documents"]:
                 documents = db.execute(
-                    """SELECT id,filename,content_type,file_size_bytes,requirement_count,version,uploaded_at
+                    """SELECT id,filename,content_type,file_size_bytes,requirement_count,version,
+                    uploaded_at,analysis_json IS NOT NULL has_analysis
                     FROM requirement_documents WHERE project_id=? ORDER BY id DESC""",
                     (pid,),
                 ).fetchall()
                 self.send_json([dict(row) for row in documents])
+                return
+            if len(parts) == 7 and parts[3:5] == ["requirements", "documents"] and parts[6] == "analysis":
+                document_id = self.parse_project_id(parts[5])
+                document = db.execute(
+                    """SELECT analysis_json FROM requirement_documents
+                    WHERE id=? AND project_id=?""",
+                    (document_id, pid),
+                ).fetchone()
+                if not document:
+                    self.send_json({"error": "Requirement document not found"}, 404)
+                    return
+                if not document["analysis_json"]:
+                    self.send_json({"error": "BRD analysis is not available for this document."}, 404)
+                    return
+                self.send_json({"analysis": json.loads(document["analysis_json"])})
+                return
+            if len(parts) == 7 and parts[3:5] == ["requirements", "documents"] and parts[6] == "analysis.md":
+                document_id = self.parse_project_id(parts[5])
+                document = db.execute(
+                    """SELECT filename,analysis_json FROM requirement_documents
+                    WHERE id=? AND project_id=?""",
+                    (document_id, pid),
+                ).fetchone()
+                if not document:
+                    self.send_json({"error": "Requirement document not found"}, 404)
+                    return
+                if not document["analysis_json"]:
+                    self.send_json({"error": "BRD analysis is not available for this document."}, 404)
+                    return
+                analysis = json.loads(document["analysis_json"])
+                report = brd_analysis_markdown(analysis).encode("utf-8")
+                safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", document["filename"])
+                download_name = f"{Path(safe_name).stem or 'brd'}-analysis.md"
+                self.send_bytes(
+                    report,
+                    "text/markdown; charset=utf-8",
+                    extra={"Content-Disposition": f'attachment; filename="{download_name}"'},
+                )
                 return
             if len(parts) == 6 and parts[3:5] == ["requirements", "documents"]:
                 document_id = self.parse_project_id(parts[5])
@@ -1330,7 +1752,13 @@ class QAHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[3] == "test-cases":
                 self.send_json([dict(r) for r in db.execute(
-                    """SELECT tc.*, r.requirement_key, r.module_type, r.module_category,
+                    """SELECT tc.*,
+                    COALESCE(r.requirement_key,NULLIF(tc.source_requirement_key,'')) requirement_key,
+                    COALESCE(r.title,NULLIF(tc.source_requirement_title,'')) requirement_title,
+                    r.module_type, r.module_category,
+                    r.origin requirement_current_origin,
+                    r.review_status requirement_current_approval_status,
+                    r.source_suggestion_id requirement_current_suggestion_id,
                     COALESCE(e.status, 'Not Executed') status,
                     COALESCE(e.actual_result, '') actual_result, COALESCE(e.comments, '') comments,
                     e.id execution_id, e.executed_at,
@@ -1373,26 +1801,61 @@ class QAHandler(BaseHTTPRequestHandler):
     def post_api(self, db, path, data):
         parts = path.strip("/").split("/")
         now = timestamp()
-        if parts == ["api", "ai", "settings"]:
-            base_url = validate_ollama_base_url(data.get("ollama_base_url"))
-            model = validate_ollama_model_name(data.get("ollama_model", ""))
-            db.execute(
-                """UPDATE ai_settings SET ollama_base_url=?,ollama_model=?,updated_at=?
-                WHERE id=1""",
-                (base_url, model, now),
+        if parts == ["api", "auth", "login"]:
+            try:
+                peer_is_local = ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                peer_is_local = False
+            expected = os.environ.get("QA_ADMIN_PASSWORD", "")
+            if not peer_is_local:
+                self.send_json({"error": "Admin sign-in is available only over a loopback connection."}, 403)
+                return
+            if len(expected.strip()) < 12:
+                self.send_json({
+                    "error": "Set QA_ADMIN_PASSWORD to at least 12 characters in qa-platform/.env, then restart the server."
+                }, 503)
+                return
+            password = data.get("password")
+            if not isinstance(password, str) or not hmac.compare_digest(password, expected):
+                self.send_json({"error": "Admin password is incorrect."}, 401)
+                return
+            token = self.issue_admin_session()
+            self.send_json(
+                {"authenticated": True, "role": "Admin"},
+                extra={
+                    "Set-Cookie": (
+                        f"trace_admin_session={token}; Path=/; HttpOnly; SameSite=Strict; "
+                        "Max-Age=43200"
+                    )
+                },
             )
-            self.send_json({"ollama_base_url": base_url, "ollama_model": model})
             return
-        if parts == ["api", "ai", "ollama", "test"]:
-            settings = db.execute(
-                "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
-            ).fetchone()
-            models = list_ollama_models(settings["ollama_base_url"])
+        if parts == ["api", "auth", "logout"]:
+            self.send_json({"authenticated": False}, extra=self.logout_admin())
+            return
+        if parts == ["api", "ai", "settings"]:
+            self.send_json(save_provider_settings(db, data))
+            return
+        if parts in (["api", "ai", "test"], ["api", "ai", "ollama", "test"]):
+            settings = active_provider_config(db)
+            if settings["provider"] == "local":
+                self.send_json({
+                    "connected": True,
+                    "provider": "local",
+                    "model": settings["model"],
+                    "message": "Local deterministic mode is ready; no remote connection is required.",
+                })
+                return
+            generate_provider_text(
+                settings,
+                "You are checking the AI provider connection.",
+                "Reply with the single word OK.",
+                0,
+            )
             self.send_json({
                 "connected": True,
-                "ollama_base_url": settings["ollama_base_url"],
-                "selected_model": settings["ollama_model"],
-                "models": models,
+                "provider": settings["provider"],
+                "model": settings["model"],
             })
             return
         if parts == ["api", "projects"]:
@@ -1485,18 +1948,22 @@ class QAHandler(BaseHTTPRequestHandler):
             if not requirements:
                 self.send_json({"error": "Add or generate project requirements before validating code coverage."}, 400)
                 return
-            ai_settings = db.execute(
-                "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
-            ).fetchone()
+            ai_settings = active_provider_config(db)
+            if ai_settings["provider"] == "local":
+                raise ValueError(
+                    "Static requirement coverage needs a connected AI provider. Select Ollama, "
+                    "Google Gemini, or an OpenAI-compatible provider in Settings → AI Module."
+                )
             inventory = json.loads(application["inventory_json"])
             excerpts = source_code_excerpts(Path(application["storage_path"]), inventory)
             coverage = []
             for offset in range(0, len(requirements), 100):
-                coverage.extend(validate_ollama_requirement_coverage(
-                    ai_settings["ollama_base_url"],
-                    ai_settings["ollama_model"],
+                coverage.extend(validate_requirement_coverage(
+                    ai_settings["provider"],
+                    ai_settings["model"],
                     requirements[offset:offset + 100],
                     excerpts,
+                    configuration=ai_settings,
                 ))
             checked_at = timestamp()
             signature = requirements_signature(db, pid)
@@ -1574,13 +2041,29 @@ class QAHandler(BaseHTTPRequestHandler):
             cur = db.execute(
                 """INSERT INTO requirements(project_id,requirement_key,title,description,acceptance_criteria,
                 business_rules,validation_rules,dependencies,priority,module_type,module_category,
-                source_document,source_section,review_status,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                requirement_type,scope_classification,ai_confidence_status,actor,preconditions,trigger,
+                main_flow,alternative_flow,exception_flow,related_requirements,source_document,
+                source_section,review_status,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (pid, key, title, requirement["description"], requirement["acceptance_criteria"],
                  requirement["business_rules"], requirement["validation_rules"],
                  requirement["dependencies"],
-                 self.choice(data, "priority", ("High", "Medium", "Low"), "Medium"),
+                 self.choice(data, "priority", ("High", "Medium", "Low", "Not specified"), "Medium"),
                  module_type, module_category,
+                 self.choice(data, "requirement_type", (
+                     "Use Case", "User Story", "Feature", "Functional Requirement",
+                     "Non-Functional Requirement",
+                 ), "Functional Requirement"),
+                 self.choice(data, "scope_classification", (
+                     "In Scope", "Out of Scope", "Requires Clarification",
+                 ), "Requires Clarification"),
+                 self.choice(data, "ai_confidence_status", (
+                     "Supported", "Needs clarification",
+                 ), "Needs clarification"),
+                 *(validate_text(data, field) for field in (
+                     "actor", "preconditions", "trigger", "main_flow",
+                     "alternative_flow", "exception_flow", "related_requirements",
+                 )),
                  validate_text(data, "source_document", limit=200),
                  validate_text(data, "source_section", limit=200), "Needs review", now),
             )
@@ -1591,17 +2074,20 @@ class QAHandler(BaseHTTPRequestHandler):
             if Path(filename.replace("\\", "/")).name != filename:
                 raise ValueError("Requirement filename must be a plain file name.")
             suffix = Path(filename).suffix.lower()
-            if suffix not in {".docx", ".txt", ".md"}:
-                raise ValueError("Only DOCX, TXT, and Markdown requirement documents are supported.")
-            if suffix == ".docx":
+            if suffix not in {".pdf", ".docx", ".csv", ".txt", ".md"}:
+                raise ValueError("Only PDF, DOCX, CSV, TXT, and Markdown requirement documents are supported.")
+            if suffix in {".docx", ".pdf"}:
                 encoded = validate_text(data, "document_data", True, 7_000_000)
                 try:
                     original = base64.b64decode(encoded, validate=True)
                 except (binascii.Error, ValueError) as exc:
-                    raise ValueError("Requirement DOCX data must be valid base64.") from exc
+                    raise ValueError(f"Requirement {suffix[1:].upper()} data must be valid base64.") from exc
                 if not original or len(original) > MAX_DOCUMENT_BYTES:
-                    raise ValueError("Requirement DOCX is empty or too large (maximum 5 MB).")
-                content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    raise ValueError(f"Requirement {suffix[1:].upper()} is empty or too large (maximum 5 MB).")
+                content_type = (
+                    "application/pdf" if suffix == ".pdf"
+                    else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
                 document_text, records = extract_requirement_document(
                     filename, document_data=original
                 )
@@ -1613,36 +2099,165 @@ class QAHandler(BaseHTTPRequestHandler):
                     raise ValueError("Requirement document content is too long (maximum 1000000 characters).")
                 document_text, records = extract_requirement_document(filename, content=content)
                 original = content.encode("utf-8")
-                content_type = "text/markdown" if suffix == ".md" else "text/plain"
+                content_type = (
+                    "text/markdown" if suffix == ".md"
+                    else "text/csv" if suffix == ".csv"
+                    else "text/plain"
+                )
+            extracted_records = records
             generator = data.get("generator", "auto")
-            if generator not in {"auto", "ollama", "deterministic"}:
-                raise ValueError("Requirement generator must be auto, ollama, or deterministic.")
+            supported_generators = {
+                "auto", "local", "google", "ollama", "openai-compatible",
+                "deterministic",
+            }
+            if not isinstance(generator, str) or generator not in supported_generators:
+                raise ValueError("Choose Local deterministic or a configured AI provider.")
             analysis_warning = ""
-            if generator in {"auto", "ollama"}:
-                ai_settings = db.execute(
-                    "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
+            analysis_source = "rule-based"
+            ai_suggestions = []
+            preview_id = data.get("preview_id")
+            if preview_id is None and "confirmed_preview" in data:
+                raise ValueError("This BRD preview is no longer valid; analyze the document again.")
+            if preview_id is not None:
+                if not isinstance(preview_id, str) or not re.fullmatch(
+                    r"[A-Za-z0-9_-]{32,64}", preview_id
+                ):
+                    raise ValueError("BRD preview ID is invalid; analyze the document again.")
+                stored_preview = db.execute(
+                    """SELECT filename,source_sha256,preview_json,created_at
+                    FROM requirement_analysis_previews WHERE id=? AND project_id=?""",
+                    (preview_id, pid),
                 ).fetchone()
-                # If user explicitly requested ollama but model is not configured, give a helpful error
-                if generator == "ollama" and not ai_settings["ollama_model"]:
-                    raise ValueError(
-                        "No Ollama model is configured. Open Settings → AI module, connect to Ollama, "
-                        "and select an installed model before using AI analysis."
+                if not stored_preview:
+                    raise ValueError("BRD preview expired or was already used; analyze again.")
+                if (
+                    stored_preview["filename"] != filename
+                    or not hmac.compare_digest(
+                        stored_preview["source_sha256"], hashlib.sha256(original).hexdigest()
                     )
-                try:
-                    records = generate_ollama_requirements(
-                        ai_settings["ollama_base_url"],
-                        ai_settings["ollama_model"],
-                        document_text,
+                ):
+                    raise ValueError("BRD source changed after preview; analyze the document again.")
+                preview_created_at = datetime.fromisoformat(stored_preview["created_at"])
+                if datetime.now(timezone.utc) - preview_created_at > timedelta(hours=24):
+                    raise ValueError("BRD preview expired; analyze the document again.")
+                preview = json.loads(stored_preview["preview_json"])
+                records = validate_generated_requirements(
+                    preview["requirements"], allow_empty=True
+                )
+                for record, stored_record in zip(records, preview["requirements"]):
+                    record["requirement_key"] = stored_record.get("requirement_key", "")
+                    record["source_evidence"] = stored_record.get("source_evidence", "")
+                ai_suggestions = preview["suggestions"]
+                analysis = validate_brd_analysis(preview["analysis"])
+                analysis["analysis_status"] = preview["analysis_status"]
+                analysis["requirements"] = [
+                    item["content"] for item in ai_suggestions
+                ]
+                generator = preview["generator"]
+                analysis_source = preview["analysis_source"]
+                analysis_warning = preview["analysis_warning"]
+            else:
+                next_requirement_number = int(
+                    next_key(db, "requirements", "requirement_key", pid, "REQ").split("-")[1]
+                )
+                for record in records:
+                    duplicate = find_duplicate_requirement(db, pid, record)
+                    if duplicate:
+                        record["requirement_key"] = duplicate["requirement_key"]
+                    elif not record.get("requirement_key"):
+                        record["requirement_key"] = f"REQ-{next_requirement_number:03d}"
+                        next_requirement_number += 1
+                if generator != "deterministic":
+                    explicit_ai = generator != "auto"
+                    try:
+                        ai_settings = active_provider_config(db)
+                        if explicit_ai and generator != ai_settings["provider"]:
+                            raise ValueError(
+                                "Choose the configured provider in Settings → AI Module before analysis."
+                            )
+                        if ai_settings["provider"] == "local":
+                            generator = "deterministic"
+                        else:
+                            ai_candidates, analysis = generate_brd_analysis(
+                                ai_settings["provider"],
+                                ai_settings["model"],
+                                document_text,
+                                configuration=ai_settings,
+                            )
+                            generator = ai_settings["provider"]
+                            analysis_source = ai_settings["provider"]
+                            ai_suggestions = build_ai_requirement_suggestions(
+                                ai_candidates, document_text, records
+                            )
+                    except ValueError as exc:
+                        if explicit_ai:
+                            raise
+                        generator = "deterministic"
+                        analysis_warning = (
+                            "Local AI analysis was unavailable, so the report requires review "
+                            f"and only rule-extracted requirements can be confirmed ({exc})"
+                        )
+                if generator == "deterministic":
+                    analysis = fallback_brd_analysis(document_text)
+                    analysis_source = "rule-based"
+                source_evidence = [
+                    record.get("source_evidence", "") for record in extracted_records
+                ]
+                records = validate_generated_requirements(records, allow_empty=True)
+                for index, record in enumerate(records):
+                    record["requirement_key"] = (
+                        record.get("requirement_key")
+                        or f"REQ-{next_requirement_number + index:03d}"
                     )
-                    generator = "ollama"
-                except ValueError as exc:
-                    if generator == "ollama":
-                        raise
-                    generator = "deterministic"
-                    analysis_warning = (
-                        "Local AI analysis was unavailable, so requirements were extracted and "
-                        f"classified by rule ({exc})"
-                    )
+                    record["source_evidence"] = source_evidence[index]
+                validated_suggestions = validate_generated_requirements(
+                    [item["content"] for item in ai_suggestions], allow_empty=True
+                )
+                ai_suggestions = [
+                    {**item, "content": content}
+                    for item, content in zip(ai_suggestions, validated_suggestions)
+                ]
+                analysis = validate_brd_analysis(analysis)
+                analysis_status = (
+                    "AI SUGGESTION"
+                    if analysis_source != "rule-based" else "NEEDS REVIEW"
+                )
+                analysis["analysis_status"] = analysis_status
+                analysis["requirements"] = [
+                    item["content"] for item in ai_suggestions
+                ]
+                preview_id = secrets.token_urlsafe(32)
+                expired_before = (
+                    datetime.now(timezone.utc) - timedelta(hours=24)
+                ).isoformat(timespec="seconds")
+                db.execute(
+                    "DELETE FROM requirement_analysis_previews WHERE created_at<?",
+                    (expired_before,),
+                )
+                preview = {
+                    "requirements": records,
+                    "suggestions": ai_suggestions,
+                    "analysis": analysis,
+                    "analysis_status": analysis_status,
+                    "generator": generator,
+                    "analysis_source": analysis_source,
+                    "analysis_warning": analysis_warning,
+                }
+                db.execute(
+                    """INSERT INTO requirement_analysis_previews
+                    (id,project_id,filename,source_sha256,preview_json,created_at)
+                    VALUES(?,?,?,?,?,?)""",
+                    (
+                        preview_id, pid, filename, hashlib.sha256(original).hexdigest(),
+                        json.dumps(preview, ensure_ascii=False), timestamp(),
+                    ),
+                )
+                self.send_json({
+                    "preview_required": True,
+                    "preview": {**preview, "preview_id": preview_id},
+                })
+                return
+            analysis_json = json.dumps(analysis, ensure_ascii=False)
             filename = Path(filename).name
             document_id = uuid.uuid4().hex
             safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:160] or "requirements"
@@ -1682,43 +2297,73 @@ class QAHandler(BaseHTTPRequestHandler):
                         raise ValueError(f"Requirement ID {key} already exists in this project.")
                     seen_keys.add(key)
                     seen_fingerprints.add(fingerprint)
-                    module_type, module_category = normalize_requirement_module(
-                        record.get("module_type"),
-                        record.get("module_category"),
-                        record.get("title", ""),
-                        record.get("description", ""),
-                        record.get("acceptance_criteria", ""),
-                        record.get("business_rules", ""),
-                        record.get("validation_rules", ""),
-                        record.get("dependencies", ""),
-                    )
-                    cur = db.execute(
-                        """INSERT INTO requirements
-                        (project_id,requirement_key,title,description,acceptance_criteria,
-                        business_rules,validation_rules,dependencies,priority,module_type,
-                        module_category,source_document,source_section,review_status,created_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            pid, key, record["title"], record["description"],
-                            record["acceptance_criteria"], record["business_rules"],
-                            record["validation_rules"], record["dependencies"], record["priority"],
-                            module_type, module_category,
-                            filename, record.get("source_section", record["title"]), "Needs review", now,
-                        ),
-                    )
-                    created.append(row_dict(db.execute(
-                        "SELECT * FROM requirements WHERE id=?", (cur.lastrowid,)
-                    ).fetchone()))
+                    created.append(insert_requirement_record(
+                        db,
+                        pid,
+                        record,
+                        filename,
+                        record.get("source_evidence", ""),
+                        now,
+                        origin="extracted",
+                    ))
                 cursor = db.execute(
                     """INSERT INTO requirement_documents
-                    (project_id,filename,storage_path,content_type,file_size_bytes,requirement_count,version,uploaded_at)
-                    VALUES(?,?,?,?,?,?,?,?)""",
-                    (pid, filename, str(document_path), content_type, len(original), len(created), doc_version, now),
+                    (project_id,filename,storage_path,content_type,file_size_bytes,requirement_count,
+                    version,uploaded_at,analysis_json)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        pid, filename, str(document_path), content_type, len(original),
+                        len(created), doc_version, now, analysis_json,
+                    ),
                 )
                 document = db.execute(
                     """SELECT id,filename,content_type,file_size_bytes,requirement_count,version,uploaded_at
                     FROM requirement_documents WHERE id=?""", (cursor.lastrowid,)
                 ).fetchone()
+                suggestion_count = 0
+                for suggestion in ai_suggestions:
+                    content = suggestion["content"]
+                    related_requirement_id = None
+                    related_key = suggestion.get("related_requirement_key", "")
+                    if related_key:
+                        related = db.execute(
+                            """SELECT id FROM requirements
+                            WHERE project_id=? AND requirement_key=?""",
+                            (pid, related_key),
+                        ).fetchone()
+                        if not related:
+                            related_record = next(
+                                (
+                                    item for item in records
+                                    if item.get("requirement_key") == related_key
+                                ),
+                                None,
+                            )
+                            if related_record:
+                                related = find_duplicate_requirement(
+                                    db, pid, related_record
+                                )
+                        related_requirement_id = related["id"] if related else None
+                    db.execute(
+                        """INSERT INTO requirement_suggestions
+                        (project_id,document_id,related_requirement_id,related_requirement_key,
+                        original_content_json,content_json,reason,source_reference,source_evidence,
+                        status,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            pid, cursor.lastrowid, related_requirement_id, related_key,
+                            json.dumps(content, ensure_ascii=False),
+                            json.dumps(content, ensure_ascii=False), suggestion["reason"],
+                            suggestion.get("source_reference", ""),
+                            suggestion.get("source_evidence", ""),
+                            "Pending", now, now,
+                        ),
+                    )
+                    suggestion_count += 1
+                db.execute(
+                    "DELETE FROM requirement_analysis_previews WHERE id=? AND project_id=?",
+                    (preview_id, pid),
+                )
             except Exception:
                 temp_path.unlink(missing_ok=True)
                 document_path.unlink(missing_ok=True)
@@ -1734,27 +2379,37 @@ class QAHandler(BaseHTTPRequestHandler):
                 ),
                 "skipped_duplicates": skipped_duplicates,
                 "total_extracted": len(records),
+                "suggestions_added": suggestion_count,
                 "generator": generator,
                 "analysis_warning": analysis_warning,
+                "analysis_source": analysis_source,
+                "analysis": analysis,
                 "document": dict(document),
             }, 201)
             return
         if parts[3] == "requirements" and len(parts) == 5 and parts[4] == "analyze":
             requirements = [
                 dict(row) for row in db.execute(
-                    "SELECT * FROM requirements WHERE project_id=? ORDER BY id", (pid,)
+                    """SELECT * FROM requirements
+                    WHERE project_id=? AND origin='manual' ORDER BY id""",
+                    (pid,),
                 )
             ]
             if not requirements:
-                raise ValueError("Add or import requirements before running AI classification.")
-            ai_settings = db.execute(
-                "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
-            ).fetchone()
-            classifications = classify_ollama_requirements(
-                ai_settings["ollama_base_url"],
-                ai_settings["ollama_model"],
-                requirements,
-            )
+                raise ValueError(
+                    "AI classification only applies to manually entered requirements; "
+                    "extracted and approved suggestion records are protected from AI overwrites."
+                )
+            ai_settings = active_provider_config(db)
+            if ai_settings["provider"] == "local":
+                classifications = classify_requirements_locally(requirements)
+            else:
+                classifications = classify_requirements(
+                    ai_settings["provider"],
+                    ai_settings["model"],
+                    requirements,
+                    configuration=ai_settings,
+                )
             for entry in classifications:
                 db.execute(
                     """UPDATE requirements SET module_type=?,module_category=?
@@ -1771,8 +2426,14 @@ class QAHandler(BaseHTTPRequestHandler):
                     "SELECT * FROM requirements WHERE project_id=? ORDER BY id", (pid,)
                 )
             ]
+            unchanged_records = db.execute(
+                """SELECT COUNT(*) FROM requirements
+                WHERE project_id=? AND origin!='manual'""",
+                (pid,),
+            ).fetchone()[0]
             self.send_json({
                 "updated": len(classifications),
+                "excluded_from_ai_classification": unchanged_records,
                 "functional": sum(1 for item in updated if item["module_type"] == "Functional"),
                 "non_functional": sum(
                     1 for item in updated if item["module_type"] == "Non-Functional"
@@ -1802,6 +2463,97 @@ class QAHandler(BaseHTTPRequestHandler):
             self.send_json(document, 201)
             return
         if parts[3] == "test-cases" and len(parts) == 5 and parts[4] == "generate":
+            if data.get("mode") == "ai_assisted":
+                source_text = validate_text(
+                    data, "source_text", True, MAX_AD_HOC_INPUT_LENGTH
+                )
+                categories = data.get("categories", list(AD_HOC_TEST_CATEGORIES))
+                if (
+                    not isinstance(categories, list)
+                    or not categories
+                    or len(categories) > len(AD_HOC_TEST_CATEGORIES)
+                    or any(not isinstance(item, str) for item in categories)
+                ):
+                    raise ValueError("Select one or more valid test categories.")
+                generator = data.get("generator", "google")
+                if not isinstance(generator, str) or generator not in {
+                    "google", "ollama", "openai-compatible", "local",
+                }:
+                    raise ValueError("Select a configured AI provider for AI-assisted generation.")
+                ai_settings = active_provider_config(db)
+                if generator != ai_settings["provider"]:
+                    raise ValueError(
+                        "Choose the configured provider in Settings → AI Module before generating cases."
+                    )
+                if ai_settings["provider"] == "local":
+                    raise ValueError(
+                        "AI-assisted generation requires a model-based provider. Configure Ollama, "
+                        "Google Gemini, or an OpenAI-compatible provider in Settings → AI Module."
+                    )
+                generated = generate_ad_hoc_test_cases(
+                    ai_settings["provider"],
+                    ai_settings["model"],
+                    source_text,
+                    categories,
+                    configuration=ai_settings,
+                )
+                analysis = generated["analysis"]
+                generated_cases = generated["test_cases"]
+                if not generated_cases:
+                    self.send_json({
+                        "status": "needs_clarification",
+                        "created": [],
+                        "count": 0,
+                        "skipped_existing": 0,
+                        "analysis": analysis,
+                        "generator": generator,
+                    })
+                    return
+
+                created = []
+                skipped = 0
+                truncated = len(generated_cases) > MAX_GENERATED_CASES
+                existing_keys = {
+                    row["generation_key"] for row in db.execute(
+                        "SELECT generation_key FROM test_cases WHERE project_id=? AND generation_key!=''",
+                        (pid,),
+                    )
+                }
+                for item in generated_cases[:MAX_GENERATED_CASES]:
+                    if item["generation_key"] in existing_keys:
+                        skipped += 1
+                        continue
+                    key = next_key(db, "test_cases", "case_key", pid, "TC")
+                    cursor = db.execute(
+                        """INSERT INTO test_cases
+                        (project_id,case_key,title,scenario,description,steps,expected_result,
+                        preconditions,test_data,priority,test_type,test_category,classification,
+                        assumptions,source_reference,generation_key,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            pid, key, item["title"], item["scenario"],
+                            "AI-assisted draft from user-provided content.",
+                            item["steps"], item["expected_result"], item["preconditions"],
+                            item["test_data"], item["priority"], item["test_type"],
+                            item["test_category"], item["classification"], item["assumptions"],
+                            item["source_reference"], item["generation_key"], now, now,
+                        ),
+                    )
+                    existing_keys.add(item["generation_key"])
+                    created.append(row_dict(db.execute(
+                        "SELECT * FROM test_cases WHERE id=?", (cursor.lastrowid,)
+                    ).fetchone()))
+                self.send_json({
+                    "status": "generated",
+                    "created": created,
+                    "count": len(created),
+                    "skipped_existing": skipped,
+                    "truncated": truncated,
+                    "analysis": analysis,
+                    "generator": generator,
+                })
+                return
+
             requested_ids = data.get("requirement_ids")
             if requested_ids is not None:
                 if not isinstance(requested_ids, list) or len(requested_ids) > 100:
@@ -1812,36 +2564,60 @@ class QAHandler(BaseHTTPRequestHandler):
                 if not requested_ids:
                     raise ValueError("Select at least one requirement to generate test cases.")
                 placeholders = ",".join("?" for _ in requested_ids)
-                requirements = db.execute(
+                selected_requirements = db.execute(
                     f"SELECT * FROM requirements WHERE project_id=? AND id IN ({placeholders}) ORDER BY id",
                     (pid, *requested_ids),
                 ).fetchall()
-                if len(requirements) != len(requested_ids):
+                if len(selected_requirements) != len(requested_ids):
                     raise ValueError("One or more requirements do not belong to this project.")
+                unreviewed = [
+                    item["requirement_key"] for item in selected_requirements
+                    if item["review_status"] != "Reviewed"
+                ]
+                if unreviewed:
+                    raise ValueError(
+                        "Test cases can only be generated from requirements marked Reviewed. "
+                        f"Review first: {', '.join(unreviewed[:10])}."
+                    )
+                requirements = selected_requirements
             else:
                 requirements = db.execute(
-                    "SELECT * FROM requirements WHERE project_id=? ORDER BY id", (pid,)
+                    """SELECT * FROM requirements WHERE project_id=? AND review_status='Reviewed'
+                    ORDER BY id""",
+                    (pid,),
                 ).fetchall()
             if not requirements:
-                raise ValueError("Add or import requirements before generating test cases.")
+                raise ValueError(
+                    "Add or import requirements, then mark at least one as Reviewed before generating test cases."
+                )
+            excluded_unreviewed = db.execute(
+                """SELECT COUNT(*) FROM requirements
+                WHERE project_id=? AND review_status!='Reviewed'""",
+                (pid,),
+            ).fetchone()[0]
 
             generator = data.get("generator", "deterministic")
-            if generator == "ollama":
-                ai_settings = db.execute(
-                    "SELECT ollama_base_url,ollama_model FROM ai_settings WHERE id=1"
-                ).fetchone()
-                if not ai_settings["ollama_model"]:
+            if generator in {"google", "ollama", "openai-compatible", "local"}:
+                ai_settings = active_provider_config(db)
+                if generator != ai_settings["provider"]:
                     raise ValueError(
-                        "No Ollama model is configured. Open Settings → AI module, connect to Ollama, "
-                        "and select an installed model before using AI generation."
+                        "Choose the configured provider in Settings → AI Module before generating cases."
                     )
-                generated_cases = generate_ollama_test_cases(
-                    ai_settings["ollama_base_url"],
-                    ai_settings["ollama_model"],
-                    [dict(requirement) for requirement in requirements],
-                    [],
-                    {},
-                )
+                if ai_settings["provider"] == "local":
+                    generated_cases = generate_project_cases(
+                        [dict(requirement) for requirement in requirements],
+                        [],
+                        {},
+                    )
+                else:
+                    generated_cases = generate_test_cases(
+                        ai_settings["provider"],
+                        ai_settings["model"],
+                        [dict(requirement) for requirement in requirements],
+                        [],
+                        {},
+                        configuration=ai_settings,
+                    )
             elif generator == "deterministic":
                 generated_cases = generate_project_cases(
                     [dict(requirement) for requirement in requirements],
@@ -1849,7 +2625,9 @@ class QAHandler(BaseHTTPRequestHandler):
                     {},
                 )
             else:
-                raise ValueError("Generator must be deterministic or ollama.")
+                raise ValueError(
+                    "Generator must be deterministic or the configured AI provider."
+                )
             created = []
             skipped = 0
             truncated = len(generated_cases) > MAX_GENERATED_CASES
@@ -1859,39 +2637,72 @@ class QAHandler(BaseHTTPRequestHandler):
                     (pid,),
                 )
             }
+            requirements_by_id = {item["id"]: item for item in requirements}
             for generated in generated_cases[:MAX_GENERATED_CASES]:
                 generation_key = generated["generation_key"]
                 if generation_key in existing_keys:
                     skipped += 1
                     continue
                 key = next_key(db, "test_cases", "case_key", pid, "TC")
+                source_requirement = requirements_by_id[generated["requirement_id"]]
                 cursor = db.execute(
                     """INSERT INTO test_cases
-                    (project_id,requirement_id,case_key,scenario,description,steps,expected_result,
-                    test_type,generation_key,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (project_id,requirement_id,case_key,scenario,title,description,steps,expected_result,
+                    preconditions,test_data,use_case_id,priority,test_type,test_category,
+                    classification,generation_key,
+                    requirement_origin,requirement_approval_status,source_suggestion_id,
+                    source_requirement_key,source_requirement_title,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         pid, generated["requirement_id"], key, generated["scenario"],
+                        generated["scenario"],
                         generated["description"], generated["steps"],
-                        generated["expected_result"], generated["test_type"],
-                        generation_key, now, now,
+                        generated["expected_result"], generated.get("preconditions", ""),
+                        generated.get("test_data", ""), generated.get("use_case_id", ""),
+                        generated.get("priority", "Not specified"), generated["test_type"],
+                        "Non-Functional" if generated["test_type"] in {
+                            "Performance", "Security", "Usability", "Compatibility",
+                            "Reliability", "Non-Functional",
+                        } else "Functional",
+                        "Negative" if generated["test_type"] in {"Negative", "Validation"} else "Positive",
+                        generation_key, source_requirement["origin"],
+                        source_requirement["review_status"],
+                        source_requirement["source_suggestion_id"],
+                        source_requirement["requirement_key"], source_requirement["title"],
+                        now, now,
                     ),
                 )
                 existing_keys.add(generation_key)
                 created.append(row_dict(db.execute(
                     "SELECT * FROM test_cases WHERE id=?", (cursor.lastrowid,)
                 ).fetchone()))
-            ai_input_truncated = generator == "ollama" and (
-                len(requirements) > 100
+            ai_input_truncated = (
+                generator not in {"deterministic", "local"} and len(requirements) > 100
             )
-            message = (
-                "Generated Ollama draft cases from project requirements only."
-                + (" Some input records were omitted by model context limits." if ai_input_truncated else "")
-                + " Review every case before execution."
-                if generator == "ollama"
-                else "Generated draft test cases from project requirements only. "
-                     "Review every case before execution."
-            )
+            message = "Generated draft cases from project requirements only."
+            if excluded_unreviewed:
+                message += f" Excluded {excluded_unreviewed} requirement(s) not marked Reviewed."
+            if ai_input_truncated:
+                message += " Some input records were omitted by model context limits."
+            message += " Review every case before execution."
+            covered_requirement_ids = {
+                row["requirement_id"] for row in db.execute(
+                    """SELECT DISTINCT requirement_id FROM test_cases
+                    WHERE project_id=? AND requirement_id IN (
+                        SELECT id FROM requirements WHERE project_id=? AND review_status='Reviewed'
+                    )""",
+                    (pid, pid),
+                )
+            }
+            uncovered_requirements = [
+                {
+                    "id": item["id"],
+                    "requirement_key": item["requirement_key"],
+                    "title": item["title"],
+                }
+                for item in requirements
+                if item["id"] not in covered_requirement_ids
+            ]
             self.send_json({
                 "created": created,
                 "count": len(created),
@@ -1904,6 +2715,13 @@ class QAHandler(BaseHTTPRequestHandler):
                     "application_routes": 0,
                     "source_files": 0,
                 },
+                "coverage": {
+                    "reviewed_requirements": len(requirements),
+                    "covered_requirements": len(requirements) - len(uncovered_requirements),
+                    "uncovered_count": len(uncovered_requirements),
+                    "uncovered_requirements": uncovered_requirements[:100],
+                    "uncovered_truncated": len(uncovered_requirements) > 100,
+                },
                 "generator": generator,
                 "message": message,
             }, 200)
@@ -1911,14 +2729,41 @@ class QAHandler(BaseHTTPRequestHandler):
         if parts[3] == "test-cases" and len(parts) == 4:
             scenario = validate_text(data, "scenario", True, 200)
             req_id = self.optional_requirement(db, data.get("requirement_id"), pid)
+            source_requirement = (
+                db.execute(
+                    """SELECT origin,review_status,source_suggestion_id,requirement_key,title
+                    FROM requirements WHERE id=? AND project_id=?""",
+                    (req_id, pid),
+                ).fetchone()
+                if req_id else None
+            )
             key = next_key(db, "test_cases", "case_key", pid, "TC")
             cur = db.execute(
                 """INSERT INTO test_cases
-                (project_id,requirement_id,case_key,scenario,description,steps,expected_result,
-                test_type,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (pid, req_id, key, scenario, validate_text(data, "description"), validate_text(data, "steps"),
+                (project_id,requirement_id,case_key,scenario,title,description,steps,expected_result,
+                preconditions,test_data,use_case_id,priority,test_type,test_category,classification,
+                assumptions,source_reference,requirement_origin,
+                requirement_approval_status,source_suggestion_id,source_requirement_key,
+                source_requirement_title,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (pid, req_id, key, scenario,
+                 validate_text(data, "title", limit=200) or scenario,
+                 validate_text(data, "description"), validate_text(data, "steps"),
                  validate_text(data, "expected_result"),
-                 self.choice(data, "test_type", TEST_TYPES, "Functional"), now, now),
+                 validate_text(data, "preconditions"), validate_text(data, "test_data"),
+                 validate_text(data, "use_case_id", limit=100),
+                 self.choice(data, "priority", ("Critical", "High", "Medium", "Low", "Not specified"), "Not specified"),
+                 self.choice(data, "test_type", TEST_TYPES, "Functional"),
+                 self.choice(data, "test_category", AD_HOC_TEST_CATEGORIES, "Functional"),
+                 self.choice(data, "classification", ("", "Positive", "Negative"), ""),
+                 validate_text(data, "assumptions", limit=2000),
+                 validate_text(data, "source_reference", limit=500),
+                 source_requirement["origin"] if source_requirement else "",
+                 source_requirement["review_status"] if source_requirement else "",
+                 source_requirement["source_suggestion_id"] if source_requirement else None,
+                 source_requirement["requirement_key"] if source_requirement else "",
+                 source_requirement["title"] if source_requirement else "",
+                 now, now),
             )
             self.send_json(row_dict(db.execute("SELECT * FROM test_cases WHERE id=?", (cur.lastrowid,)).fetchone()), 201)
             return
@@ -2014,6 +2859,95 @@ class QAHandler(BaseHTTPRequestHandler):
             )
             self.send_json(row_dict(db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()))
             return
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:5] == [
+            "requirements", "suggestions",
+        ]:
+            pid = self.parse_project_id(parts[2])
+            suggestion_id = self.parse_project_id(parts[5])
+            row = db.execute(
+                "SELECT * FROM requirement_suggestions WHERE id=? AND project_id=?",
+                (suggestion_id, pid),
+            ).fetchone()
+            if not row:
+                self.send_json({"error": "AI suggestion not found"}, 404)
+                return
+            if row["status"] != "Pending":
+                self.send_json({"error": "This AI suggestion has already been decided."}, 409)
+                return
+            action = data.get("action")
+            actions = {"edit": "Edited", "accept": "Accepted", "reject": "Rejected"}
+            if action not in actions:
+                raise ValueError("Choose edit, accept, or reject for an AI suggestion.")
+            content = json.loads(row["content_json"])
+            if action == "reject" and "content" in data:
+                raise ValueError("Reject action cannot include edited content.")
+            if action != "reject" and "content" in data:
+                raw_content = data["content"]
+                if not isinstance(raw_content, dict):
+                    raise ValueError("Suggestion content must be an object.")
+                content = validate_generated_requirements([raw_content])[0]
+            elif action == "edit":
+                raise ValueError("Edited suggestion content is required.")
+
+            if action == "accept":
+                duplicate = find_duplicate_requirement(db, pid, content)
+                if duplicate:
+                    self.send_json(
+                        {"error": f"This suggestion duplicates {duplicate['requirement_key']}."},
+                        409,
+                    )
+                    return
+                document = db.execute(
+                    "SELECT filename FROM requirement_documents WHERE id=? AND project_id=?",
+                    (row["document_id"], pid),
+                ).fetchone()
+                accepted = insert_requirement_record(
+                    db,
+                    pid,
+                    content,
+                    document["filename"],
+                    row["source_evidence"],
+                    timestamp(),
+                    origin="ai_suggestion",
+                    review_status="Reviewed",
+                    source_suggestion_id=suggestion_id,
+                )
+                db.execute(
+                    """UPDATE requirement_suggestions SET content_json=?,status='Accepted',
+                    accepted_requirement_id=?,updated_at=? WHERE id=?""",
+                    (
+                        json.dumps(content, ensure_ascii=False), accepted["id"],
+                        timestamp(), suggestion_id,
+                    ),
+                )
+            elif action == "reject":
+                db.execute(
+                    """UPDATE requirement_suggestions SET status='Rejected',updated_at=?
+                    WHERE id=?""",
+                    (timestamp(), suggestion_id),
+                )
+            else:
+                db.execute(
+                    """UPDATE requirement_suggestions SET content_json=?,updated_at=?
+                    WHERE id=?""",
+                    (json.dumps(content, ensure_ascii=False), timestamp(), suggestion_id),
+                )
+            reviewer = "Admin" if self.is_admin() else "Local reviewer"
+            db.execute(
+                """INSERT INTO requirement_suggestion_history
+                (suggestion_id,action,content_json,reviewer,created_at)
+                VALUES(?,?,?,?,?)""",
+                (
+                    suggestion_id, actions[action],
+                    json.dumps(content, ensure_ascii=False), reviewer, timestamp(),
+                ),
+            )
+            updated = db.execute(
+                "SELECT * FROM requirement_suggestions WHERE id=?",
+                (suggestion_id,),
+            ).fetchone()
+            self.send_json(requirement_suggestion_dict(db, updated))
+            return
         if len(parts) != 5 or parts[:2] != ["api", "projects"]:
             self.send_json({"error": "Not found"}, 404)
             return
@@ -2027,10 +2961,15 @@ class QAHandler(BaseHTTPRequestHandler):
                 return
             editable_fields = (
                 "title", "description", "acceptance_criteria", "business_rules",
-                "validation_rules", "dependencies", "source_section",
+                "validation_rules", "dependencies", "source_section", "actor",
+                "preconditions", "trigger", "main_flow", "alternative_flow",
+                "exception_flow", "related_requirements",
             )
             vals = [
-                validate_text(data, field, field == "title", 200 if field in ("title", "source_section") else 12000)
+                validate_text(
+                    data, field, field == "title",
+                    200 if field in ("title", "source_section") else 12000,
+                )
                 if field in data else row[field]
                 for field in editable_fields
             ]
@@ -2053,31 +2992,105 @@ class QAHandler(BaseHTTPRequestHandler):
                     409,
                 )
                 return
-            priority = self.choice(data, "priority", ("High", "Medium", "Low"), row["priority"])
-            review = self.choice(data, "review_status", ("Needs review", "Reviewed"), row["review_status"])
+            priority = self.choice(
+                data, "priority", ("High", "Medium", "Low", "Not specified"), row["priority"]
+            )
+            review = self.choice(
+                data, "review_status", ("Needs review", "Reviewed", "Rejected"), row["review_status"]
+            )
+            requirement_type = self.choice(data, "requirement_type", (
+                "Use Case", "User Story", "Feature", "Functional Requirement",
+                "Non-Functional Requirement",
+            ), row["requirement_type"])
+            scope_classification = self.choice(data, "scope_classification", (
+                "In Scope", "Out of Scope", "Requires Clarification",
+            ), row["scope_classification"])
+            ai_confidence_status = self.choice(data, "ai_confidence_status", (
+                "Supported", "Needs clarification",
+            ), row["ai_confidence_status"])
             db.execute(
                 """UPDATE requirements SET title=?,description=?,acceptance_criteria=?,business_rules=?,
-                validation_rules=?,dependencies=?,source_section=?,priority=?,module_type=?,
+                validation_rules=?,dependencies=?,source_section=?,actor=?,preconditions=?,trigger=?,
+                main_flow=?,alternative_flow=?,exception_flow=?,related_requirements=?,priority=?,
+                requirement_type=?,scope_classification=?,ai_confidence_status=?,module_type=?,
                 module_category=?,review_status=? WHERE id=? AND project_id=?""",
-                (*vals, priority, module_type, module_category, review, record, pid),
+                (
+                    *vals, priority, requirement_type, scope_classification, ai_confidence_status,
+                    module_type, module_category, review, record, pid,
+                ),
             )
+            if row["source_suggestion_id"]:
+                decision_content = {
+                    **updated_content,
+                    "priority": priority,
+                    "requirement_type": requirement_type,
+                    "scope_classification": scope_classification,
+                    "ai_confidence_status": ai_confidence_status,
+                    "module_type": module_type,
+                    "module_category": module_category,
+                    "review_status": review,
+                }
+                db.execute(
+                    """INSERT INTO requirement_suggestion_history
+                    (suggestion_id,action,content_json,reviewer,created_at)
+                    VALUES(?,?,?,?,?)""",
+                    (
+                        row["source_suggestion_id"], "Edited",
+                        json.dumps(decision_content, ensure_ascii=False),
+                        "Admin" if self.is_admin() else "Local reviewer", now,
+                    ),
+                )
         elif kind == "test-cases":
             row = db.execute("SELECT * FROM test_cases WHERE id=? AND project_id=?", (record, pid)).fetchone()
             if not row:
                 self.send_json({"error": "Test case not found"}, 404)
                 return
             scenario = validate_text(data, "scenario", True, 200) if "scenario" in data else row["scenario"]
+            title = validate_text(data, "title", True, 200) if "title" in data else row["title"]
             desc = validate_text(data, "description") if "description" in data else row["description"]
             steps = validate_text(data, "steps") if "steps" in data else row["steps"]
             expected = validate_text(data, "expected_result") if "expected_result" in data else row["expected_result"]
+            preconditions = validate_text(data, "preconditions") if "preconditions" in data else row["preconditions"]
+            test_data = validate_text(data, "test_data") if "test_data" in data else row["test_data"]
+            use_case_id = validate_text(data, "use_case_id", limit=100) if "use_case_id" in data else row["use_case_id"]
+            priority = self.choice(
+                data, "priority", ("Critical", "High", "Medium", "Low", "Not specified"), row["priority"]
+            )
             test_type = self.choice(
                 data, "test_type", TEST_TYPES, row["test_type"]
             )
+            test_category = self.choice(
+                data, "test_category", AD_HOC_TEST_CATEGORIES, row["test_category"]
+            )
+            classification = self.choice(
+                data, "classification", ("", "Positive", "Negative"), row["classification"]
+            )
+            assumptions = validate_text(data, "assumptions", limit=2000) if "assumptions" in data else row["assumptions"]
+            source_reference = validate_text(data, "source_reference", limit=500) if "source_reference" in data else row["source_reference"]
             req_id = self.optional_requirement(db, data.get("requirement_id"), pid) if "requirement_id" in data else row["requirement_id"]
+            source_requirement = (
+                db.execute(
+                    """SELECT origin,review_status,source_suggestion_id,requirement_key,title
+                    FROM requirements WHERE id=? AND project_id=?""",
+                    (req_id, pid),
+                ).fetchone()
+                if req_id else None
+            )
             db.execute(
                 """UPDATE test_cases SET scenario=?,description=?,steps=?,expected_result=?,
-                test_type=?,requirement_id=?,updated_at=? WHERE id=? AND project_id=?""",
-                (scenario, desc, steps, expected, test_type, req_id, now, record, pid),
+                title=?,preconditions=?,test_data=?,use_case_id=?,priority=?,test_type=?,
+                test_category=?,classification=?,assumptions=?,source_reference=?,requirement_id=?,
+                requirement_origin=?,requirement_approval_status=?,source_suggestion_id=?,
+                source_requirement_key=?,source_requirement_title=?,updated_at=?
+                WHERE id=? AND project_id=?""",
+                (scenario, desc, steps, expected, title, preconditions, test_data, use_case_id,
+                 priority, test_type, test_category, classification, assumptions, source_reference, req_id,
+                 source_requirement["origin"] if source_requirement else "",
+                 source_requirement["review_status"] if source_requirement else "",
+                 source_requirement["source_suggestion_id"] if source_requirement else None,
+                 source_requirement["requirement_key"] if source_requirement else "",
+                 source_requirement["title"] if source_requirement else "",
+                 now, record, pid),
             )
         elif kind == "bugs":
             row = db.execute("SELECT * FROM bugs WHERE id=? AND project_id=?", (record, pid)).fetchone()
@@ -2100,6 +3113,25 @@ class QAHandler(BaseHTTPRequestHandler):
 
     def delete_api(self, db, path):
         parts = path.strip("/").split("/")
+        if (
+            len(parts) == 6
+            and parts[:2] == ["api", "projects"]
+            and parts[3:5] == ["requirements", "previews"]
+        ):
+            pid = self.parse_project_id(parts[2])
+            preview_id = parts[5]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", preview_id):
+                self.send_json({"error": "BRD preview ID is invalid."}, 400)
+                return
+            cursor = db.execute(
+                "DELETE FROM requirement_analysis_previews WHERE id=? AND project_id=?",
+                (preview_id, pid),
+            )
+            if not cursor.rowcount:
+                self.send_json({"error": "BRD preview not found."}, 404)
+                return
+            self.send_json({"deleted": True})
+            return
         if len(parts) != 5 or parts[:2] != ["api", "projects"] or parts[3] not in ("requirements", "test-cases"):
             self.send_json({"error": "Not found"}, 404)
             return
@@ -2136,12 +3168,25 @@ class QAHandler(BaseHTTPRequestHandler):
         writer.writerow(["Project", self.csv_cell(project["name"]), "Key", self.csv_cell(project["project_key"]),
                          "Version", self.csv_cell(project["version"])])
         writer.writerow([])
-        writer.writerow(["Case ID", "Requirement ID", "Module Type", "Module Category", "Scenario",
+        writer.writerow(["Case ID", "Requirement ID", "Requirement Title", "Requirement Origin",
+                         "Approval Status", "Source Suggestion ID", "Use Case ID",
+                         "Module Type", "Module Category",
+                         "Test Category", "Test Type", "Classification", "Priority",
+                         "Test Case Title", "Scenario", "Preconditions", "Test Data",
+                         "Assumptions / Dependencies", "Source Reference",
                          "Description", "Steps", "Expected Result",
                          "Actual Result", "Status", "Comments", "Evidence references"])
         for row in db.execute(
-            """SELECT tc.case_key, r.requirement_key, COALESCE(r.module_type,''),
-            COALESCE(r.module_category,''), tc.scenario, tc.description, tc.steps, tc.expected_result,
+            """SELECT tc.case_key,
+            COALESCE(r.requirement_key,NULLIF(tc.source_requirement_key,''),''),
+            COALESCE(r.title,NULLIF(tc.source_requirement_title,''),''),
+            COALESCE(NULLIF(tc.requirement_origin,''),r.origin,''),
+            COALESCE(NULLIF(tc.requirement_approval_status,''),r.review_status,''),
+            COALESCE(tc.source_suggestion_id,r.source_suggestion_id,''),
+            tc.use_case_id, COALESCE(r.module_type,''), COALESCE(r.module_category,''),
+            tc.test_category, tc.test_type, tc.classification, tc.priority,
+            tc.title, tc.scenario, tc.preconditions, tc.test_data,
+            tc.assumptions, tc.source_reference, tc.description, tc.steps, tc.expected_result,
             COALESCE(e.actual_result,''), COALESCE(e.status,'Not Executed'), COALESCE(e.comments,''),
             (SELECT group_concat(ev.id || ':' || ev.filename, '; ') FROM execution_evidence ev WHERE ev.execution_id=e.id)
             FROM test_cases tc LEFT JOIN requirements r ON r.id=tc.requirement_id
@@ -2229,11 +3274,13 @@ class QAHandler(BaseHTTPRequestHandler):
         return value
 
 
-def create_server(host="127.0.0.1", port=8000, db_path: Path | str = DB_PATH):
+def create_server(host="127.0.0.1", port=8001, db_path: Path | str = DB_PATH):
     initialize(db_path)
     server = ThreadingHTTPServer((host, port), QAHandler)
     server.db_path = Path(db_path)
     server.storage_root = Path(db_path).resolve().parent / "storage"
+    server.admin_sessions = {}
+    server.admin_session_lock = threading.Lock()
     with database(server.db_path) as db:
         for row in db.execute("SELECT id FROM projects"):
             ensure_project_storage(server.storage_root, row["id"])
@@ -2253,10 +3300,27 @@ def create_server(host="127.0.0.1", port=8000, db_path: Path | str = DB_PATH):
     return server
 
 
+def create_startup_server(host, port):
+    try:
+        return create_server(host, port)
+    except OSError as exc:
+        if (
+            exc.errno != errno.EADDRINUSE
+            or port != 8001
+            or "QA_PORT" in os.environ
+        ):
+            raise
+        print(
+            "Port 8001 is already in use; starting QA Platform on an available port.",
+            flush=True,
+        )
+        return create_server(host, 0)
+
+
 if __name__ == "__main__":
-    host = os.environ.get("QA_HOST", "127.0.0.1")
-    port = int(os.environ.get("QA_PORT", "8000"))
-    server = create_server(host, port)
+    host, port = server_address()
+    server = create_startup_server(host, port)
+    port = server.server_port
     browser_host = "127.0.0.1" if host == "0.0.0.0" else host
     url = f"http://{browser_host}:{port}/"
     print(f"QA Platform running at {url} (Ctrl+C to stop)", flush=True)
