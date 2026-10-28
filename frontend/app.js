@@ -1,7 +1,7 @@
 /* ── Trace · app.js ────────────────────────────────────────────────────
    Single-file vanilla JS frontend.
    Every view renders into #page. Navigation is handled by state.view.
-   All API calls go to the Python backend at the same origin.
+   API calls use the configured backend origin, or the current origin by default.
 ────────────────────────────────────────────────────────────────────── */
 
 /* ── Utilities ────────────────────────────────────────────────────── */
@@ -11,12 +11,25 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const pretty = v => esc(v).replace(/\n/g, "<br>");
 const fmtDate = v => { if (!v) return "—"; const d = new Date(v); return isNaN(d) ? v : d.toLocaleDateString(); };
+const THEME_PREFERENCE_KEY = "trace-theme-preference";
+const THEME_PREFERENCES = ["dark", "light", "system"];
+
+function readThemePreference() {
+  try {
+    const preference = localStorage.getItem(THEME_PREFERENCE_KEY);
+    return THEME_PREFERENCES.includes(preference) ? preference : "dark";
+  } catch (error) {
+    console.warn("Could not read the saved theme preference.", error);
+    return "dark";
+  }
+}
 
 /* ── State ────────────────────────────────────────────────────────── */
 const S = {
   view: "projects",
   viewHistory: [],
   settingsTab: "ai",        // which settings sub-pane is active
+  themePreference: readThemePreference(),
   project: null,
   projects: [],
   requirements: [],
@@ -27,15 +40,21 @@ const S = {
   bugs: [],
   apiDocs: [],
   applications: [],
-  analyses: [],
-  reaRuntime: null,
   aiSettings: {
     provider: "local",
     model: "deterministic",
     configured: true,
     providers: [],
   },
-  auth: { authenticated: false, admin_configured: false },
+  auth: { authenticated: false, admin_configured: false, user: null, permissions: [] },
+  authMode: "login",
+  legacyAdminLogin: false,
+  users: [],
+  teams: [],
+  roles: [],
+  permissionModules: {},
+  profile: null,
+  customFields: [],
   aiDraft: null,
   aiStatus: "",
   caseGenerator: "deterministic",
@@ -45,24 +64,353 @@ const S = {
   inventoryVisible: {},
 };
 
+function currentPath() {
+  return window.location.pathname.replace(/\/+$/, "") || "/";
+}
+
+function isPublicPath(path = currentPath()) {
+  return ["/", "/about", "/privacy", "/terms"].includes(path);
+}
+
+function publicHeader(active = "home") {
+  return `
+    <header class="public-header">
+      <a class="public-brand" href="/" data-public-nav aria-label="TRACE home">
+        <picture class="brand-picture">
+          <source srcset="/assets/Logo-light.svg" type="image/svg+xml" data-brand-theme="light">
+          <source srcset="/assets/Logo-light.png" type="image/png" data-brand-theme="light">
+          <source srcset="/assets/Logo.svg" type="image/svg+xml">
+          <img class="public-brand-logo" src="/assets/Logo.png" alt="TRACE — AI-powered QA workspace">
+        </picture>
+      </a>
+      <button class="public-menu-toggle" type="button" aria-expanded="false" aria-controls="publicNav" aria-label="Open navigation">
+        <span></span><span></span><span></span>
+      </button>
+      <nav class="public-nav" id="publicNav" aria-label="Main navigation">
+        <a href="/#top" data-public-nav class="${active === "home" ? "active" : ""}">Home</a>
+        <a href="/#features" data-public-nav>Features</a>
+        <a href="/#how-it-works" data-public-nav>How It Works</a>
+        <a href="/about" data-public-nav class="${active === "about" ? "active" : ""}">About</a>
+        <a href="/privacy" data-public-nav class="${active === "privacy" ? "active" : ""}">Privacy</a>
+        <a href="/terms" data-public-nav class="${active === "terms" ? "active" : ""}">Terms</a>
+        <span class="public-nav-actions">
+          <a class="public-signin" href="/login" data-public-nav>Sign In</a>
+          <a class="public-button public-button-small" href="/signup" data-public-nav>Get Started <span aria-hidden="true">↗</span></a>
+        </span>
+      </nav>
+    </header>`;
+}
+
+function publicFooter() {
+  return `
+    <footer class="public-footer">
+      <div class="public-footer-main">
+        <a class="public-brand" href="/" data-public-nav aria-label="TRACE home">
+          <picture class="brand-picture">
+            <source srcset="/assets/Logo-light.svg" type="image/svg+xml" data-brand-theme="light">
+            <source srcset="/assets/Logo-light.png" type="image/png" data-brand-theme="light">
+            <source srcset="/assets/Logo.svg" type="image/svg+xml">
+            <img class="public-brand-logo" src="/assets/Logo.png" alt="TRACE — AI-powered QA workspace">
+          </picture>
+        </a>
+        <p>Connect business requirements to practical, reviewable software testing.</p>
+        <div class="public-footer-links">
+          <div><strong>Explore</strong><a href="/#features" data-public-nav>Features</a><a href="/#how-it-works" data-public-nav>How it works</a><a href="/about" data-public-nav>About</a></div>
+          <div><strong>Policies</strong><a href="/privacy" data-public-nav>Privacy policy</a><a href="/terms" data-public-nav>Terms &amp; conditions</a></div>
+          <div><strong>Workspace</strong><a href="/login" data-public-nav>Sign in</a><a href="/signup" data-public-nav>Get started</a></div>
+        </div>
+      </div>
+      <div class="public-footer-bottom"><span>© ${new Date().getFullYear()} TRACE</span><span>Local-first QA workspace · Draft policies require legal review</span></div>
+    </footer>`;
+}
+
+function publicLayout(content, active) {
+  return `${publicHeader(active)}${content}${publicFooter()}`;
+}
+
+function homePage() {
+  const benefits = [
+    ["▤", "Manual analysis takes time", "Turn supported BRD content into structured records your team can inspect and confirm."],
+    ["◇", "Ambiguity is easy to miss", "Review reported gaps and clarification points before they become assumptions in test design."],
+    ["↻", "Test preparation is repetitive", "Generate editable test-case drafts from requirements that have been reviewed."],
+    ["⌁", "Traceability gets fragmented", "Keep generated cases connected to their source requirements for easier review."],
+    ["☷", "Documentation varies by author", "Use a consistent structure for requirements, steps, expected results, and priorities."],
+    ["▥", "Coverage is hard to see", "Review requirement coverage and uncovered items alongside your project test work."]
+  ];
+  const features = [
+    ["BRD upload & analysis", "Import supported PDF, DOCX, CSV, TXT, and Markdown documents. Scanned PDFs need OCR before import.", "AVAILABLE"],
+    ["Rule-based extraction", "Deterministic extraction confirms only source-supported content; headings and unstructured text are not treated as requirements by themselves.", "AVAILABLE"],
+    ["AI-assisted analysis", "Optional configured providers can propose analysis and requirements. Suggestions stay separate until a reviewer acts.", "AVAILABLE · OPTIONAL"],
+    ["Requirement gap review", "Review potential missing information and ambiguity reported during analysis; use it as guidance, not verified fact.", "AVAILABLE · REVIEW REQUIRED"],
+    ["Requirement traceability", "Link generated cases to reviewed requirements and inspect reported coverage.", "AVAILABLE"],
+    ["Test-case generation", "Create editable, requirement-linked drafts with the local deterministic generator or an optional configured provider.", "AVAILABLE"],
+    ["Project management", "Organize requirements, test cases, execution status, defects, files, and reports by project.", "AVAILABLE"],
+    ["Structured QA documentation", "Capture consistent requirement and test-case fields, attachments, and CSV reports.", "AVAILABLE"],
+    ["Application code analysis", "The current workspace labels this module Coming soon; its analysis workflow is not available yet.", "COMING SOON"]
+  ];
+  const benefitCards = benefits.map(([icon, title, copy]) => `
+    <article class="public-card benefit-card"><span class="benefit-icon" aria-hidden="true">${icon}</span><h3>${title}</h3><p>${copy}</p></article>`).join("");
+  const featureCards = features.map(([title, copy, status]) => `
+    <article class="public-card feature-card"><span class="feature-mark" aria-hidden="true">✓</span><div><span class="feature-status">${status}</span><h3>${title}</h3><p>${copy}</p></div></article>`).join("");
+  return publicLayout(`
+    <main id="top">
+      <section class="public-hero">
+        <div class="hero-circuit hero-circuit-left" aria-hidden="true"></div>
+        <div class="hero-copy">
+          <p class="public-eyebrow"><span class="status-pulse"></span> REQUIREMENTS IN · CONFIDENCE OUT</p>
+          <h1>Turn Requirements Into <span>Test-Ready Confidence.</span></h1>
+          <p class="hero-description">Analyze business requirements, identify gaps, and generate structured test cases with TRACE — your workspace for smarter QA.</p>
+          <div class="hero-actions">
+            <a class="public-button" href="/signup" data-public-nav>Get Started <span aria-hidden="true">↗</span></a>
+            <a class="public-button public-button-secondary" href="/login" data-public-nav>Sign In</a>
+          </div>
+          <p class="hero-note"><span aria-hidden="true">●</span> Local-first today · Optional model providers · Human review stays in the loop</p>
+        </div>
+        <div class="workflow-visual" role="img" aria-label="TRACE workflow overview: upload a BRD, analyze requirements, review gaps, then prepare test cases.">
+          <div class="workflow-topline"><span>THE TRACE WORKFLOW</span><span class="workflow-live"><i></i> REVIEW-LED</span></div>
+          <div class="workflow-path" aria-hidden="true"><span></span></div>
+          <div class="workflow-steps">
+            <div class="workflow-step"><b>01</b><span class="workflow-icon">↑</span><strong>Upload BRD</strong><small>Provide source material</small></div>
+            <div class="workflow-step"><b>02</b><span class="workflow-icon">⌕</span><strong>Analyze</strong><small>Extract supported detail</small></div>
+            <div class="workflow-step"><b>03</b><span class="workflow-icon">◇</span><strong>Review gaps</strong><small>Confirm what matters</small></div>
+            <div class="workflow-step"><b>04</b><span class="workflow-icon">☷</span><strong>Prepare tests</strong><small>Keep source links</small></div>
+          </div>
+          <div class="workflow-caption"><span>WORKFLOW OVERVIEW</span><span>Illustrative · not a live dashboard</span></div>
+        </div>
+        <div class="hero-bottomline"><span>BUILT FOR QA TEAMS, ANALYSTS &amp; BUILDERS</span><span>01 / REQUIREMENTS TO TESTS</span></div>
+      </section>
+
+      <section class="public-section intro-section" id="about-trace">
+        <div class="section-kicker">01 / WHAT IS TRACE?</div>
+        <div class="intro-grid"><h2>A clearer path from <span>what to build</span> to how to test it.</h2><div><p>TRACE is a QA productivity workspace designed to connect business requirements with software testing. Keep source documents, structured requirements, review decisions, and test cases together in a project-focused workflow.</p><p>Deterministic extraction provides a source-grounded starting point. Optional AI analysis can suggest interpretations and gaps for people to review—not silently replace the source or your team’s judgment.</p><a class="text-link" href="/about" data-public-nav>Learn about TRACE <span aria-hidden="true">→</span></a></div></div>
+      </section>
+
+      <section class="public-section benefits-section" id="benefits">
+        <div class="section-heading"><div><div class="section-kicker">02 / WHY TRACE?</div><h2>Make the work between <span>requirements and tests</span> easier to see.</h2></div><p>Purpose-built support for common QA handoffs—with review and traceability kept visible.</p></div>
+        <div class="benefit-grid">${benefitCards}</div>
+      </section>
+
+      <section class="public-section features-section" id="features">
+        <div class="section-heading"><div><div class="section-kicker">03 / PRODUCT CAPABILITIES</div><h2>Practical tools for a <span>reviewable QA workflow.</span></h2></div><p>Available capabilities reflect the current application. AI providers are optional, and generated suggestions require human review.</p></div>
+        <div class="feature-grid">${featureCards}</div>
+      </section>
+
+      <section class="public-section how-section" id="how-it-works">
+        <div class="section-kicker">04 / HOW IT WORKS</div><h2>From source document to <span>reviewed test draft.</span></h2>
+        <div class="how-grid">
+          <article><span>STEP 01</span><b>↑</b><h3>Upload BRD</h3><p>Provide a supported requirements document or paste its text into a project.</p></article>
+          <article><span>STEP 02</span><b>⌕</b><h3>Analyze requirements</h3><p>Use deterministic extraction for source-supported requirements; optionally request AI analysis.</p></article>
+          <article><span>STEP 03</span><b>◇</b><h3>Review results</h3><p>Inspect extracted records, potential gaps, and clearly separated AI suggestions. Confirm and review before generation.</p></article>
+          <article><span>STEP 04</span><b>☷</b><h3>Generate test cases</h3><p>Create structured, editable drafts linked to eligible reviewed requirements.</p></article>
+        </div>
+        <p class="how-note">AI proposals are not confirmed source facts. Review the source and approve requirements before relying on generated drafts.</p>
+      </section>
+      <section class="public-cta"><div><div class="section-kicker">READY TO TRACE THE DETAILS?</div><h2>Bring your requirements and testing closer together.</h2><p>Start in the existing TRACE workspace. Local deployment and sign-up constraints apply.</p></div><a class="public-button" href="/signup" data-public-nav>Get Started <span aria-hidden="true">↗</span></a></section>
+    </main>`, "home");
+}
+
+function aboutPage() {
+  return publicLayout(`
+    <main class="public-subpage">
+      <section class="subpage-hero"><p class="public-eyebrow">ABOUT TRACE · REQUIREMENTS TO TESTING</p><h1>Make the connection between <span>requirements and testing</span> easier to follow.</h1><p>TRACE is a QA productivity workspace built to help teams carry source requirements into reviewable test preparation.</p></section>
+      <section class="public-section about-content">
+        <article><span class="section-kicker">PURPOSE</span><h2>Turn scattered handoffs into a reviewable workflow.</h2><p>Business requirements describe intended outcomes; software testing checks whether those outcomes are supported by the product. TRACE brings source documents, extracted requirements, reviewer decisions, and linked test cases into a shared project workspace.</p></article>
+        <article><span class="section-kicker">VISION</span><h2>Clarity first. Traceability throughout.</h2><p>The goal is to help teams identify unclear source material, make review decisions explicit, and prepare structured tests without losing the connection to the requirement that informed them.</p></article>
+        <article><span class="section-kicker">WHO IT’S FOR</span><h2>Designed around cross-functional QA work.</h2><p>QA engineers, test leads, business analysts, and development teams can use TRACE to collaborate on requirement review, test preparation, execution tracking, and project-level visibility.</p></article>
+        <article class="about-callout"><span class="section-kicker">CURRENT PRODUCT</span><p>TRACE is currently a local-first application. Deterministic workflows run locally; optional AI integrations use a provider configured by the workspace administrator. AI output is a suggestion and needs human review.</p></article>
+      </section>
+      <div class="subpage-action"><a class="public-button" href="/signup" data-public-nav>Explore the workspace <span aria-hidden="true">↗</span></a></div>
+    </main>`, "about");
+}
+
+function legalPage(kind) {
+  const isPrivacy = kind === "privacy";
+  const title = isPrivacy ? "Privacy Policy" : "Terms & Conditions";
+  const lastUpdated = "27 October 2026";
+  const sections = isPrivacy ? [
+    ["scope", "1. Scope and draft status", "<p>This draft describes the current local-first TRACE application, not a separately hosted cloud service. It is a working product document, not legal advice; have qualified counsel review it before production use. Operator identity, governing law, and the final contact process remain to be supplied.</p>"],
+    ["data", "2. Information handled", "<p>Depending on use, TRACE stores account names and email addresses, profile and role information, project details, requirements, test cases, execution and defect records, audit history, and files or attachments uploaded by users. Account passwords are stored as salted PBKDF2 hashes rather than plaintext.</p>"],
+    ["documents", "3. Uploaded requirements and files", "<p>Uploaded BRDs and other project files are stored in the workspace’s configured storage directory; structured records are stored in the configured database. The default setup uses SQLite and local storage. PostgreSQL can be configured for database records, but project files still require persistent shared storage. Operators should secure and back up both locations.</p><p>Deleting a project removes its database records but archives its project folder rather than erasing its files. Account deactivation preserves related records and audit history. TRACE does not currently define an automatic retention period; archived files and backups may remain until separately removed by the operator.</p>"],
+    ["ai", "4. AI and model processing", "<p>Local deterministic processing is available. If an administrator configures Ollama, Google Gemini, or an OpenAI-compatible provider, document-derived content, requirements, or prompts submitted for AI-assisted analysis or generation may be sent to that provider for processing. The provider’s own terms, retention, and privacy practices apply to that processing.</p><p>Review provider settings and applicable agreements before sending confidential, personal, regulated, or otherwise restricted information. Provider API credentials are stored encrypted in the database when configured with the required encryption key. Do not treat AI output as verified source content.</p>"],
+    ["services", "5. Storage, third parties, and deployment", "<p>TRACE does not currently provide cloud sync or a hosted account service. The default backend listens on the local loopback interface; deployment settings can change this. The operator is responsible for deployment, network transport, server/database/filesystem access, backups, and any third-party model service they configure. The current stylesheet requests Geist font assets from Google Fonts, so a browser may contact Google when loading the interface. Optional model providers also receive the content submitted for processing. No analytics or advertising integration is described by the current application; verify deployment-specific integrations before use.</p>"],
+    ["retention", "6. Retention and deletion", "<p>Workspace data remains in the configured database and storage until an operator or authorized user removes it. Project deletion archives files as described above, so it is not complete erasure. No automatic expiry or backup-purge schedule is currently provided. Define and document a deletion and backup-retention process before production use.</p>"],
+    ["rights", "7. User requests and choices", "<p>Users should contact the workspace operator to ask about access, correction, export, or deletion of their account information. TRACE does not include an email-based recovery or centralized privacy-request service. The operator must define applicable rights, identity verification, response timelines, and deletion handling for the deployment.</p>"],
+    ["security", "8. Security", "<p>The application uses role-based API permissions, salted password hashes, and HttpOnly, SameSite session cookies with a 12-hour lifetime. These implementation details are not a guarantee of security. Keep the application and its data on trusted infrastructure, protect administrator credentials and encryption keys, use appropriate transport protection if exposed beyond localhost, and maintain backups and access controls.</p>"],
+    ["contact", "9. Contact and unresolved details", "<p>Workspace operator / legal entity: <strong>[OPERATOR NAME TO BE PROVIDED]</strong><br>Privacy contact: <strong>[CONTACT EMAIL OR PROCESS TO BE PROVIDED]</strong><br>Jurisdiction and applicable privacy law: <strong>[TO BE DETERMINED]</strong></p><p>Replace these placeholders and confirm the policy against the actual deployment and applicable law before publication.</p>"]
+  ] : [
+    ["draft", "1. Draft and operator", "<p>These draft terms describe the current TRACE application and require review by qualified counsel before production use. They do not identify a contracting entity or governing law. Operator: <strong>[OPERATOR NAME TO BE PROVIDED]</strong>. Governing law and venue: <strong>[TO BE DETERMINED]</strong>.</p>"],
+    ["account", "2. Accounts and responsibilities", "<p>Provide accurate account details, protect passwords and administrator credentials, and use only accounts and permissions assigned to you. Workspace administrators control accounts and roles. The current application is local-first and account creation and authentication are restricted to local requests; it is not a public hosted signup service.</p>"],
+    ["content", "3. Uploaded content and acceptable use", "<p>You retain responsibility for the content you upload or enter, including having the rights and authority to use it. Do not upload material unlawfully or in violation of another party’s rights, or content you are not authorized to process. You are responsible for choosing appropriate storage, access, and configured model providers for your information.</p>"],
+    ["ai", "4. AI-generated output and review", "<p>AI-assisted results can be incomplete, inaccurate, or inconsistent with the source. They are suggestions, not professional advice or verified facts. Review the original requirements and all extracted content, gap findings, and generated test cases before using them. TRACE does not guarantee defect prevention, complete coverage, or suitability for a particular purpose.</p>"],
+    ["service", "5. Service limitations and availability", "<p>TRACE is provided as a local-first QA workspace. Availability depends on the operator’s machine, configuration, database, storage, and any optional AI provider. The application does not currently provide cloud synchronization, subscription billing, or a service-level guarantee. Features may change; the operator should maintain independent backups.</p>"],
+    ["ownership", "6. Intellectual property", "<p>Users retain rights in their submitted content. TRACE’s software, branding, and associated materials remain with their respective rights holders. To operate the application, users authorize the workspace operator and any explicitly configured model provider to process submitted content for the requested workspace functions, subject to applicable agreements.</p>"],
+    ["billing", "7. Subscription terms", "<p>No subscription or payment workflow is implemented in the current application. If a paid service is introduced, pricing, renewal, cancellation, taxes, and refund terms must be presented separately and accepted before payment.</p>"],
+    ["termination", "8. Suspension, termination, and data", "<p>Workspace administrators can deactivate accounts and delete projects. Deactivation preserves related records and audit history; project deletion archives project files rather than erasing them. Operators should define access termination, data export, deletion, and archive-purge practices for their deployment.</p>"],
+    ["liability", "9. Warranty and liability", "<p>To the extent permitted by applicable law, TRACE is provided without a guarantee that it will be uninterrupted, error-free, secure, or suitable for a particular testing purpose. The operator must define any applicable warranty disclaimer, liability limits, and statutory exceptions with legal counsel: <strong>[LEGAL TERMS TO BE REVIEWED]</strong>.</p>"],
+    ["contact", "10. Contact and changes", "<p>Operator / legal entity: <strong>[OPERATOR NAME TO BE PROVIDED]</strong><br>Terms contact: <strong>[CONTACT EMAIL OR PROCESS TO BE PROVIDED]</strong><br>Governing law: <strong>[TO BE DETERMINED]</strong></p><p>Replace placeholders and publish a dated, legally reviewed version before production use.</p>"]
+  ];
+  const links = sections.map(([id, heading]) => `<a href="#${id}">${heading.replace(/^\d+\.\s*/, "")}</a>`).join("");
+  const content = sections.map(([id, heading, body]) => `<section class="legal-section" id="${id}"><h2>${heading}</h2>${body}</section>`).join("");
+  return publicLayout(`
+    <main class="public-subpage legal-page">
+      <section class="subpage-hero legal-hero"><p class="public-eyebrow">TRACE · ${isPrivacy ? "DATA & PRIVACY" : "SERVICE TERMS"}</p><h1>${title}</h1><p>Draft for review · Last updated ${lastUpdated}</p><div class="draft-notice"><strong>Draft — not legal advice.</strong> The operator, contact, jurisdiction, and deployment-specific details are placeholders or require confirmation. Obtain legal review before production use.</div></section>
+      <div class="legal-layout"><nav class="legal-toc" aria-label="${title} contents"><strong>On this page</strong>${links}</nav><div class="legal-content">${content}</div></div>
+    </main>`, isPrivacy ? "privacy" : "terms");
+}
+
+function renderPublicPage() {
+  const root = $("#publicRoot");
+  if (!root) return;
+  const path = currentPath();
+  document.body.classList.remove("auth-required");
+  document.body.classList.add("public-site");
+  root.hidden = false;
+  root.innerHTML = path === "/about" ? aboutPage()
+    : path === "/privacy" ? legalPage("privacy")
+    : path === "/terms" ? legalPage("terms")
+    : homePage();
+  applyBrandTheme(S.themePreference);
+  const pageTitles = {
+    "/": "TRACE | AI-Powered QA Workspace",
+    "/about": "About TRACE | AI-Powered QA Workspace",
+    "/privacy": "Privacy Policy | TRACE",
+    "/terms": "Terms & Conditions | TRACE"
+  };
+  document.title = pageTitles[path] || pageTitles["/"];
+  bindPublicActions();
+  if (window.location.hash) {
+    requestAnimationFrame(() => document.getElementById(decodeURIComponent(window.location.hash.slice(1)))?.scrollIntoView());
+  } else {
+    window.scrollTo(0, 0);
+  }
+}
+
+function bindPublicActions() {
+  const root = $("#publicRoot");
+  if (root.dataset.publicActionsBound) return;
+  root.dataset.publicActionsBound = "true";
+  root.addEventListener("keydown", event => {
+    if (event.key !== "Escape") return;
+    const toggle = $(".public-menu-toggle", root);
+    if (toggle?.getAttribute("aria-expanded") !== "true") return;
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.setAttribute("aria-label", "Open navigation");
+    $("#publicNav", root).classList.remove("is-open");
+    toggle.focus();
+  });
+  root.addEventListener("click", event => {
+    const toggle = event.target.closest(".public-menu-toggle");
+    if (toggle) {
+      const nav = $("#publicNav");
+      const expanded = toggle.getAttribute("aria-expanded") === "true";
+      toggle.setAttribute("aria-expanded", String(!expanded));
+      toggle.setAttribute("aria-label", expanded ? "Open navigation" : "Close navigation");
+      nav.classList.toggle("is-open", !expanded);
+      return;
+    }
+    const link = event.target.closest("a[data-public-nav]");
+    if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const target = new URL(link.href, window.location.href);
+    if (target.origin !== window.location.origin) return;
+    if (target.pathname === currentPath() && target.hash) {
+      $("#publicNav", root)?.classList.remove("is-open");
+      const menuToggle = $(".public-menu-toggle", root);
+      menuToggle?.setAttribute("aria-expanded", "false");
+      menuToggle?.setAttribute("aria-label", "Open navigation");
+      return;
+    }
+    event.preventDefault();
+    window.history.pushState({}, "", `${target.pathname}${target.hash}`);
+    handleRouteChange();
+  });
+}
+
+function handleRouteChange() {
+  const path = currentPath();
+  if (isPublicPath(path)) {
+    renderPublicPage();
+    return;
+  }
+  if (path === "/signup") S.authMode = "signup";
+  else S.authMode = "login";
+  $("#publicRoot").hidden = true;
+  document.body.classList.remove("public-site");
+  render();
+  loadProjects().catch(error => toast(error.message));
+}
+
+function applyThemePreference(preference) {
+  document.documentElement.dataset.theme = preference;
+  const prefersLight = window.matchMedia("(prefers-color-scheme: light)").matches;
+  const isLight = preference === "light" || (preference === "system" && prefersLight);
+  applyBrandTheme(preference);
+  const themeColor = $('meta[name="theme-color"]');
+  if (themeColor) themeColor.content = isLight ? "#f5f7f4" : "#0c0e0d";
+}
+
+function applyBrandTheme(preference) {
+  const mediaForTheme = theme => preference === "system"
+    ? `(prefers-color-scheme: ${theme})`
+    : preference === theme ? "all" : "not all";
+
+  document.querySelectorAll("source[data-brand-theme], link[data-brand-theme]").forEach(asset => {
+    asset.media = mediaForTheme(asset.dataset.brandTheme);
+  });
+}
+
+function saveThemePreference(preference) {
+  if (!THEME_PREFERENCES.includes(preference)) return;
+  S.themePreference = preference;
+  applyThemePreference(preference);
+  try {
+    localStorage.setItem(THEME_PREFERENCE_KEY, preference);
+    toast("Appearance preference saved");
+  } catch (error) {
+    console.error("Could not save the theme preference.", error);
+    toast("Theme changed for this session, but could not be saved in this browser.");
+  }
+}
+
+applyThemePreference(S.themePreference);
+window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+  if (S.themePreference === "system") applyThemePreference(S.themePreference);
+});
+
 const modal = $("#modal");
 const modalForm = $("#modalForm");
-let pollTimer = null;
 
 /* ── API helper ───────────────────────────────────────────────────── */
+const API_BASE_URL = String(window.QA_API_BASE_URL || "").replace(/\/+$/, "");
+
 async function api(path, opts = {}) {
   let res;
   try {
-    res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+    res = await fetch(`${API_BASE_URL}${path}`, {
+      credentials: "include",
+      ...opts,
+      headers: {
+        "Content-Type": "application/json",
+        ...(S.auth.user?.tenant_id ? { "X-Tenant-ID": String(S.auth.user.tenant_id) } : {}),
+        ...(opts.headers || {}),
+      },
+    });
   } catch (e) {
     if (e instanceof TypeError) throw new Error("Cannot reach the QA server. Make sure app.py is running.");
     throw e;
   }
+
   const ct = res.headers.get("content-type") || "";
   const data = ct.includes("application/json") ? await res.json() : null;
   if (!res.ok) {
     const error = new Error(data?.error || `Request failed (${res.status})`);
     error.status = res.status;
+    if (res.status === 401 && !path.startsWith("/api/auth/")) {
+      S.auth = { authenticated: false, admin_configured: S.auth.admin_configured, user: null, permissions: [] };
+      S.project = null;
+      S.view = "projects";
+      S.viewHistory = [];
+      render();
+    }
     throw error;
   }
   return data;
@@ -86,15 +434,206 @@ function goBack() {
   if (prev) { S.view = prev; render(); }
 }
 
+function profileInitials(user) {
+  const first = String(user?.first_name || "").trim();
+  const last = String(user?.last_name || "").trim();
+  const initials = `${first[0] || ""}${last[0] || ""}`;
+  return initials || String(user?.email || "?")[0] || "?";
+}
+
+function syncProfileMenu() {
+  const trigger = $("#profileMenuTrigger");
+  const menu = $("#profileMenu");
+  if (!trigger || !menu) return;
+  const authenticated = Boolean(S.auth.authenticated && S.auth.user);
+  trigger.hidden = !authenticated;
+  if (!authenticated) {
+    trigger.setAttribute("aria-expanded", "false");
+    menu.hidden = true;
+    return;
+  }
+
+  const user = S.auth.user;
+  const profile = S.profile;
+  const currentProfile = profile && (
+    profile.global_admin
+      ? Boolean(user.global_admin)
+      : String(profile.id) === String(user.id)
+  ) ? profile : null;
+  const name = [user.first_name, user.last_name].filter(Boolean).join(" ").trim()
+    || user.email || "Account";
+  const initials = profileInitials(user);
+  const imageTypes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+  const image = currentProfile?.profile_image_data
+    && imageTypes.includes(currentProfile.profile_image_type)
+    ? `data:${currentProfile.profile_image_type};base64,${currentProfile.profile_image_data}`
+    : "";
+
+  ["#profileMenuAvatar", "#profileMenuAvatarLarge"].forEach(selector => {
+    const avatar = $(selector);
+    if (!avatar) return;
+    avatar.replaceChildren();
+    if (image) {
+      const img = document.createElement("img");
+      img.src = image;
+      img.alt = "";
+      avatar.append(img);
+    } else {
+      avatar.textContent = initials;
+    }
+  });
+  $("#profileMenuName").textContent = name;
+  $("#profileMenuEmail").textContent = user.email || "";
+  $("#profileMenuRole").textContent = user.role_name || (user.global_admin ? "Administrator" : "");
+  trigger.setAttribute("aria-label", `Open account menu for ${name}`);
+}
+
+function closeProfileMenu(returnFocus = false) {
+  const trigger = $("#profileMenuTrigger");
+  const menu = $("#profileMenu");
+  if (!trigger || !menu) return;
+  trigger.setAttribute("aria-expanded", "false");
+  menu.hidden = true;
+  if (returnFocus && !trigger.hidden) trigger.focus();
+}
+
+async function signOut() {
+  try {
+    await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+    S.auth = await api("/api/auth/status");
+    S.project = null;
+    S.profile = null;
+    S.aiDraft = null;
+    S.aiStatus = "";
+    S.view = "projects";
+    S.viewHistory = [];
+    closeProfileMenu();
+    await render();
+  } catch (error) {
+    toast(error.message);
+    throw error;
+  }
+}
+
+function bindProfileMenu() {
+  const container = $("#profileMenuContainer");
+  const trigger = $("#profileMenuTrigger");
+  const menu = $("#profileMenu");
+  if (!container || !trigger || !menu) return;
+
+  trigger.addEventListener("click", async () => {
+    const opening = trigger.getAttribute("aria-expanded") !== "true";
+    if (!opening) {
+      closeProfileMenu();
+      return;
+    }
+    trigger.setAttribute("aria-expanded", "true");
+    menu.hidden = false;
+    const userId = S.auth.user?.id;
+    const profileIsCurrent = S.profile && (
+      S.profile.global_admin
+        ? Boolean(S.auth.user?.global_admin)
+        : String(S.profile.id) === String(userId)
+    );
+    if (!profileIsCurrent) {
+      try {
+        const profile = await api("/api/profile");
+        if (S.auth.authenticated && String(userId) === String(S.auth.user?.id)) {
+          S.profile = profile;
+          syncProfileMenu();
+        }
+      } catch (error) {
+        toast(error.message);
+      }
+    }
+  });
+  trigger.addEventListener("keydown", event => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    trigger.click();
+    const items = $$('[role="menuitem"]', menu).filter(item => !item.disabled);
+    items[event.key === "ArrowDown" ? 0 : items.length - 1]?.focus();
+  });
+
+  menu.addEventListener("click", async event => {
+    const item = event.target.closest("[data-profile-action]");
+    if (!item) return;
+    const action = item.dataset.profileAction;
+    closeProfileMenu();
+    if (action === "signout") {
+      item.disabled = true;
+      item.textContent = "Signing out…";
+      try {
+        await signOut();
+      } catch {
+        item.disabled = false;
+        item.innerHTML = '<span aria-hidden="true">↪</span>Sign out';
+      }
+      return;
+    }
+
+    if (action === "profile" || action === "security") {
+      S.settingsTab = "profile";
+      navigate("settings");
+      render();
+      await loadSettingsTab("profile");
+      if (action === "security") {
+        const passwordInput = $("#passwordForm input");
+        passwordInput?.scrollIntoView({ block: "center" });
+        passwordInput?.focus({ preventScroll: true });
+      }
+    } else if (action === "settings") {
+      navigate("settings");
+      render();
+    }
+  });
+
+  document.addEventListener("pointerdown", event => {
+    if (!container.contains(event.target)) closeProfileMenu();
+  });
+  container.addEventListener("focusout", () => {
+    setTimeout(() => {
+      if (!container.contains(document.activeElement)) closeProfileMenu();
+    });
+  });
+  document.addEventListener("keydown", event => {
+    if (trigger.getAttribute("aria-expanded") !== "true") return;
+    const items = $$('[role="menuitem"]', menu).filter(item => !item.disabled);
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeProfileMenu(true);
+      return;
+    }
+    if (!items.length) return;
+    const currentIndex = items.indexOf(document.activeElement);
+    let nextIndex = null;
+    if (event.key === "ArrowDown") nextIndex = (currentIndex + 1) % items.length;
+    if (event.key === "ArrowUp") nextIndex = (currentIndex <= 0 ? items.length : currentIndex) - 1;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = items.length - 1;
+    if (nextIndex !== null) {
+      event.preventDefault();
+      items[nextIndex].focus();
+    }
+  });
+}
+
 /* ── Project API path shortcut ────────────────────────────────────── */
 function pp(suffix) { return `/api/projects/${S.project.id}/${suffix}`; }
 
 /* ── Load everything from the backend ────────────────────────────── */
 async function loadProjects(preferred) {
-  [S.projects, S.aiSettings, S.auth] = await Promise.all([
+  S.auth = await api("/api/auth/status");
+  if (!S.auth.authenticated) {
+    await render();
+    return;
+  }
+  if (["/login", "/signup"].includes(currentPath())) {
+    window.history.replaceState({}, "", "/workspace");
+  }
+  [S.projects, S.aiSettings] = await Promise.all([
     api("/api/projects"),
     api("/api/ai/settings"),
-    api("/api/auth/status"),
   ]);
   const sel = $("#projectSelect");
   if (sel) {
@@ -110,33 +649,34 @@ async function loadProjects(preferred) {
 
 async function refresh() {
   if (!S.project) return render();
-  const suggestionsRequest = api(pp("requirements/suggestions")).catch(error => {
-    if (error.status !== 404) throw error;
-    const message = "This server does not support requirement suggestions. Stop it, start qa-platform\\start-qa-platform.bat, then refresh.";
-    console.warn(message);
-    toast(message);
-    return [];
-  });
+  const loadIfAllowed = (permission, path) =>
+    hasPermission(permission) ? api(pp(path)) : Promise.resolve([]);
+  const suggestionsRequest = hasPermission("requirements.view")
+    ? api(pp("requirements/suggestions")).catch(error => {
+      if (error.status !== 404) throw error;
+      const message = "This server does not support requirement suggestions. Stop it, start qa-platform\\start-qa-platform.bat, then refresh.";
+      console.warn(message);
+      toast(message);
+      return [];
+    })
+    : Promise.resolve([]);
   [
     S.requirements, S.requirementSuggestions, S.requirementDocs, S.cases, S.bugs,
-    S.apiDocs, S.applications, S.analyses,
+    S.apiDocs, S.applications,
   ] = await Promise.all([
-    api(pp("requirements")),
+    loadIfAllowed("requirements.view", "requirements"),
     suggestionsRequest,
-    api(pp("requirements/documents")),
-    api(pp("test-cases")),
-    api(pp("bugs")),
-    api(pp("api-docs")),
-    api(pp("applications")),
-    api(pp("analyses")),
+    loadIfAllowed("requirements.view", "requirements/documents"),
+    loadIfAllowed("test-cases.view", "test-cases"),
+    loadIfAllowed("bugs.view", "bugs"),
+    loadIfAllowed("api-docs.view", "api-docs"),
+    loadIfAllowed("applications.view", "applications"),
   ]);
-  if (!S.reaRuntime) S.reaRuntime = await api("/api/rea/runtime");
   // Update sidebar counts
   const rc = $("#reqCount"); if (rc) rc.textContent = S.requirements.length;
   const cc = $("#caseCount"); if (cc) cc.textContent = S.cases.length;
   const dc = $("#defectCount"); if (dc) dc.textContent = S.bugs.length;
   await render();
-  pollAnalyses();
 }
 
 /* ── Sidebar state sync ───────────────────────────────────────────── */
@@ -151,6 +691,9 @@ function syncNav() {
   // Top nav
   $$("#topNav .nav-item").forEach(btn => {
     const v = btn.dataset.view;
+    btn.hidden = v === "dashboard"
+      ? !hasPermission("reports.view")
+      : !hasPermission("projects.view");
     const active = v === "projects" ? (S.view === "projects" || projectArea)
       : v === "dashboard" ? S.view === "dashboard"
       : false;
@@ -166,8 +709,18 @@ function syncNav() {
     const lbl = $("#projectLabel");
     if (lbl) lbl.textContent = S.project.project_key || "PROJECT";
   }
-  $$("#projectNav .nav-item").forEach(btn =>
-    btn.classList.toggle("active", btn.dataset.view === S.view));
+  const projectPermissions = {
+    overview: "projects.view", brd: "requirements.view",
+    requirements: "requirements.view", cases: "test-cases.view",
+    defects: "bugs.view", reports: "reports.view",
+    "project-settings": "projects.edit", "api-docs": "api-docs.view",
+    applications: "applications.view", "application-analysis": "app-analysis.view",
+    files: "projects.view",
+  };
+  $$("#projectNav .nav-item").forEach(btn => {
+    btn.hidden = !hasPermission(projectPermissions[btn.dataset.view] || "projects.view");
+    btn.classList.toggle("active", btn.dataset.view === S.view);
+  });
 
   // Breadcrumb
   const crumbs = {
@@ -199,12 +752,310 @@ function renderBack() {
 }
 
 /* ════════════════════════════════════════════════════════════════════
+   AUTHENTICATION
+════════════════════════════════════════════════════════════════════ */
+function authView() {
+  const isSignup = S.authMode === "signup";
+  return `
+    <section class="auth-shell" aria-labelledby="authHeading">
+      <div class="auth-backdrop" aria-hidden="true">
+        <svg class="auth-circuit" viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
+          <path d="M0 180h210l42 42h160m-180 0h90v120h120l38 38h112M0 640h170l48-48h115v-86l54-54h112M1440 165h-170l-48 48h-144v106l-54 54h-142m558 280h-186l-45-45h-112v-94l-38-38h-128" />
+          <path d="M0 330h120l35 35h110m-265 360h240l44-44h98M1440 350h-110l-42 42h-142m294 350h-228l-42-42h-100" />
+          <circle cx="462" cy="342" r="4" /><circle cx="399" cy="506" r="4" />
+          <circle cx="978" cy="373" r="4" /><circle cx="1018" cy="650" r="4" />
+          <circle cx="252" cy="222" r="3" /><circle cx="1180" cy="213" r="3" />
+        </svg>
+        <span class="auth-orbit auth-orbit-one"></span>
+        <span class="auth-orbit auth-orbit-two"></span>
+        <div class="auth-tech-panel auth-tech-panel-left"><span>TRACE / QA</span><i></i><b>BUILD</b><em>LOCAL · VERIFIED</em></div>
+        <div class="auth-tech-panel auth-tech-panel-right"><span>RUN STATUS</span><i></i><b>PASS</b><em>EXECUTION READY</em></div>
+        <span class="auth-tech-label auth-label-top">AUTOMATION&nbsp; / &nbsp;TEST</span>
+        <span class="auth-tech-label auth-label-bottom">DEFECT&nbsp; → &nbsp;PASS</span>
+      </div>
+      <div class="auth-card">
+        <header class="auth-header">
+          <picture class="brand-picture">
+            <source srcset="/assets/Logo-light.svg" type="image/svg+xml" data-brand-theme="light">
+            <source srcset="/assets/Logo-light.png" type="image/png" data-brand-theme="light">
+            <source srcset="/assets/Logo.svg" type="image/svg+xml">
+            <img class="auth-brand-logo" src="/assets/Logo.png" alt="TRACE">
+          </picture>
+        </header>
+        <h1 id="authHeading">${isSignup ? "Create your account" : "Welcome back"}</h1>
+        <p class="auth-description">${isSignup
+          ? "Set up your account to get started with your QA workspace."
+          : "Sign in to continue to your QA workspace."}</p>
+        <div class="auth-tabs" role="tablist" aria-label="Authentication">
+          <button type="button" role="tab" id="authLoginTab" aria-selected="${!isSignup}" aria-controls="authPanel" class="${isSignup ? "" : "active"}" data-auth-mode="login">Sign in</button>
+          <button type="button" role="tab" id="authSignupTab" aria-selected="${isSignup}" aria-controls="authPanel" class="${isSignup ? "active" : ""}" data-auth-mode="signup">Create account</button>
+        </div>
+        ${isSignup ? `
+          <div id="authPanel" role="tabpanel" aria-labelledby="authSignupTab">
+            <form id="signupForm" class="auth-form" novalidate>
+              <label for="signupFullName">Full name
+                <input id="signupFullName" name="full_name" autocomplete="name" maxlength="161" required aria-invalid="false" aria-describedby="signupFullNameError">
+                <span class="auth-field-error" id="signupFullNameError" hidden></span>
+              </label>
+              <label for="signupEmail">Email
+                <input id="signupEmail" name="email" type="email" autocomplete="email" maxlength="254" required aria-invalid="false" aria-describedby="signupEmailError">
+                <span class="auth-field-error" id="signupEmailError" hidden></span>
+              </label>
+              <label for="signupPassword">Password
+                <span class="password-control"><input id="signupPassword" name="password" type="password" autocomplete="new-password" minlength="12" required aria-invalid="false" aria-describedby="signupPasswordError passwordGuidance"><button type="button" class="password-toggle" data-toggle-password aria-label="Show password">Show</button></span>
+                <span class="auth-field-error" id="signupPasswordError" hidden></span>
+              </label>
+              <label for="signupConfirmPassword">Confirm password
+                <span class="password-control"><input id="signupConfirmPassword" name="confirm_password" type="password" autocomplete="new-password" minlength="12" required aria-invalid="false" aria-describedby="signupConfirmPasswordError"><button type="button" class="password-toggle" data-toggle-password aria-label="Show confirm password">Show</button></span>
+                <span class="auth-field-error" id="signupConfirmPasswordError" hidden></span>
+              </label>
+              <div class="password-guidance" id="passwordGuidance">
+                <span class="password-guidance-title">Password requirements</span>
+                <ul class="password-rules">
+                  <li data-password-rule="length"><span aria-hidden="true">○</span> At least 12 characters</li>
+                  <li data-password-rule="uppercase"><span aria-hidden="true">○</span> One uppercase letter</li>
+                  <li data-password-rule="lowercase"><span aria-hidden="true">○</span> One lowercase letter</li>
+                  <li data-password-rule="number"><span aria-hidden="true">○</span> One number</li>
+                </ul>
+              </div>
+              <p class="auth-hint">New accounts receive the User role. A Global Admin can assign additional permissions.</p>
+              <div class="form-error" id="authError" role="alert" aria-live="assertive"></div>
+              <button class="btn btn-primary auth-submit" type="submit">Create account</button>
+            </form>
+            <p class="auth-switch">Already have an account? <button type="button" data-auth-mode="login">Sign in</button></p>
+          </div>` : `
+          <div id="authPanel" role="tabpanel" aria-labelledby="authLoginTab">
+            <form id="loginForm" class="auth-form" novalidate>
+              ${S.legacyAdminLogin ? "" : `<label for="loginEmail">Email
+                <input id="loginEmail" name="email" type="email" autocomplete="username" maxlength="254" required aria-invalid="false" aria-describedby="loginEmailError">
+                <span class="auth-field-error" id="loginEmailError" hidden></span>
+              </label>`}
+              <label for="loginPassword">Password
+                <span class="password-control"><input id="loginPassword" name="password" type="password" autocomplete="current-password" required aria-invalid="false" aria-describedby="loginPasswordError"><button type="button" class="password-toggle" data-toggle-password aria-label="Show password">Show</button></span>
+                <span class="auth-field-error" id="loginPasswordError" hidden></span>
+              </label>
+              <div class="form-error" id="authError" role="alert" aria-live="assertive"></div>
+              <button class="btn btn-primary auth-submit" type="submit">Sign in</button>
+              <button class="auth-link" type="button" id="toggleAdminLogin">${S.legacyAdminLogin
+                ? "Sign in with an email account"
+                : "Use the configured Admin password"}</button>
+              <p class="auth-hint">Forgot your password? Ask your workspace Administrator to reset it locally.</p>
+            </form>
+            <p class="auth-switch">New to TRACE? <button type="button" data-auth-mode="signup">Create an account</button></p>
+          </div>`}
+      </div>
+    </section>`;
+}
+
+function bindAuthActions() {
+  bindPasswordToggles();
+  $$("[data-auth-mode]").forEach(button => button.addEventListener("click", () => {
+    S.authMode = button.dataset.authMode;
+    S.legacyAdminLogin = false;
+    window.history.replaceState({}, "", S.authMode === "signup" ? "/signup" : "/login");
+    render();
+  }));
+  $("#toggleAdminLogin")?.addEventListener("click", () => {
+    S.legacyAdminLogin = !S.legacyAdminLogin;
+    render();
+  });
+  const signupForm = $("#signupForm");
+  signupForm?.querySelectorAll("input").forEach(input => input.addEventListener("input", () => {
+    $("#authError").textContent = "";
+    updatePasswordRules();
+    if (input.getAttribute("aria-invalid") === "true") {
+      showAuthFieldError(signupForm, input.name, authFieldError(signupForm, input.name));
+    }
+    if (input.name === "password" || input.name === "confirm_password") {
+      const confirm = signupForm.elements.confirm_password;
+      if (confirm.value && confirm.getAttribute("aria-invalid") === "true") {
+        showAuthFieldError(signupForm, "confirm_password", authFieldError(signupForm, "confirm_password"));
+      }
+    }
+  }));
+  signupForm?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const invalid = validateAuthForm(form, true);
+    if (invalid) {
+      invalid.focus();
+      return;
+    }
+    const values = new FormData(form);
+    const nameParts = String(values.get("full_name")).trim().split(/\s+/);
+    const firstName = nameParts.shift();
+    const payload = {
+      first_name: firstName,
+      last_name: nameParts.join(" ") || firstName,
+      email: String(values.get("email")).trim(),
+      password: values.get("password"),
+      confirm_password: values.get("confirm_password"),
+    };
+    const submit = setAuthLoading(form, "Creating account…");
+    $("#authError").textContent = "";
+    try {
+      await api("/api/auth/signup", { method: "POST", body: JSON.stringify(payload) });
+      window.history.replaceState({}, "", "/workspace");
+      await loadProjects();
+      toast("Account created");
+    } catch (reason) {
+      if (reason.status === 409) {
+        showAuthFieldError(form, "email", reason.message);
+        form.elements.email.focus();
+      } else {
+        $("#authError").textContent = reason.message;
+      }
+    } finally { resetAuthLoading(submit, "Create account"); }
+  });
+  const loginForm = $("#loginForm");
+  loginForm?.querySelectorAll("input").forEach(input => input.addEventListener("input", () => {
+    $("#authError").textContent = "";
+    if (input.getAttribute("aria-invalid") === "true") {
+      showAuthFieldError(loginForm, input.name, authFieldError(loginForm, input.name));
+    }
+  }));
+  loginForm?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const invalid = validateAuthForm(form, false);
+    if (invalid) {
+      invalid.focus();
+      return;
+    }
+    const payload = Object.fromEntries(new FormData(form).entries());
+    if (payload.email) payload.email = String(payload.email).trim();
+    const submit = setAuthLoading(form, "Signing in…");
+    $("#authError").textContent = "";
+    try {
+      await api("/api/auth/login", { method: "POST", body: JSON.stringify(payload) });
+      window.history.replaceState({}, "", "/workspace");
+      await loadProjects();
+      toast("Signed in");
+    } catch (reason) {
+      $("#authError").textContent = reason.message;
+    } finally { resetAuthLoading(submit, "Sign in"); }
+  });
+}
+
+function authFieldError(form, name) {
+  const input = form.elements[name];
+  if (!input) return "";
+  const value = input.value.trim();
+  if (name === "full_name") {
+    if (!value) return "Enter your full name.";
+    const [first, ...rest] = value.split(/\s+/);
+    return first.length > 80 || rest.join(" ").length > 80
+      ? "Keep each name at 80 characters or fewer."
+      : "";
+  }
+  if (name === "email") {
+    if (!value) return "Enter your email address.";
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ? "" : "Enter a valid email address.";
+  }
+  if (name === "password") {
+    if (!value) return "Enter your password.";
+    if (form.id === "signupForm") {
+      if (value.length < 12) return "Use at least 12 characters.";
+      if (!/[A-Z]/.test(value) || !/[a-z]/.test(value) || !/\d/.test(value)) {
+        return "Include uppercase and lowercase letters and a number.";
+      }
+    }
+    return "";
+  }
+  if (name === "confirm_password") {
+    if (!value) return "Confirm your password.";
+    return value === form.elements.password.value ? "" : "Passwords do not match.";
+  }
+  return "";
+}
+
+function showAuthFieldError(form, name, message) {
+  const input = form.elements[name];
+  if (!input) return;
+  const error = $(`#${input.id}Error`);
+  input.setAttribute("aria-invalid", message ? "true" : "false");
+  if (error) {
+    error.textContent = message;
+    error.hidden = !message;
+  }
+}
+
+function validateAuthForm(form, isSignup) {
+  const fields = isSignup
+    ? ["full_name", "email", "password", "confirm_password"]
+    : [...(form.elements.email ? ["email"] : []), "password"];
+  let firstInvalid = null;
+  fields.forEach(name => {
+    const input = form.elements[name];
+    const message = authFieldError(form, name);
+    showAuthFieldError(form, name, message);
+    if (message && !firstInvalid) firstInvalid = input;
+  });
+  return firstInvalid;
+}
+
+function updatePasswordRules() {
+  const password = $("#signupPassword")?.value || "";
+  const rules = {
+    length: password.length >= 12,
+    uppercase: /[A-Z]/.test(password),
+    lowercase: /[a-z]/.test(password),
+    number: /\d/.test(password),
+  };
+  Object.entries(rules).forEach(([name, met]) => {
+    const item = $(`[data-password-rule="${name}"]`);
+    if (!item) return;
+    item.classList.toggle("is-met", met);
+    item.querySelector("span").textContent = met ? "✓" : "○";
+  });
+}
+
+function setAuthLoading(form, text) {
+  const button = form.querySelector('[type="submit"]');
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.textContent = text;
+  return button;
+}
+
+function resetAuthLoading(button, text) {
+  button.disabled = false;
+  button.removeAttribute("aria-busy");
+  button.textContent = text;
+}
+
+function bindPasswordToggles() {
+  $$("[data-toggle-password]").forEach(button => button.addEventListener("click", () => {
+    const input = button.parentElement.querySelector("input");
+    const show = input.type === "password";
+    input.type = show ? "text" : "password";
+    button.textContent = show ? "Hide" : "Show";
+    button.setAttribute("aria-label", `${show ? "Hide" : "Show"} password`);
+  }));
+}
+
+/* ════════════════════════════════════════════════════════════════════
    MAIN RENDER
 ════════════════════════════════════════════════════════════════════ */
 async function render() {
+  if (isPublicPath()) {
+    renderPublicPage();
+    return;
+  }
+  $("#publicRoot").hidden = true;
+  document.body.classList.remove("public-site");
   syncNav();
+  syncProfileMenu();
   const pg = $("#page");
   if (!pg) return;
+  if (!S.auth.authenticated) {
+    document.body.classList.add("auth-required");
+    pg.innerHTML = authView();
+    applyBrandTheme(S.themePreference);
+    bindAuthActions();
+    return;
+  }
+  document.body.classList.remove("auth-required");
 
   /* ── Global Dashboard ── */
   if (S.view === "dashboard") {
@@ -235,17 +1086,20 @@ async function render() {
 
   const extraActions =
     S.view === "requirements"
-      ? `<button class="btn btn-ghost" id="importBtn">↑ Upload BRD</button>
-         <button class="btn btn-ghost" id="addBtn">＋ Add requirement</button>`
+      ? `${hasPermission("requirements.create") ? `<button class="btn btn-ghost" id="importBtn">↑ Upload BRD</button>
+         <button class="btn btn-ghost" id="addBtn">＋ Add requirement</button>` : ""}
+         ${hasPermission("reports.view") ? `<button class="btn btn-ghost module-export" data-module="requirements">↓ Download Report</button>` : ""}`
       : S.view === "cases"
-      ? `<button class="btn btn-primary" id="genCasesBtn" ${genReady && genOk ? "" : "disabled"}>✦ Generate test cases</button>
-         <button class="btn btn-ghost" id="addBtn">＋ Add test case</button>`
+      ? `${hasPermission("test-cases.create") ? `<button class="btn btn-primary" id="genCasesBtn" ${genReady && genOk ? "" : "disabled"}>✦ Generate test cases</button>
+         <button class="btn btn-ghost" id="addBtn">＋ Add test case</button>` : ""}
+         ${hasPermission("reports.view") ? `<button class="btn btn-ghost module-export" data-module="test-cases">↓ Download Report</button>` : ""}`
       : S.view === "defects"
-      ? `<button class="btn btn-primary" id="addBtn">＋ Log defect</button>`
+      ? `${hasPermission("bugs.create") ? `<button class="btn btn-primary" id="addBtn">＋ Log defect</button>` : ""}
+         ${hasPermission("reports.view") ? `<button class="btn btn-ghost module-export" data-module="bugs">↓ Download Report</button>` : ""}`
       : S.view === "api-docs"
-      ? `<button class="btn btn-primary" id="apiImportBtn">↑ Import OpenAPI JSON</button>`
+      ? `${hasPermission("api-docs.create") ? `<button class="btn btn-primary" id="apiImportBtn">↑ Import OpenAPI JSON</button>` : ""}`
       : S.view === "applications"
-      ? `<button class="btn btn-primary" id="appUploadBtn">↑ Upload application ZIP</button>`
+      ? `${hasPermission("applications.create") ? `<button class="btn btn-primary" id="appUploadBtn">↑ Upload application ZIP</button>` : ""}`
       : "";
 
   const heading = `
@@ -263,8 +1117,8 @@ async function render() {
       </div>
       <div class="page-head-actions">
         ${extraActions}
-        <button class="btn btn-ghost" id="exportBtn">↓ Export report</button>
-        <button class="btn btn-danger" id="delProjectBtn">Delete project</button>
+        ${S.view === "reports" && hasPermission("reports.view") ? `<button class="btn btn-ghost" id="exportBtn">↓ Export full project report</button>` : ""}
+        ${hasPermission("projects.delete") ? `<button class="btn btn-danger" id="delProjectBtn">Delete project</button>` : ""}
       </div>
     </div>`;
 
@@ -314,7 +1168,7 @@ function globalDashboardView() {
         <p>All projects at a glance.</p>
       </div>
       <div class="page-head-actions">
-        <button class="btn btn-primary" id="dashCreateBtn">＋ Create project</button>
+        ${hasPermission("projects.create") ? `<button class="btn btn-primary" id="dashCreateBtn">＋ Create project</button>` : ""}
       </div>
     </div>
     <div class="metric-grid">
@@ -344,9 +1198,9 @@ function projectsView() {
       <td>${fmtDate(p.created_at)}</td>
       <td>${fmtDate(p.updated_at)}</td>
       <td><div class="row-actions">
-        <button class="act-btn" onclick="openProject(${p.id},'overview')">Open</button>
-        <button class="act-btn" onclick="openModal('project','${p.id}')">Edit</button>
-        <button class="act-btn act-btn-danger" onclick="deleteProject(${p.id})">Delete</button>
+        ${hasPermission("projects.view") ? `<button class="act-btn" onclick="openProject(${p.id},'overview')">Open</button>` : ""}
+        ${hasPermission("projects.edit") ? `<button class="act-btn" onclick="openModal('project','${p.id}')">Edit</button>` : ""}
+        ${hasPermission("projects.delete") ? `<button class="act-btn act-btn-danger" onclick="deleteProject(${p.id})">Delete</button>` : ""}
       </div></td>
     </tr>`).join("");
   return `
@@ -356,9 +1210,7 @@ function projectsView() {
         <h1>Projects</h1>
         <p>Create and manage your QA projects.</p>
       </div>
-      <div class="page-head-actions">
-        <button class="btn btn-primary" id="createProjectBtn">＋ Create project</button>
-      </div>
+      <div class="page-head-actions">${hasPermission("projects.create") ? `<button class="btn btn-primary" id="createProjectBtn">＋ Create project</button>` : ""}</div>
     </div>
     <div class="proj-tools">
       <input class="search-input" id="projSearch" placeholder="⌕  Search projects…">
@@ -500,7 +1352,7 @@ function requirementSuggestionsView() {
         <p><strong>Related requirement:</strong> ${related ? `${esc(related.requirement_key)} · ${esc(related.title)}` : esc(suggestion.related_requirement_key || "None identified")}
           · <strong>Source reference:</strong> ${esc(suggestion.source_reference || "No exact source reference identified")}</p>
         ${suggestion.source_evidence ? `<blockquote class="source-evidence">${esc(suggestion.source_evidence)}</blockquote>` : ""}
-        ${suggestion.status === "Pending" ? `
+        ${suggestion.status === "Pending" && hasPermission("requirements.edit") ? `
           <div class="row-actions suggestion-actions">
             <button class="act-btn suggestion-accept" data-id="${suggestion.id}">Accept</button>
             <button class="act-btn suggestion-edit-toggle" data-id="${suggestion.id}">Edit</button>
@@ -557,7 +1409,7 @@ function brdView() {
         Supported formats: PDF, DOCX, CSV, TXT, and Markdown. Rule-based extraction alone creates confirmed requirements with source evidence.
         AI can provide a separate use-case analysis and suggestions; every suggestion requires an explicit reviewer decision before it can be used for test generation.
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
+      ${hasPermission("requirements.create") ? `<div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary" id="uploadBrdBtn">↑ Upload BRD file</button>
         <button class="btn btn-ghost" id="configAiBtn">Configure AI model</button>
       </div>
@@ -565,7 +1417,7 @@ function brdView() {
         <summary>Or paste raw requirement text</summary>
         <textarea id="pasteText" maxlength="1000000" placeholder="Paste BRD content here…"></textarea>
         <button class="btn btn-primary" id="pasteBtn">Analyze with AI</button>
-      </details>
+      </details>` : ""}
     </div>
     ${brdAnalysisView()}
     ${requirementSuggestionsView()}
@@ -601,8 +1453,8 @@ function requirementsView() {
         ${r.source_evidence ? `<span class="cell-sub">${esc(r.source_evidence.slice(0, 220))}</span>` : ""}
       </td>
       <td><div class="row-actions">
-        <button class="act-btn edit-req" data-id="${r.id}">Edit</button>
-        <button class="act-btn act-btn-danger del-req" data-id="${r.id}">Delete</button>
+        ${hasPermission("requirements.edit") ? `<button class="act-btn edit-req" data-id="${r.id}">Edit</button>` : ""}
+        ${hasPermission("requirements.delete") ? `<button class="act-btn act-btn-danger del-req" data-id="${r.id}">Delete</button>` : ""}
       </div></td>
     </tr>`).join("");
   return `
@@ -664,17 +1516,17 @@ function casesView() {
       <td class="case-long">${pretty(c.expected_result || "—")}</td>
       <td class="case-long">${c.assumptions ? `<strong>Assumptions</strong><br>${pretty(c.assumptions)}<br>` : ""}${c.source_reference ? `<strong>Source</strong><br>${pretty(c.source_reference)}` : "—"}</td>
       <td>
-        <select class="exec-select" data-id="${c.id}" aria-label="Status for ${esc(c.case_key)}">
+        <select class="exec-select" data-id="${c.id}" aria-label="Status for ${esc(c.case_key)}" ${hasPermission("test-cases.edit") ? "" : "disabled"}>
           ${["Not Executed","In Progress","Pass","Fail","Blocked","Skipped"].map(s =>
             `<option ${s === c.status ? "selected" : ""}>${s}</option>`).join("")}
         </select>
       </td>
       <td class="case-long">${pretty(c.actual_result || "—")}</td>
       <td><div class="row-actions">
-        <button class="act-btn edit-case" data-id="${c.id}">Edit</button>
+        ${hasPermission("test-cases.edit") ? `<button class="act-btn edit-case" data-id="${c.id}">Edit</button>` : ""}
         ${c.execution_id ? `<button class="act-btn ev-case" data-case="${c.id}">History</button>` : ""}
-        ${c.status === "Fail" ? `<button class="act-btn bug-from-case" data-case="${c.id}">＋ Defect</button>` : ""}
-        <button class="act-btn act-btn-danger del-case" data-id="${c.id}">Delete</button>
+        ${c.status === "Fail" && hasPermission("bugs.create") ? `<button class="act-btn bug-from-case" data-case="${c.id}">＋ Defect</button>` : ""}
+        ${hasPermission("test-cases.delete") ? `<button class="act-btn act-btn-danger del-case" data-id="${c.id}">Delete</button>` : ""}
       </div></td>
     </tr>`).join("");
   return `
@@ -725,7 +1577,7 @@ function casesView() {
       ${!assistedGenOk
         ? `<div class="info-box warn-box" style="margin-top:8px">Configure a model-based provider (Ollama, Google Gemini, or OpenAI-compatible) in <button class="act-btn" id="goAiSettings">Settings → AI Module</button> to use AI-assisted generation.</div>`
         : ""}
-      <button class="btn btn-primary" id="assistedGenerateBtn" style="margin-top:12px" ${assistedGenOk ? "" : "disabled"}>✦ Analyze and generate</button>
+      ${hasPermission("test-cases.create") ? `<button class="btn btn-primary" id="assistedGenerateBtn" style="margin-top:12px" ${assistedGenOk ? "" : "disabled"}>✦ Analyze and generate</button>` : ""}
       ${assistedAnalysis}
     </div>
     <div class="filter-row">
@@ -748,7 +1600,11 @@ function defectsView() {
       <td><span class="badge ${b.severity === "Critical" || b.severity === "High" ? "badge-red" : "badge-amber"}">${esc(b.severity)} · ${esc(b.priority)}</span></td>
       <td>${esc(b.assigned_to || "—")}</td>
       <td><span class="badge ${b.status === "Open" ? "badge-red" : b.status === "Resolved" || b.status === "Closed" ? "badge-green" : "badge-amber"}">${esc(b.status)}</span></td>
-      <td><button class="act-btn edit-bug" data-id="${b.id}">Update</button></td>
+      <td>
+        <button class="act-btn view-bug" data-id="${b.id}">View</button>
+        ${hasPermission("bugs.edit") ? `<button class="act-btn edit-bug" data-id="${b.id}">Update</button>` : ""}
+        ${hasPermission("bugs.delete") ? `<button class="act-btn act-btn-danger delete-bug" data-id="${b.id}">Delete</button>` : ""}
+      </td>
     </tr>`).join("");
   return `
     <div class="filter-row">
@@ -878,7 +1734,7 @@ function applicationsView() {
         </div>
         <div class="info-box" style="margin:12px 0">
           <strong>Validate requirements against source</strong> — the configured AI provider will review source excerpts for coverage evidence.
-          <button class="btn btn-ghost btn-sm validate-cov" data-app="${app.id}" style="margin-top:8px">Validate requirement coverage</button>
+          ${hasPermission("applications.create") ? `<button class="btn btn-ghost btn-sm validate-cov" data-app="${app.id}" style="margin-top:8px">Validate requirement coverage</button>` : ""}
         </div>
         <div class="table-wrap">
           <table class="data-table">
@@ -896,54 +1752,21 @@ function applicationsView() {
         <span class="badge badge-amber">CODE NOT EXECUTED</span>
       </div>
       <div class="info-box">Upload a developer build ZIP to inspect its structure, detect frameworks, routes, and components.</div>
-      <div style="margin-top:12px"><button class="btn btn-primary" id="appUploadInlineBtn">↑ Choose application ZIP</button></div>
+      ${hasPermission("applications.create") ? `<div style="margin-top:12px"><button class="btn btn-primary" id="appUploadInlineBtn">↑ Choose application ZIP</button></div>` : ""}
     </div>
     <div class="app-history">${cards || '<div class="panel" style="text-align:center;padding:30px;color:var(--muted)"><strong style="color:var(--text2)">No application uploaded</strong></div>'}</div>`;
 }
 
 /* ── App Analysis ─────────────────────────────────────────────────── */
 function appAnalysisView() {
-  const rt = S.reaRuntime || {};
-  const hist = S.analyses.map(item => {
-    const badge = item.status === "completed" ? "badge-green" : item.status === "failed" ? "badge-red" : "badge-muted";
-    return `
-      <article class="analysis-card">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
-          <span class="badge ${badge}">${esc(item.status)}</span>
-          <span class="mono" style="color:var(--muted)">#${item.id} · ${fmtDate(item.created_at)}</span>
-        </div>
-        <div class="analysis-path">${esc(item.input_path)}</div>
-        ${item.error ? `<div class="error-box">${esc(item.error)}</div>` : ""}
-        ${item.summary ? analysisResultMarkup(item.summary) : ""}
-      </article>`;
-  }).join("");
   return `
     <div class="panel">
       <div class="panel-head">
-        <div><div class="panel-title">Analyze a local JavaScript application</div><div class="panel-sub">REA statically inspects a directory or .asar. Does not run code.</div></div>
-        <span class="badge ${rt.analysis_enabled ? "badge-green" : "badge-muted"}">${rt.analysis_enabled ? "REA READY" : "REA UNAVAILABLE"}</span>
+        <div><div class="panel-title">App Analysis</div><div class="panel-sub">Application analysis is planned for a future release.</div></div>
+        <span class="badge badge-muted">COMING SOON</span>
       </div>
-      <div id="reaStatus" class="info-box">${rt.analysis_enabled ? "Ready · REA static analysis via CLI" : esc(rt.reason || "Checking REA runtime…")}</div>
-      <div class="analysis-form">
-        <label for="appPath">Absolute path on this server</label>
-        <input id="appPath" type="text" placeholder="C:\\path\\to\\app or /path/to/app" autocomplete="off" spellcheck="false">
-        <div class="analysis-actions">
-          <button class="btn btn-primary" id="startAnalysis" ${rt.analysis_enabled ? "" : "disabled"}>Start analysis</button>
-          <button class="btn btn-ghost" id="checkRea">Check availability</button>
-        </div>
-      </div>
-    </div>
-    <div class="panel">
-      <div class="panel-head"><div class="panel-title">Analysis history</div></div>
-      <div class="analysis-history">${hist || '<div style="text-align:center;padding:24px;color:var(--muted)">No analyses yet.</div>'}</div>
+      <div class="info-box">This module is temporarily unavailable while we prepare its next version. Your projects and other QA Platform features remain available.</div>
     </div>`;
-}
-function analysisResultMarkup(summary) {
-  if (!summary) return "";
-  const stats = summary.statistics || {};
-  const metrics = [["Modules","modules"],["Files","relevant_files"],["Parsed JS","parsed_javascript_files"],["Findings","findings"]].map(([l,k]) =>
-    Number.isInteger(stats[k]) ? `<div class="a-stat"><span>${l}</span><strong>${stats[k].toLocaleString()}</strong></div>` : "").join("");
-  return `<div class="analysis-result">${metrics ? `<div class="a-stats">${metrics}</div>` : ""}</div>`;
 }
 
 /* ── Project files ────────────────────────────────────────────────── */
@@ -968,17 +1791,167 @@ function filesView(result) {
 }
 
 /* ── Settings ─────────────────────────────────────────────────────── */
+function hasPermission(permission) {
+  const permissions = S.auth.permissions || [];
+  return permissions.includes("*") || permissions.includes(permission);
+}
+
+async function loadSettingsTab(tab) {
+  try {
+    if (tab === "profile") S.profile = await api("/api/profile");
+    if (tab === "team") {
+      S.teams = await api("/api/teams");
+      S.users = hasPermission("users.view") ? await api("/api/users") : [];
+    }
+    if (tab === "users") {
+      const [users, roleResult, teams] = await Promise.all([
+        api("/api/users"), api("/api/roles"), api("/api/teams"),
+      ]);
+      S.users = users;
+      S.roles = roleResult.roles;
+      S.teams = teams;
+    }
+    if (tab === "roles") {
+      const result = await api("/api/roles");
+      S.roles = result.roles;
+      S.permissionModules = result.permission_modules;
+    }
+    if (tab === "audit") S.auditEvents = await api("/api/audit-events");
+    render();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function profileSettingsView() {
+  const profile = S.profile;
+  if (!profile) return `<h2>User Profile</h2><div class="pane-sub">Loading profile…</div>`;
+  const image = profile.profile_image_data
+    ? `data:${profile.profile_image_type};base64,${profile.profile_image_data}`
+    : "";
+  return `
+    <h2>${profile.global_admin ? "Global Admin Profile" : "User Profile"}</h2>
+    <div class="pane-sub">${profile.global_admin
+      ? "Manage the profile for the configured workspace Administrator."
+      : "Manage your account details and password."}</div>
+    ${profile.global_admin
+      ? '<div class="info-box">The Admin sign-in password is managed with QA_ADMIN_PASSWORD in the local environment configuration.</div>'
+      : ""}
+    <form id="profileForm" class="management-form">
+      <div class="profile-avatar">${image ? `<img src="${image}" alt="Profile image">` : esc(`${profile.first_name[0] || ""}${profile.last_name[0] || ""}`)}</div>
+      <label class="field">Profile image<input id="profileImage" type="file" accept="image/png,image/jpeg,image/gif,image/webp"></label>
+      <button class="btn btn-ghost" type="button" id="removeProfileImage" ${image ? "" : "disabled"}>Remove image</button>
+      ${field("first_name","First name",profile.first_name,"text",false,"",true)}
+      ${field("last_name","Last name",profile.last_name,"text",false,"",true)}
+      ${field("email","Email",profile.email,"email",false,"",true)}
+      ${field("phone","Phone",profile.phone || "","tel")}
+      <div class="full"><button class="btn btn-primary" type="submit">Save profile</button></div>
+    </form>
+    ${profile.global_admin ? "" : `
+      <h3 class="management-subhead">Change password</h3>
+      <form id="passwordForm" class="management-form">
+        ${field("current_password","Current password","","password",false,"",true)}
+        ${field("new_password","New password","","password",false,"12+ characters, upper/lowercase and number",true)}
+        ${field("confirm_password","Confirm new password","","password",false,"",true)}
+        <div class="full"><button class="btn btn-primary" type="submit">Update password</button></div>
+      </form>`}`;
+}
+
+function usersSettingsView() {
+  const rows = S.users.map(user => `
+    <tr data-user-row data-status="${esc(user.status)}">
+      <td><strong class="cell-main">${esc(`${user.first_name} ${user.last_name}`)}</strong></td>
+      <td>${esc(user.email)}</td><td>${esc(user.role_name)}</td><td>${esc(user.team_names || "—")}</td>
+      <td><span class="badge">${esc(user.status)}</span></td><td>${fmtDate(user.created_at)}</td><td>${fmtDate(user.last_login_at)}</td>
+      <td>${hasPermission("users.update") ? `<button class="act-btn edit-user" data-id="${user.id}">Edit</button>` : ""}
+      ${user.status === "Active" && hasPermission("users.deactivate")
+        ? `<button class="act-btn deactivate-user" data-id="${user.id}">Deactivate</button>`
+        : user.status !== "Active" && hasPermission("users.activate")
+          ? `<button class="act-btn activate-user" data-id="${user.id}">Activate</button>` : ""}
+      ${hasPermission("users.delete") ? `<button class="act-btn delete-user" data-id="${user.id}">Delete</button>` : ""}</td>
+    </tr>`).join("");
+  return `
+    <div class="custom-field-manager-head"><div><h2>User Management</h2>
+      <div class="pane-sub">Manage accounts, status, teams, and role assignments.</div></div>
+      ${hasPermission("users.create") ? `<button class="btn btn-primary" id="createUser">＋ Add user</button>` : ""}
+    </div>
+    <div class="management-filters"><input id="userSearch" type="search" placeholder="Search name or email">
+      <select id="userStatusFilter"><option value="">All statuses</option>${["Active","Inactive","Invited","Suspended"].map(status => `<option>${status}</option>`).join("")}</select></div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Team</th><th>Status</th><th>Created</th><th>Last login</th><th>Actions</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="empty-row"><strong>No users</strong></td></tr>'}</tbody></table></div>`;
+}
+
+function teamsSettingsView() {
+  const rows = S.teams.map(team => `
+    <tr><td><strong class="cell-main">${esc(team.name)}</strong><div class="pane-sub">${esc(team.description || "")}</div></td>
+      <td>${esc(team.owner_name || "—")}</td><td>${team.member_count}</td><td>${fmtDate(team.created_at)}</td>
+      <td><span class="badge">${esc(team.status)}</span></td><td>
+        <button class="act-btn manage-team" data-id="${team.id}">Members</button>
+        ${hasPermission("teams.edit") ? `<button class="act-btn edit-team" data-id="${team.id}">Edit</button>` : ""}
+        ${hasPermission("teams.delete") && team.status === "Active" ? `<button class="act-btn archive-team" data-id="${team.id}">Archive</button>` : ""}
+      </td></tr>`).join("");
+  return `
+    <div class="custom-field-manager-head"><div><h2>Team & Members</h2>
+      <div class="pane-sub">Organize workspace users into teams. Team deletion archives the team and preserves memberships.</div></div>
+      ${hasPermission("teams.create") ? `<button class="btn btn-primary" id="createTeam">＋ Create team</button>` : ""}
+    </div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Team</th><th>Owner</th><th>Members</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" class="empty-row"><strong>No teams</strong></td></tr>'}</tbody></table></div>
+    <div id="teamMembersPanel"></div>`;
+}
+
+function rolePermissionMatrix(selected = []) {
+  return Object.entries(S.permissionModules).map(([module, actions]) => `
+    <div class="permission-row"><strong>${esc(module)}</strong>
+      ${actions.map(action => {
+        const key = `${module}.${action}`;
+        return `<label><input type="checkbox" name="permissions" value="${key}" ${selected.includes(key) ? "checked" : ""}>${esc(action)}</label>`;
+      }).join("")}
+    </div>`).join("");
+}
+
+function rolesSettingsView() {
+  const rows = S.roles.map(role => `
+    <tr><td><strong class="cell-main">${esc(role.name)}</strong></td><td>${esc(role.description || "")}</td>
+      <td>${role.user_count}</td><td>${role.permission_count}</td><td>${fmtDate(role.created_at)}</td>
+      <td><span class="badge">${esc(role.status)}</span></td><td>
+        ${!role.is_system && hasPermission("roles.edit") ? `<button class="act-btn edit-role" data-id="${role.id}">Edit</button>` : ""}
+        ${!role.is_system && hasPermission("roles.delete") ? `<button class="act-btn delete-role" data-id="${role.id}">Delete</button>` : ""}
+      </td></tr>`).join("");
+  return `
+    <div class="custom-field-manager-head"><div><h2>Roles & Permissions</h2>
+      <div class="pane-sub">Define reusable module permissions. The system Administrator role is protected.</div></div>
+      ${hasPermission("roles.create") ? `<button class="btn btn-primary" id="createRole">＋ Create role</button>` : ""}
+    </div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Role</th><th>Description</th><th>Users</th><th>Permissions</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="7" class="empty-row"><strong>No roles</strong></td></tr>'}</tbody></table></div>`;
+}
+
+function auditSettingsView() {
+  const rows = (S.auditEvents || []).map(event => `
+    <tr><td>${fmtDate(event.created_at)}</td><td>${esc(event.actor_email || event.actor_label || "System")}</td>
+      <td>${esc(event.tenant_name || event.tenant_id || "—")}</td>
+      <td>${esc(event.action)}</td><td>${esc(event.target_type)} ${esc(event.target_id)}</td>
+      <td>${esc(JSON.stringify(event.details))}</td></tr>`).join("");
+  return `<h2>Activity log</h2><div class="pane-sub">Recent user, team, role, and permission changes.</div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Time</th><th>Actor</th><th>Tenant</th><th>Action</th><th>Target</th><th>Previous / new values</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="empty-row"><strong>No activity recorded</strong></td></tr>'}</tbody></table></div>`;
+}
+
 function settingsView() {
   const tab = S.settingsTab;
   const navItems = [
     ["ai", "✦", "AI Module"],
+    ...(hasPermission("users.view") ? [["users", "♙", "Users"]] : []),
+    ...(hasPermission("teams.view") ? [["team", "◎", "Team & Members"]] : []),
+    ...(hasPermission("roles.view") ? [["roles", "◈", "Roles & Permissions"]] : []),
+    ...(hasPermission("admin") || hasPermission("*") ? [["custom-fields", "▤", "Custom Fields"]] : []),
     ["profile", "◉", "User Profile"],
-    ["team", "◎", "Team & Members"],
-    ["roles", "◈", "Roles & Permissions"],
     ["integrations", "⇄", "Integrations"],
     ["notifications", "◻", "Notifications"],
     ["preferences", "⚙", "App Preferences"],
-    ["archive", "▣", "Archive"],
+    ...(hasPermission("*") ? [["archive", "▣", "Archive"]] : []),
+    ...(hasPermission("*") ? [["audit", "≋", "Activity Log"]] : []),
   ];
   const navHtml = navItems.map(([id, icon, label]) => `
     <button class="settings-nav-item ${tab === id ? "active" : ""}" data-stab="${id}">${icon} ${label}</button>`).join("");
@@ -1002,7 +1975,7 @@ function settingsView() {
       <form id="adminLoginForm" class="ai-login-form">
         <h3>Admin sign-in</h3>
         <p class="pane-sub">${S.auth.admin_configured
-          ? "Sign in to manage AI providers and run AI analysis."
+          ? "Sign in to manage AI providers, run AI analysis, and configure custom fields."
           : "Copy qa-platform/.env.example to qa-platform/.env, set QA_ADMIN_PASSWORD to a unique password of at least 12 characters, then restart the server."}</p>
         <label for="adminPassword">Admin password
           <input id="adminPassword" type="password" autocomplete="current-password" required
@@ -1011,7 +1984,7 @@ function settingsView() {
         <button class="btn btn-primary" type="submit" ${S.auth.admin_configured ? "" : "disabled"}>Sign in</button>
         <div class="ai-status" id="loginStatus" role="status"></div>
       </form>` : "";
-    const settingsForm = S.auth.authenticated ? `
+    const settingsForm = hasPermission("*") ? `
       <div class="ai-fields">
         <label for="aiProvider">Provider
           <select id="aiProvider">
@@ -1035,20 +2008,50 @@ function settingsView() {
       <div class="ai-actions">
         <button class="btn btn-primary" id="saveAi">Save provider settings</button>
         <button class="btn btn-ghost" id="testAi" ${S.aiDraft || !S.aiSettings.configured ? "disabled" : ""}>Test connection</button>
-        <button class="btn btn-ghost" id="logoutAdmin">Sign out</button>
       </div>
       <div class="ai-status" id="aiStatus" role="status">${esc(S.aiStatus || setupStatus)}</div>
       <div class="info-box" style="margin-top:14px">
         API keys are encrypted in the local database using <code>QA_AI_ENCRYPTION_KEY</code> and are never returned to the browser.
         Local mode stays on this machine. Ollama uses its local server. Gemini and Other send analysis text to the selected provider.
-      </div>` : "";
+      </div>` : `<div class="info-box">Only an Administrator can change the AI provider, credentials, or workspace-level AI settings.</div>`;
     pane = `
       <h2>AI Module</h2>
       <div class="pane-sub">Configure Local deterministic, Ollama, Google Gemini, or an OpenAI-compatible model.</div>
       ${adminForm}
       ${settingsForm}`;
+  } else if (tab === "custom-fields") {
+    pane = hasPermission("*")
+      ? `<div class="custom-field-manager-head"><div><h2>Custom Fields</h2>
+          <div class="pane-sub">Create reusable fields for Project, Requirement, Test Case, and Defect forms.</div></div>
+          <button class="btn btn-primary" id="addCustomField">＋ Add field</button></div>
+          <div id="customFieldList"><div class="pane-sub">Loading custom fields…</div></div>`
+      : `<h2>Custom Fields</h2><div class="pane-sub">Only an Admin can create or manage workspace custom fields.</div>
+          <button class="btn btn-primary" id="goCustomFieldAdmin">Sign in as Admin</button>`;
+  } else if (tab === "profile") {
+    pane = profileSettingsView();
+  } else if (tab === "team") {
+    pane = teamsSettingsView();
+  } else if (tab === "users") {
+    pane = usersSettingsView();
+  } else if (tab === "roles") {
+    pane = rolesSettingsView();
+  } else if (tab === "audit") {
+    pane = auditSettingsView();
   } else if (tab === "archive") {
     pane = `<h2>Archive</h2><div class="pane-sub">Files retained from deleted projects.</div><div id="archiveContent"><div style="color:var(--muted);font-size:12px">Loading…</div></div>`;
+  } else if (tab === "preferences") {
+    pane = `
+      <h2>App Preferences</h2>
+      <div class="pane-sub">Choose how Trace looks. System follows your device's light or dark appearance.</div>
+      <div class="preference-setting">
+        <label for="themePreference">Color theme</label>
+        <select id="themePreference">
+          <option value="dark" ${S.themePreference === "dark" ? "selected" : ""}>Dark</option>
+          <option value="light" ${S.themePreference === "light" ? "selected" : ""}>Light</option>
+          <option value="system" ${S.themePreference === "system" ? "selected" : ""}>System (match device)</option>
+        </select>
+        <div class="pane-sub">This preference is saved in this browser.</div>
+      </div>`;
   } else {
     const labels = { profile:"User Profile",team:"Team & Members",roles:"Roles & Permissions",integrations:"Integrations",notifications:"Notifications",preferences:"App Preferences" };
     pane = `<h2>${labels[tab]||tab}</h2><div class="pane-sub">Configuration for ${labels[tab]||tab}.</div><div class="coming-soon">This section is coming in a future release.</div>`;
@@ -1060,11 +2063,137 @@ function settingsView() {
         <div class="eyebrow">WORKSPACE</div>
         <h1>Settings</h1>
       </div>
+      <div class="page-head-actions"><span class="pane-sub">${esc(S.auth.user?.email || "Administrator")}</span></div>
     </div>
     <div class="settings-grid">
       <div class="settings-nav">${navHtml}</div>
       <div class="settings-pane">${pane}</div>
     </div>`;
+}
+
+function renderCustomFieldList() {
+  const container = $("#customFieldList");
+  if (!container) return;
+  const rows = S.customFields.map(item => `
+    <article class="custom-field-card">
+      <div>
+        <strong>${esc(item.label)}</strong>
+        <span class="badge ${item.active ? "badge-green" : "badge-muted"}">${item.active ? "ACTIVE" : "INACTIVE"}</span>
+        <div class="pane-sub">${esc(item.module_label)} · ${esc(item.field_type)}${item.required ? " · Required" : ""}</div>
+        ${item.description ? `<div class="pane-sub">${esc(item.description)}</div>` : ""}
+        ${item.field_type === "dropdown" ? `<div class="pane-sub">Options: ${item.options.map(option => esc(option.label)).join(", ")}</div>` : ""}
+      </div>
+      <div class="custom-field-actions">
+        <button class="act-btn edit-custom-field" data-id="${item.id}">Edit</button>
+        <button class="act-btn toggle-custom-field" data-id="${item.id}" data-active="${item.active ? "true" : "false"}">${item.active ? "Deactivate" : "Activate"}</button>
+        <button class="act-btn delete-custom-field" data-id="${item.id}">Delete</button>
+      </div>
+    </article>`).join("");
+  container.innerHTML = rows || '<div class="empty-row"><strong>No custom fields configured</strong>Add a field to make it available on a form.</div>';
+  $$(".edit-custom-field", container).forEach(button => button.addEventListener("click", () =>
+    openCustomFieldModal(button.dataset.id)));
+  $$(".toggle-custom-field", container).forEach(button => button.addEventListener("click", () =>
+    updateCustomField(button.dataset.id, { active: button.dataset.active !== "true" })));
+  $$(".delete-custom-field", container).forEach(button => button.addEventListener("click", () =>
+    deleteCustomField(button.dataset.id)));
+}
+
+async function loadCustomFields() {
+  S.customFields = await api("/api/custom-fields");
+  renderCustomFieldList();
+}
+
+function openCustomFieldModal(id = null) {
+  const existing = S.customFields.find(item => String(item.id) === String(id));
+  $("#saveModal").hidden = false;
+  $("#modalEyebrow").textContent = "WORKSPACE CONFIGURATION";
+  $("#modalTitle").textContent = existing ? "Edit custom field" : "Create custom field";
+  $("#saveModal").textContent = existing ? "Save field" : "Create field";
+  $("#formError").textContent = "";
+  $("#modalFields").innerHTML =
+    selectField("module_key", "Form / module", [
+      { value: "projects", label: "Project" },
+      { value: "requirements", label: "Requirement" },
+      { value: "test-cases", label: "Test Case" },
+      { value: "bugs", label: "Defect" },
+    ], existing?.module_key || "bugs", true) +
+    field("name", "Field name", existing?.name || "", "text", false, "e.g. build_number", true) +
+    field("label", "Field label", existing?.label || "", "text", false, "e.g. Build Number", true) +
+    selectField("field_type", "Field type", [
+      { value: "text", label: "Text" },
+      { value: "number", label: "Number" },
+      { value: "dropdown", label: "Dropdown" },
+    ], existing?.field_type || "text") +
+    field("display_order", "Display order", existing?.display_order ?? 0, "number") +
+    field("description", "Help text", existing?.description || "", "textarea", true, "Optional field guidance") +
+    `<div class="field full" id="customFieldOptionsRow" ${existing?.field_type === "dropdown" ? "" : "hidden"}>
+      <label for="f_options">Dropdown options</label>
+      <textarea id="f_options" name="options" placeholder="One option per line; use Label | value for a distinct stored value">${esc(
+        existing?.options.map(option => option.label === option.value
+          ? option.label : `${option.label} | ${option.value}`).join("\n") || ""
+      )}</textarea>
+    </div>
+    <label class="custom-field-check"><input id="f_required" name="required" type="checkbox" ${existing?.required ? "checked" : ""}> Required</label>
+    <label class="custom-field-check"><input id="f_active" name="active" type="checkbox" ${existing ? (existing.active ? "checked" : "") : "checked"}> Active</label>`;
+  $("#cancelModal").onclick = () => modal.close();
+  $("#closeModal").onclick = () => modal.close();
+  $("#f_field_type").addEventListener("change", event => {
+    $("#customFieldOptionsRow").hidden = event.target.value !== "dropdown";
+  });
+  modalForm.onsubmit = async event => {
+    event.preventDefault();
+    $("#formError").textContent = "";
+    const form = new FormData(modalForm);
+    const options = String(form.get("options") || "").split(/\r?\n/)
+      .map(line => line.trim()).filter(Boolean)
+      .map(line => {
+        const [label, value] = line.split("|", 2).map(item => item.trim());
+        return { label, value: value || label };
+      });
+    const payload = {
+      module_key: form.get("module_key"),
+      name: form.get("name"),
+      label: form.get("label"),
+      field_type: form.get("field_type"),
+      description: form.get("description"),
+      display_order: Number(form.get("display_order") || 0),
+      required: $("#f_required").checked,
+      active: $("#f_active").checked,
+      options,
+    };
+    try {
+      await api(existing ? `/api/custom-fields/${existing.id}` : "/api/custom-fields", {
+        method: existing ? "PATCH" : "POST",
+        body: JSON.stringify(payload),
+      });
+      modal.close();
+      await loadCustomFields();
+      toast(existing ? "Custom field updated" : "Custom field created");
+    } catch (error) {
+      $("#formError").textContent = error.message;
+    }
+  };
+  modal.showModal();
+}
+
+async function updateCustomField(id, changes) {
+  try {
+    await api(`/api/custom-fields/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(changes),
+    });
+    await loadCustomFields();
+    toast(changes.active ? "Custom field activated" : "Custom field deactivated");
+  } catch (error) { toast(error.message); }
+}
+
+async function deleteCustomField(id) {
+  if (!confirm("Delete this custom field? Fields with saved values must be deactivated instead.")) return;
+  try {
+    await api(`/api/custom-fields/${id}`, { method: "DELETE" });
+    await loadCustomFields();
+    toast("Custom field deleted");
+  } catch (error) { toast(error.message); }
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -1102,11 +2231,11 @@ function bindWorkspaceActions() {
     render();
   }));
 
-  $("#startAnalysis")?.addEventListener("click", startAnalysis);
-  $("#checkRea")?.addEventListener("click", checkRea);
 
   $("#exportBtn")?.addEventListener("click", exportReport);
   $$(".export-csv").forEach(b => b.addEventListener("click", exportReport));
+  $$(".module-export").forEach(b => b.addEventListener("click", () =>
+    exportModuleReport(b.dataset.module)));
 
   $("#editProjBtn")?.addEventListener("click", () => openModal("project", S.project.id));
   $("#delProjectBtn")?.addEventListener("click", () => deleteProject(S.project.id));
@@ -1152,7 +2281,9 @@ function bindWorkspaceActions() {
   }));
 
   /* Bug actions */
+  $$(".view-bug").forEach(b => b.addEventListener("click", () => showDefect(b.dataset.id)));
   $$(".edit-bug").forEach(b => b.addEventListener("click", () => openModal("bug", b.dataset.id)));
+  $$(".delete-bug").forEach(b => b.addEventListener("click", () => deleteBug(b.dataset.id)));
 
   /* File download */
   $$(".dl-file").forEach(b => b.addEventListener("click", () => {
@@ -1161,13 +2292,265 @@ function bindWorkspaceActions() {
 }
 
 /* ── Settings actions ─────────────────────────────────────────────── */
+function openManagementModal(kind, id = null) {
+  const record = kind === "user" ? S.users.find(item => String(item.id) === String(id))
+    : kind === "team" ? S.teams.find(item => String(item.id) === String(id))
+    : S.roles.find(item => String(item.id) === String(id));
+  const isEdit = Boolean(record);
+  $("#saveModal").hidden = false;
+  $("#formError").textContent = "";
+  $("#modalEyebrow").textContent = "WORKSPACE MANAGEMENT";
+  $("#modalTitle").textContent = `${isEdit ? "Edit" : "Create"} ${kind}`;
+  $("#saveModal").textContent = isEdit ? "Save changes" : `Create ${kind}`;
+  if (kind === "user") {
+    const roleOptions = S.roles.filter(role => role.status === "Active")
+      .map(role => ({ value: role.id, label: role.name }));
+    const defaultRole = roleOptions.find(role => role.label === "User");
+    const teamOptions = S.teams.filter(team => team.status === "Active")
+      .map(team => `<option value="${team.id}" ${(record?.team_ids || []).includes(team.id) ? "selected" : ""}>${esc(team.name)}</option>`)
+      .join("");
+    $("#modalFields").innerHTML =
+      field("first_name","First name",record?.first_name || "","text",false,"",true) +
+      field("last_name","Last name",record?.last_name || "","text",false,"",true) +
+      field("email","Email",record?.email || "","email",false,"",true) +
+      field("phone","Phone",record?.phone || "","tel") +
+      selectField("role_id","Role",roleOptions,record?.role_id || defaultRole?.value) +
+      `<label class="field">Teams<select name="team_ids" multiple size="4">${teamOptions}</select>
+        <span class="field-hint">Use Ctrl or Command to select multiple teams.</span></label>` +
+      selectField("status","Status",["Active","Inactive","Invited","Suspended"],record?.status || "Active") +
+      field("password",isEdit ? "Reset password (optional)" : "Temporary password","","password",true,
+        isEdit ? "Leave blank to keep the current password" : "12+ chars, upper/lowercase and number",!isEdit);
+  } else if (kind === "team") {
+    const activeUsers = S.users.filter(user => user.status === "Active")
+      .map(user => ({ value: user.id, label: `${user.first_name} ${user.last_name} · ${user.email}` }));
+    $("#modalFields").innerHTML =
+      field("name","Team name",record?.name || "","text",true,"",true) +
+      selectField("owner_user_id","Owner / lead",activeUsers,record?.owner_user_id || activeUsers[0]?.value) +
+      selectField("status","Status",["Active","Inactive"],record?.status || "Active") +
+      field("description","Description",record?.description || "","textarea",true);
+  } else {
+    $("#modalFields").innerHTML =
+      field("name","Role name",record?.name || "","text",true,"",true) +
+      selectField("status","Status",["Active","Inactive"],record?.status || "Active") +
+      field("description","Description",record?.description || "","textarea",true) +
+      `<div class="field full"><label>Permission matrix</label>${rolePermissionMatrix(record?.permissions || [])}</div>`;
+  }
+  $("#cancelModal").onclick = () => modal.close();
+  $("#closeModal").onclick = () => modal.close();
+  modalForm.onsubmit = async event => {
+    event.preventDefault();
+    const form = new FormData(modalForm);
+    const payload = Object.fromEntries(form.entries());
+    if (kind === "role") payload.permissions = form.getAll("permissions");
+    if (kind === "user") payload.team_ids = form.getAll("team_ids").map(Number);
+    try {
+      const base = kind === "user" ? "/api/users" : kind === "team" ? "/api/teams" : "/api/roles";
+      await api(isEdit ? `${base}/${record.id}` : base, {
+        method: isEdit ? "PATCH" : "POST",
+        body: JSON.stringify(payload),
+      });
+      modal.close();
+      await loadSettingsTab(S.settingsTab);
+      toast(`${kind[0].toUpperCase()}${kind.slice(1)} ${isEdit ? "updated" : "created"}`);
+    } catch (error) {
+      $("#formError").textContent = error.message;
+    }
+  };
+  modal.showModal();
+}
+
+async function showTeamMembers(teamId) {
+  const panel = $("#teamMembersPanel");
+  if (!panel) return;
+  try {
+    const members = await api(`/api/teams/${teamId}/members`);
+    const team = S.teams.find(item => String(item.id) === String(teamId));
+    const availableUsers = S.users.filter(user =>
+      user.status === "Active" && !members.some(member => member.id === user.id)
+    );
+    panel.innerHTML = `
+      <div class="team-members-head"><div><h3>${esc(team?.name || "Team")} members</h3>
+        <div class="pane-sub">Removing a member only removes this team membership.</div></div></div>
+      ${hasPermission("teams.manage-members") ? `<form id="addTeamMember" class="inline-management-form">
+        <select name="user_id" required>${availableUsers.map(user => `<option value="${user.id}">${esc(user.first_name)} ${esc(user.last_name)} · ${esc(user.email)}</option>`).join("")}</select>
+        <button class="btn btn-primary" type="submit" ${availableUsers.length ? "" : "disabled"}>Add member</button>
+      </form>` : ""}
+      <label class="member-search">Search members<input id="memberSearch" type="search" placeholder="Name or email"></label>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Actions</th></tr></thead>
+      <tbody>${members.map(member => `<tr data-member-row><td>${esc(member.first_name)} ${esc(member.last_name)}</td><td>${esc(member.email)}</td><td>${esc(member.role_name)}</td>
+        <td>${hasPermission("teams.manage-members") && team?.owner_user_id !== member.id ? `<button class="act-btn remove-team-member" data-user-id="${member.id}" data-team-id="${teamId}">Remove</button>` : ""}</td></tr>`).join("")
+        || '<tr><td colspan="4" class="empty-row"><strong>No members</strong></td></tr>'}</tbody></table></div>`;
+    $("#addTeamMember")?.addEventListener("submit", async event => {
+      event.preventDefault();
+      const userId = new FormData(event.currentTarget).get("user_id");
+      try {
+        await api(`/api/teams/${teamId}/members`, {
+          method: "POST", body: JSON.stringify({ user_id: Number(userId) }),
+        });
+        await loadSettingsTab("team");
+        await showTeamMembers(teamId);
+      } catch (error) { toast(error.message); }
+    });
+    $("#memberSearch")?.addEventListener("input", event => {
+      const query = event.target.value.toLowerCase();
+      $$("[data-member-row]", panel).forEach(row =>
+        row.hidden = !row.textContent.toLowerCase().includes(query));
+    });
+    $$(".remove-team-member", panel).forEach(button => button.addEventListener("click", async () => {
+      if (!confirm("Remove this user from the team? Their other access will remain unchanged.")) return;
+      try {
+        await api(`/api/teams/${teamId}/members/${button.dataset.userId}`, { method: "DELETE" });
+        await loadSettingsTab("team");
+        await showTeamMembers(teamId);
+      } catch (error) { toast(error.message); }
+    }));
+  } catch (error) { toast(error.message); }
+}
+
+function bindProfileActions() {
+  $("#profileForm")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = Object.fromEntries(form.entries());
+    const image = $("#profileImage")?.files[0];
+    if (image) {
+      if (!["image/png","image/jpeg","image/gif","image/webp"].includes(image.type) || image.size > 1024 * 1024) {
+        toast("Choose a PNG, JPEG, GIF, or WebP profile image no larger than 1 MB.");
+        return;
+      }
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("Could not read the selected profile image."));
+        reader.readAsDataURL(image);
+      });
+      payload.profile_image_data = String(dataUrl).split(",", 2)[1];
+      payload.profile_image_type = image.type;
+    } else if (S.removeProfileImage) {
+      payload.profile_image_data = null;
+      payload.profile_image_type = "";
+    }
+    try {
+      await api("/api/profile", { method: "PATCH", body: JSON.stringify(payload) });
+      S.removeProfileImage = false;
+      await loadSettingsTab("profile");
+      if (S.profile && S.auth.user) {
+        Object.assign(S.auth.user, {
+          first_name: S.profile.first_name,
+          last_name: S.profile.last_name,
+          email: S.profile.email,
+        });
+      }
+      syncProfileMenu();
+      toast("Profile saved");
+    } catch (error) { toast(error.message); }
+  });
+  $("#removeProfileImage")?.addEventListener("click", () => {
+    S.removeProfileImage = true;
+    $("#profileImage").value = "";
+    $("#removeProfileImage").disabled = true;
+  });
+  $("#passwordForm")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const payload = Object.fromEntries(new FormData(event.currentTarget).entries());
+    try {
+      await api("/api/profile/password", { method: "PATCH", body: JSON.stringify(payload) });
+      event.currentTarget.reset();
+      toast("Password updated");
+    } catch (error) { toast(error.message); }
+  });
+}
+
 function bindSettingsActions() {
+  bindPasswordToggles();
+  $("#themePreference")?.addEventListener("change", event =>
+    saveThemePreference(event.target.value));
   /* Tab switcher */
   $$(".settings-nav-item").forEach(btn => btn.addEventListener("click", async () => {
     S.settingsTab = btn.dataset.stab;
     render();
     if (S.settingsTab === "archive") loadArchive();
+    else if (["profile","team","users","roles","audit"].includes(S.settingsTab)) {
+      await loadSettingsTab(S.settingsTab);
+    }
   }));
+  $("#createUser")?.addEventListener("click", () => openManagementModal("user"));
+  $("#createTeam")?.addEventListener("click", () => openManagementModal("team"));
+  $("#createRole")?.addEventListener("click", () => openManagementModal("role"));
+  $$(".edit-user").forEach(button => button.addEventListener("click", () =>
+    openManagementModal("user", button.dataset.id)));
+  $$(".edit-team").forEach(button => button.addEventListener("click", () =>
+    openManagementModal("team", button.dataset.id)));
+  $$(".edit-role").forEach(button => button.addEventListener("click", () =>
+    openManagementModal("role", button.dataset.id)));
+  $$(".manage-team").forEach(button => button.addEventListener("click", () =>
+    showTeamMembers(button.dataset.id)));
+  $$(".archive-team").forEach(button => button.addEventListener("click", async () => {
+    if (!confirm("Archive this team? Membership records will be retained.")) return;
+    try {
+      await api(`/api/teams/${button.dataset.id}`, { method: "DELETE" });
+      await loadSettingsTab("team");
+      toast("Team archived");
+    } catch (error) { toast(error.message); }
+  }));
+  const changeUserStatus = async (button, action) => {
+    const activating = action === "activate";
+    if (!confirm(activating
+      ? "Activate this user? They will be able to sign in again."
+      : "Deactivate this user? They will no longer be able to sign in.")) return;
+    try {
+      await api(`/api/users/${button.dataset.id}/${action}`, { method: "POST", body: "{}" });
+      await loadSettingsTab("users");
+      toast(`User ${activating ? "activated" : "deactivated"}`);
+    } catch (error) { toast(error.message); }
+  };
+  $$(".deactivate-user").forEach(button => button.addEventListener("click", async () => {
+    await changeUserStatus(button, "deactivate");
+  }));
+  $$(".activate-user").forEach(button => button.addEventListener("click", async () => {
+    await changeUserStatus(button, "activate");
+  }));
+  $$(".delete-user").forEach(button => button.addEventListener("click", async () => {
+    const systemAdmin = Boolean(S.auth.user?.global_admin);
+    const message = systemAdmin
+      ? "Permanently delete this user account? Historical project, test case, requirement, defect, and activity records will be retained."
+      : "Remove this user's access from this workspace? Memberships in other workspaces and historical QA records will be preserved.";
+    if (!confirm(message)) return;
+    try {
+      const result = await api(`/api/users/${button.dataset.id}`, { method: "DELETE" });
+      await loadSettingsTab("users");
+      toast(result.account_deleted === false
+        ? "User removed from this workspace; account retained elsewhere"
+        : "User deleted");
+    } catch (error) { toast(error.message); }
+  }));
+  const filterUsers = () => {
+    const query = ($("#userSearch")?.value || "").trim().toLowerCase();
+    const status = $("#userStatusFilter")?.value || "";
+    $$("[data-user-row]").forEach(row => {
+      row.hidden = !row.textContent.toLowerCase().includes(query)
+        || (status && row.dataset.status !== status);
+    });
+  };
+  $("#userSearch")?.addEventListener("input", filterUsers);
+  $("#userStatusFilter")?.addEventListener("change", filterUsers);
+  $$(".delete-role").forEach(button => button.addEventListener("click", async () => {
+    if (!confirm("Delete this role? It cannot be deleted while assigned to users.")) return;
+    try {
+      await api(`/api/roles/${button.dataset.id}`, { method: "DELETE" });
+      await loadSettingsTab("roles");
+      toast("Role deleted");
+    } catch (error) { toast(error.message); }
+  }));
+  $("#addCustomField")?.addEventListener("click", () => openCustomFieldModal());
+  $("#goCustomFieldAdmin")?.addEventListener("click", () => {
+    S.settingsTab = "ai";
+    render();
+  });
+  if (S.settingsTab === "custom-fields" && S.auth.authenticated) {
+    loadCustomFields().catch(error => toast(error.message));
+  }
+  bindProfileActions();
   $("#adminLoginForm")?.addEventListener("submit", async event => {
     event.preventDefault();
     const password = $("#adminPassword")?.value || "";
@@ -1206,16 +2589,6 @@ function bindSettingsActions() {
   });
   $("#saveAi")?.addEventListener("click", saveAiSettings);
   $("#testAi")?.addEventListener("click", testAiConnection);
-  $("#logoutAdmin")?.addEventListener("click", async () => {
-    try {
-      await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
-      S.auth = await api("/api/auth/status");
-      S.aiSettings = await api("/api/ai/settings");
-      S.aiDraft = null;
-      S.aiStatus = "";
-      render();
-    } catch (error) { toast(error.message); }
-  });
 }
 
 async function loadArchive() {
@@ -1341,6 +2714,18 @@ async function deleteCase(id) {
     await api(pp(`test-cases/${id}`), { method: "DELETE" });
     await refresh(); toast("Test case deleted");
   } catch (e) { toast(e.message); }
+}
+
+async function deleteBug(id) {
+  const defect = S.bugs.find(item => String(item.id) === String(id));
+  if (!defect || !confirm(`Delete ${defect.bug_key} — ${defect.title}?`)) return;
+  try {
+    await api(pp(`bugs/${id}`), { method: "DELETE" });
+    await refresh();
+    toast("Defect deleted");
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 /* ── BRD report rendering ─────────────────────────────────────────── */
@@ -1779,37 +3164,80 @@ async function validateCoverage(appId) {
   }
 }
 
-/* ── REA Analysis ─────────────────────────────────────────────────── */
-async function startAnalysis() {
-  const path = $("#appPath")?.value;
-  const btn = $("#startAnalysis");
-  if (!path) { const s = $("#reaStatus"); if (s) s.textContent = "Enter an absolute path."; return; }
-  if (btn) btn.disabled = true;
-  try {
-    await api(pp("analyses"), { method: "POST", body: JSON.stringify({ input_path: path }) });
-    toast("REA analysis queued."); await refresh();
-  } catch (e) {
-    const s = $("#reaStatus"); if (s) s.textContent = e.message;
-  } finally {
-    if ($("#startAnalysis")) $("#startAnalysis").disabled = !S.reaRuntime?.analysis_enabled;
-  }
-}
-async function checkRea() {
-  const btn = $("#checkRea"); if (btn) btn.disabled = true;
-  try { S.reaRuntime = await api("/api/rea/runtime"); render(); }
-  catch (e) { toast(e.message); }
-  finally { if ($("#checkRea")) $("#checkRea").disabled = false; }
-}
-function pollAnalyses() {
-  const active = S.analyses.some(a => a.status === "queued" || a.status === "running");
-  if (active && !pollTimer) pollTimer = setTimeout(async () => { pollTimer = null; await refresh(); }, 1500);
-  if (!active && pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-}
-
 /* ── Export report ────────────────────────────────────────────────── */
 function exportReport() {
   if (!S.project) return;
   location.href = pp("report/csv");
+}
+
+function exportModuleReport(module) {
+  if (!S.project || !["requirements", "test-cases", "bugs"].includes(module)) return;
+  const query = new URLSearchParams();
+  const search = $("#searchTable")?.value.trim();
+  if (search) query.set("q", search);
+  const queryString = query.toString();
+  const suffix = queryString ? `?${queryString}` : "";
+  location.href = pp(`report/${module}.csv${suffix}`);
+}
+
+async function showDefect(id) {
+  const defect = S.bugs.find(item => String(item.id) === String(id));
+  if (!defect || !S.project) return;
+  try {
+    const [fieldResponse, attachments] = await Promise.all([
+      api(`/api/custom-fields?module=bugs&record_id=${encodeURIComponent(id)}&include_inactive=true`),
+      api(`/api/projects/${S.project.id}/attachments?module=bugs&record_id=${encodeURIComponent(id)}`),
+    ]);
+    const linkedCase = S.cases.find(item => String(item.id) === String(defect.test_case_id));
+    const details = [
+      ["Defect ID", defect.bug_key],
+      ["Title", defect.title],
+      ["Description", defect.description],
+      ["Status", defect.status],
+      ["Severity", defect.severity],
+      ["Priority", defect.priority],
+      ["Assignee", defect.assigned_to],
+      ["Linked test case", linkedCase
+        ? `${linkedCase.case_key} · ${linkedCase.title || linkedCase.scenario}`
+        : defect.test_case_id ? `Test case #${defect.test_case_id}` : "—"],
+      ["Created", defect.created_at ? `${fmtDate(defect.created_at)} · ${defect.created_at}` : "—"],
+      ["Last updated", defect.updated_at ? `${fmtDate(defect.updated_at)} · ${defect.updated_at}` : "—"],
+    ];
+    const detailHtml = details.map(([label, value]) => `
+      <div class="field${label === "Description" ? " full" : ""}">
+        <label>${esc(label)}</label>
+        <div class="defect-detail-value">${pretty(value || "—")}</div>
+      </div>`).join("");
+    const customHtml = fieldResponse.fields.length
+      ? `<div class="field full custom-fields-divider"><strong>Custom fields</strong></div>` +
+        fieldResponse.fields.map(item => `
+          <div class="field">
+            <label>${esc(item.label)}${item.active ? "" : " · Inactive"}</label>
+            <div class="defect-detail-value">${pretty(item.value || "—")}</div>
+            ${item.description ? `<small class="custom-field-help">${esc(item.description)}</small>` : ""}
+          </div>`).join("")
+      : "";
+    const attachmentHtml = `<div class="field full attachment-section">
+      <label>Attachments</label>
+      ${attachments.length ? attachments.map(item => `
+        <div class="attachment-item">
+          <a href="/api/projects/${S.project.id}/attachments/${item.id}/view" target="_blank" rel="noopener">${esc(item.filename)}</a>
+          <span>${(item.file_size_bytes / 1024).toFixed(1)} KB</span>
+          <a class="act-btn" href="/api/projects/${S.project.id}/attachments/${item.id}/download">Download</a>
+        </div>`).join("") : '<div class="defect-detail-value">No attachments.</div>'}
+    </div>`;
+    $("#modalEyebrow").textContent = "DEFECT · READ ONLY";
+    $("#modalTitle").textContent = `${defect.bug_key} · ${defect.title}`;
+    $("#formError").textContent = "";
+    $("#saveModal").hidden = true;
+    $("#cancelModal").onclick = () => modal.close();
+    $("#closeModal").onclick = () => modal.close();
+    modalForm.onsubmit = null;
+    $("#modalFields").innerHTML = detailHtml + customHtml + attachmentHtml;
+    modal.showModal();
+  } catch (error) {
+    toast(`Could not load defect details: ${error.message}`);
+  }
 }
 
 /* ── Show evidence ────────────────────────────────────────────────── */
@@ -1856,7 +3284,100 @@ function selectField(name, label, opts, value, full = false) {
     </select></div>`;
 }
 
-function openModal(kind, id = null, linkCase = null) {
+const ATTACHMENT_EXTENSIONS = new Set([
+  "csv", "docx", "gif", "jpeg", "jpg", "json", "md", "pdf",
+  "png", "txt", "webp", "xlsx", "zip",
+]);
+function customFieldMarkup(fields) {
+  if (!fields.length) return "";
+  return `<div class="field full custom-fields-divider"><strong>Custom fields</strong></div>` +
+    fields.map(item => {
+      const required = item.required ? "required" : "";
+      const description = item.description
+        ? `<small class="custom-field-help">${esc(item.description)}</small>` : "";
+      let control;
+      if (item.field_type === "dropdown") {
+        control = `<select id="cf_${item.id}" name="cf_${item.id}" ${required}>
+          <option value="" ${item.value ? "" : "selected"} ${item.required ? "disabled" : ""}>${item.required ? "Select an option" : "Optional"}</option>
+          ${item.options.map(option => `<option value="${esc(option.value)}" ${String(option.value) === String(item.value) ? "selected" : ""}>${esc(option.label)}</option>`).join("")}
+        </select>`;
+      } else {
+        const type = item.field_type === "number" ? "number" : "text";
+        control = `<input id="cf_${item.id}" name="cf_${item.id}" type="${type}"
+          ${type === "number" ? 'step="any"' : 'maxlength="1000"'}
+          value="${esc(item.value)}" ${required}>`;
+      }
+      return `<div class="field"><label for="cf_${item.id}">${esc(item.label)}${item.required ? " *" : ""}</label>
+        ${control}${description}</div>`;
+    }).join("");
+}
+
+function attachmentSectionHtml(attachments) {
+  return `<div class="field full attachment-section">
+    <label for="f_attachments">Attachments (PDF, Office, ZIP, CSV, JSON, Markdown, text, or image · max 5 MB each)</label>
+    <input id="f_attachments" name="attachments" type="file" multiple
+      accept=".csv,.docx,.gif,.jpeg,.jpg,.json,.md,.pdf,.png,.txt,.webp,.xlsx,.zip">
+    <div id="attachmentStatus" class="pane-sub" role="status"></div>
+    <div id="attachmentList">${renderAttachmentItems(attachments, [], new Set())}</div>
+    <button type="button" class="btn btn-ghost" id="cancelAttachmentUpload" hidden>Cancel upload</button>
+  </div>`;
+}
+
+function renderAttachmentItems(existing, pending, removed) {
+  const existingHtml = existing.map(item => `
+    <div class="attachment-item ${removed.has(String(item.id)) ? "attachment-removed" : ""}">
+      <a href="/api/projects/${item.project_id}/attachments/${item.id}/view" target="_blank" rel="noopener">${esc(item.filename)}</a>
+      <span>${(item.file_size_bytes / 1024).toFixed(1)} KB</span>
+      <a class="act-btn" href="/api/projects/${item.project_id}/attachments/${item.id}/download">Download</a>
+      <button type="button" class="act-btn toggle-existing-attachment" data-id="${item.id}">${removed.has(String(item.id)) ? "Undo" : "Remove"}</button>
+    </div>`).join("");
+  const pendingHtml = pending.map((file, index) => `
+    <div class="attachment-item">
+      <span>${esc(file.name)} <small>Pending · ${(file.size / 1024).toFixed(1)} KB</small></span>
+      <button type="button" class="act-btn remove-pending-attachment" data-index="${index}">Remove</button>
+    </div>`).join("");
+  return existingHtml + pendingHtml || '<div class="pane-sub">No attachments.</div>';
+}
+
+async function saveRecordAttachments(
+  projectId, moduleKey, recordId, pending, existing, removed, controller
+) {
+  if (!pending.length && !removed.size) return;
+  const status = $("#attachmentStatus");
+  const cancel = $("#cancelAttachmentUpload");
+  const save = $("#saveModal");
+  if (save) save.disabled = true;
+  if (cancel) cancel.hidden = false;
+  try {
+    for (let index = 0; index < pending.length; index += 1) {
+      const file = pending[index];
+      if (status) status.textContent = `Uploading ${index + 1} of ${pending.length}: ${file.name}`;
+      await api(
+        `/api/projects/${projectId}/attachments?module=${encodeURIComponent(moduleKey)}`
+          + `&record_id=${encodeURIComponent(recordId)}&filename=${encodeURIComponent(file.name)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: file,
+          signal: controller.signal,
+        }
+      );
+    }
+    for (const attachmentId of removed) {
+      if (status) status.textContent = "Removing attachment…";
+      await api(`/api/projects/${projectId}/attachments/${attachmentId}`, {
+        method: "DELETE",
+        signal: controller.signal,
+      });
+    }
+    if (status) status.textContent = "Attachments saved.";
+  } finally {
+    if (save) save.disabled = false;
+    if (cancel) cancel.hidden = true;
+  }
+}
+
+async function openModal(kind, id = null, linkCase = null) {
   const isEdit = Boolean(id);
   const titles = {
     project: isEdit ? "Edit project" : "Create project",
@@ -1873,6 +3394,38 @@ function openModal(kind, id = null, linkCase = null) {
     : kind === "bug" ? S.bugs.find(x => x.id == id)
     : null;
   const linkedCase = kind === "bug" && linkCase ? S.cases.find(x => x.id == linkCase) : null;
+  const moduleKey = {
+    project: "projects",
+    requirement: "requirements",
+    case: "test-cases",
+    bug: "bugs",
+  }[kind];
+  let customFields = [];
+  let existingAttachments = [];
+  const pendingAttachments = [];
+  const removedAttachments = new Set();
+  const attachmentProjectId = kind === "project" ? (isEdit ? id : null) : S.project?.id;
+  if (moduleKey) {
+    try {
+      const customQuery = new URLSearchParams({ module: moduleKey });
+      if (isEdit) customQuery.set("record_id", id);
+      const fieldResponse = await api(`/api/custom-fields?${customQuery}`);
+      customFields = fieldResponse.fields;
+      if (isEdit && attachmentProjectId) {
+        const attachmentQuery = new URLSearchParams({
+          module: moduleKey,
+          record_id: String(id),
+        });
+        existingAttachments = await api(
+          `/api/projects/${attachmentProjectId}/attachments?${attachmentQuery}`
+        );
+        existingAttachments.forEach(item => { item.project_id = attachmentProjectId; });
+      }
+    } catch (error) {
+      toast(`Could not load form configuration: ${error.message}`);
+      return;
+    }
+  }
 
   $("#saveModal").hidden = false;
   $("#saveModal").onclick = null;
@@ -1962,8 +3515,65 @@ function openModal(kind, id = null, linkCase = null) {
       selectField("status", "Status", ["Open","In Progress","Resolved","Closed"], data?.status || "Open") +
       field("assigned_to", "Assigned to", data?.assigned_to || "", "text", false, "Developer name");
   }
+  if (moduleKey) {
+    fields += customFieldMarkup(customFields);
+    fields += attachmentSectionHtml(existingAttachments);
+  }
 
   $("#modalFields").innerHTML = fields;
+  const attachmentList = $("#attachmentList");
+  const attachmentInput = $("#f_attachments");
+  const redrawAttachments = () => {
+    if (!attachmentList) return;
+    attachmentList.innerHTML = renderAttachmentItems(
+      existingAttachments, pendingAttachments, removedAttachments
+    );
+  };
+  attachmentInput?.addEventListener("change", () => {
+    const invalid = [];
+    for (const file of attachmentInput.files || []) {
+      const extension = file.name.split(".").pop().toLowerCase();
+      if (!ATTACHMENT_EXTENSIONS.has(extension)) {
+        invalid.push(`${file.name}: unsupported file type`);
+        continue;
+      }
+      if (!file.size || file.size > 5 * 1024 * 1024) {
+        invalid.push(`${file.name}: file must be between 1 byte and 5 MB`);
+        continue;
+      }
+      const duplicate = [...existingAttachments, ...pendingAttachments].some(item =>
+        String(item.name || item.filename).toLowerCase() === file.name.toLowerCase()
+          && (item.size ?? item.file_size_bytes) === file.size
+          && !removedAttachments.has(String(item.id))
+      );
+      if (duplicate) {
+        invalid.push(`${file.name}: duplicate file`);
+        continue;
+      }
+      pendingAttachments.push(file);
+    }
+    attachmentInput.value = "";
+    $("#formError").textContent = invalid.join("; ");
+    redrawAttachments();
+  });
+  attachmentList?.addEventListener("click", event => {
+    const removePending = event.target.closest(".remove-pending-attachment");
+    if (removePending) {
+      pendingAttachments.splice(Number(removePending.dataset.index), 1);
+      redrawAttachments();
+      return;
+    }
+    const toggleExisting = event.target.closest(".toggle-existing-attachment");
+    if (toggleExisting) {
+      const attachmentId = String(toggleExisting.dataset.id);
+      if (removedAttachments.has(attachmentId)) removedAttachments.delete(attachmentId);
+      else removedAttachments.add(attachmentId);
+      redrawAttachments();
+    }
+  });
+  let attachmentUploadController = null;
+  $("#cancelAttachmentUpload")?.addEventListener("click", () =>
+    attachmentUploadController?.abort());
   $("#saveModal").textContent =
     kind === "execution" ? "Save execution"
     : kind === "project" ? (isEdit ? "Save project" : "Create project")
@@ -1975,11 +3585,30 @@ function openModal(kind, id = null, linkCase = null) {
     e.preventDefault();
     $("#formError").textContent = "";
     const payload = Object.fromEntries(new FormData(modalForm).entries());
+    payload.custom_fields = Object.fromEntries(
+      customFields.map(item => [String(item.id), $(`#cf_${item.id}`)?.value || ""])
+    );
+    delete payload.attachments;
+    for (const key of Object.keys(payload)) {
+      if (key.startsWith("cf_")) delete payload[key];
+    }
     try {
       if (kind === "project") {
         const proj = isEdit
           ? await api(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(payload) })
           : await api("/api/projects", { method: "POST", body: JSON.stringify(payload) });
+        try {
+          await saveRecordAttachments(
+            proj.id, "projects", proj.id, pendingAttachments,
+            existingAttachments, removedAttachments,
+            attachmentUploadController = new AbortController()
+          );
+        } catch (error) {
+          modal.close();
+          await loadProjects(proj.id);
+          toast(`Project saved; attachment update failed: ${error.message}`);
+          return;
+        }
         modal.close();
         if (!isEdit) S.view = "overview";
         await loadProjects(isEdit ? S.project?.id : proj.id);
@@ -1988,6 +3617,7 @@ function openModal(kind, id = null, linkCase = null) {
       }
       const suffix = { requirement: "requirements", case: "test-cases", bug: "bugs" }[kind];
       if (kind === "case") {
+        let caseId = id;
         const { status, actual_result } = payload;
         delete payload.status; delete payload.actual_result;
         if (isEdit) {
@@ -1998,9 +3628,21 @@ function openModal(kind, id = null, linkCase = null) {
           }
         } else {
           const created = await api(pp(suffix), { method: "POST", body: JSON.stringify(payload) });
+          caseId = created.id;
           if (status !== "Not Executed" || actual_result) {
             await api(pp(`executions/${created.id}`), { method: "POST", body: JSON.stringify({ status, actual_result, executed_by: S.project.qa_owner }) });
           }
+        }
+        try {
+          await saveRecordAttachments(
+            S.project.id, "test-cases", caseId,
+            pendingAttachments, existingAttachments, removedAttachments,
+            attachmentUploadController = new AbortController()
+          );
+        } catch (error) {
+          modal.close(); await refresh();
+          toast(`Test case saved; attachment update failed: ${error.message}`);
+          return;
         }
         modal.close(); await refresh(); toast(isEdit ? "Test case updated" : "Test case added"); return;
       }
@@ -2014,8 +3656,20 @@ function openModal(kind, id = null, linkCase = null) {
         }
         modal.close(); await refresh(); toast("Execution saved"); return;
       }
-      if (isEdit) await api(pp(`${suffix}/${id}`), { method: "PATCH", body: JSON.stringify(payload) });
-      else         await api(pp(suffix), { method: "POST", body: JSON.stringify(payload) });
+      const saved = isEdit
+        ? await api(pp(`${suffix}/${id}`), { method: "PATCH", body: JSON.stringify(payload) })
+        : await api(pp(suffix), { method: "POST", body: JSON.stringify(payload) });
+      try {
+        await saveRecordAttachments(
+          S.project.id, moduleKey, saved.id, pendingAttachments,
+          existingAttachments, removedAttachments,
+          attachmentUploadController = new AbortController()
+        );
+      } catch (error) {
+        modal.close(); await refresh();
+        toast(`${kind === "bug" ? "Defect" : "Requirement"} saved; attachment update failed: ${error.message}`);
+        return;
+      }
       modal.close(); await refresh();
       toast(kind === "bug" && !isEdit ? "Defect logged" : "Saved");
     } catch (e) { $("#formError").textContent = e.message; }
@@ -2049,7 +3703,7 @@ $("#projectSelect").addEventListener("change", async e => {
   S.brdAnalysis = null;
   S.view = "overview"; S.viewHistory = [];
   if (S.project) await refresh();
-  else { S.requirements=[]; S.requirementSuggestions=[]; S.requirementDocs=[]; S.cases=[]; S.bugs=[]; S.apiDocs=[]; S.applications=[]; S.analyses=[]; render(); }
+  else { S.requirements=[]; S.requirementSuggestions=[]; S.requirementDocs=[]; S.cases=[]; S.bugs=[]; S.apiDocs=[]; S.applications=[]; render(); }
 });
 
 /* Top nav */
@@ -2086,4 +3740,6 @@ modal.addEventListener("close", () => { $("#saveModal").hidden = false; });
 $("#splashCreateBtn")?.addEventListener("click", () => openModal("project"));
 
 /* Load on start */
-loadProjects().catch(e => toast(e.message));
+bindProfileMenu();
+window.addEventListener("popstate", handleRouteChange);
+handleRouteChange();

@@ -6,7 +6,7 @@ set "PYTHON_ARGS="
 
 where py >nul 2>nul
 if errorlevel 1 goto try_python_command
-py -3 -c "import sys; raise SystemExit(sys.version_info < (3, 10))" >nul 2>nul
+py -3 -c "import sys; raise SystemExit(sys.version_info < (3, 10) or sys.version_info.releaselevel != 'final')" >nul 2>nul
 if errorlevel 1 goto try_python_command
 set "PYTHON_EXE=py"
 set "PYTHON_ARGS=-3"
@@ -15,7 +15,7 @@ goto run_app
 :try_python_command
 where python >nul 2>nul
 if errorlevel 1 goto find_python
-python -c "import sys; raise SystemExit(sys.version_info < (3, 10))" >nul 2>nul
+python -c "import sys; raise SystemExit(sys.version_info < (3, 10) or sys.version_info.releaselevel != 'final')" >nul 2>nul
 if errorlevel 1 goto find_python
 set "PYTHON_EXE=python"
 goto run_app
@@ -26,7 +26,7 @@ if defined PYTHON_EXE goto run_app
 
 where winget >nul 2>nul
 if errorlevel 1 goto no_python
-echo Python 3.10 or newer was not found on PATH or in common install locations.
+echo Stable Python 3.10 or newer was not found on PATH or in common install locations.
 set /p "INSTALL_PYTHON=Install Python 3.13 for your Windows user with winget now? [Y/N] "
 if /I not "%INSTALL_PYTHON%"=="Y" goto no_python
 winget install --id Python.Python.3.13 --exact --scope user --accept-source-agreements --accept-package-agreements
@@ -40,7 +40,7 @@ pause
 exit /b 1
 
 :run_app
-"%PYTHON_EXE%" %PYTHON_ARGS% -c "import cryptography, pypdf" >nul 2>nul
+"%PYTHON_EXE%" %PYTHON_ARGS% -c "import cryptography, pypdf, psycopg" >nul 2>nul
 if errorlevel 1 (
   echo Required Python packages are missing. Installing from requirements.txt...
   "%PYTHON_EXE%" %PYTHON_ARGS% -m pip --version >nul 2>nul
@@ -51,7 +51,7 @@ if errorlevel 1 (
   )
   "%PYTHON_EXE%" %PYTHON_ARGS% -m pip install -r requirements.txt
   if errorlevel 1 goto dependencies_failed
-  "%PYTHON_EXE%" %PYTHON_ARGS% -c "import cryptography, pypdf"
+  "%PYTHON_EXE%" %PYTHON_ARGS% -c "import cryptography, pypdf, psycopg"
   if errorlevel 1 goto dependencies_failed
 )
 echo Starting the QA Platform with "%PYTHON_EXE%"...
@@ -73,12 +73,19 @@ exit /b 1
 
 :find_installed_python
 for %%V in (314 313 312 311 310) do (
-  if not defined PYTHON_EXE if exist "%LocalAppData%\Programs\Python\Python%%V\python.exe" set "PYTHON_EXE=%LocalAppData%\Programs\Python\Python%%V\python.exe"
-  if not defined PYTHON_EXE if exist "%ProgramFiles%\Python%%V\python.exe" set "PYTHON_EXE=%ProgramFiles%\Python%%V\python.exe"
-  if not defined PYTHON_EXE if exist "C:\Python%%V\python.exe" set "PYTHON_EXE=C:\Python%%V\python.exe"
+  if not defined PYTHON_EXE if exist "%LocalAppData%\Programs\Python\Python%%V\python.exe" (
+    "%LocalAppData%\Programs\Python\Python%%V\python.exe" -c "import sys; raise SystemExit(sys.version_info < (3, 10) or sys.version_info.releaselevel != 'final')" >nul 2>nul
+    if not errorlevel 1 set "PYTHON_EXE=%LocalAppData%\Programs\Python\Python%%V\python.exe"
+  )
+  if not defined PYTHON_EXE if exist "%ProgramFiles%\Python%%V\python.exe" (
+    "%ProgramFiles%\Python%%V\python.exe" -c "import sys; raise SystemExit(sys.version_info < (3, 10) or sys.version_info.releaselevel != 'final')" >nul 2>nul
+    if not errorlevel 1 set "PYTHON_EXE=%ProgramFiles%\Python%%V\python.exe"
+  )
+  if not defined PYTHON_EXE if exist "C:\Python%%V\python.exe" (
+    "C:\Python%%V\python.exe" -c "import sys; raise SystemExit(sys.version_info < (3, 10) or sys.version_info.releaselevel != 'final')" >nul 2>nul
+    if not errorlevel 1 set "PYTHON_EXE=C:\Python%%V\python.exe"
+  )
 )
-if defined PYTHON_EXE "%PYTHON_EXE%" -c "import sys; raise SystemExit(sys.version_info < (3, 10))" >nul 2>nul
-if errorlevel 1 set "PYTHON_EXE="
 exit /b 0
 
 :install_failed
@@ -87,8 +94,8 @@ pause
 exit /b 1
 
 :no_python
-echo Python 3.10 or newer was not found.
+echo Stable Python 3.10 or newer was not found. Pre-release Python versions are not supported.
 echo Install Python from https://www.python.org/downloads/ and enable "Add Python to PATH".
-echo Then run this file again, or open a terminal here and run: py -3 app.py
+echo Then run this file again, or start the app with your stable Python interpreter.
 pause
 exit /b 1

@@ -40,6 +40,27 @@ import ai_provider
 
 
 class ServerStartupTests(unittest.TestCase):
+    def test_public_and_auth_routes_serve_the_single_page_application(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = app.create_server(
+                host="127.0.0.1",
+                port=0,
+                db_path=Path(temporary) / "qa.sqlite3",
+            )
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                for path in ("/", "/about", "/about/", "/privacy", "/terms", "/login", "/signup", "/workspace"):
+                    with self.subTest(path=path):
+                        with urllib.request.urlopen(f"{base_url}{path}") as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertIn(b'id="publicRoot"', response.read())
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+
     def test_default_port_conflict_uses_an_available_port(self):
         fallback_server = object()
         with patch.dict(os.environ, {}, clear=False):
@@ -67,6 +88,46 @@ class ServerStartupTests(unittest.TestCase):
                     app.create_startup_server("127.0.0.1", 8123)
 
         create_server.assert_called_once_with("127.0.0.1", 8123)
+
+    def test_separately_served_frontend_cors_preflight_and_auth_status(self):
+        origin = "http://127.0.0.1:3000"
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ, {"QA_CORS_ORIGINS": origin}
+        ):
+            server = app.create_server(
+                host="127.0.0.1",
+                port=0,
+                db_path=Path(temporary) / "qa.sqlite3",
+            )
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                preflight = urllib.request.Request(
+                    f"{base_url}/api/auth/status",
+                    headers={
+                        "Origin": origin,
+                        "Access-Control-Request-Method": "GET",
+                        "Access-Control-Request-Headers": "content-type",
+                    },
+                    method="OPTIONS",
+                )
+                with urllib.request.urlopen(preflight) as response:
+                    self.assertEqual(response.status, 204)
+                    self.assertEqual(response.headers["Access-Control-Allow-Origin"], origin)
+                    self.assertEqual(response.headers["Access-Control-Allow-Credentials"], "true")
+                    self.assertIn("GET", response.headers["Access-Control-Allow-Methods"])
+
+                request = urllib.request.Request(
+                    f"{base_url}/api/auth/status", headers={"Origin": origin}
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers["Access-Control-Allow-Origin"], origin)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
 
 
 def brd_analysis_fixture(**overrides):
@@ -1291,15 +1352,270 @@ class PlatformApiTests(unittest.TestCase):
         token = secrets.token_urlsafe(32)
         with self.server.admin_session_lock:
             self.server.admin_sessions.clear()
+            self.server.user_sessions.clear()
             self.server.admin_sessions[token] = time.time() + 3600
-        self.auth_cookie = f"trace_admin_session={token}"
+        self.admin_cookie = f"trace_admin_session={token}"
+        self.auth_cookie = self.admin_cookie
         with app.database(self.db_path) as db:
             db.execute("DELETE FROM projects")
+            db.execute("DELETE FROM custom_fields")
+            db.execute("DELETE FROM teams")
+            db.execute("DELETE FROM users")
+            db.execute("DELETE FROM audit_events")
+            db.execute(
+                """UPDATE global_admin_profile SET first_name='Global',
+                last_name='Administrator',email='global-admin@local.qa',phone='',
+                profile_image_type='',profile_image_data=NULL,updated_at=? WHERE id=1""",
+                (app.timestamp(),),
+            )
             db.execute("DELETE FROM ai_provider_configs WHERE provider != 'local'")
             db.execute(
                 "UPDATE ai_settings SET provider='local',updated_at=? WHERE id=1",
                 (app.timestamp(),),
             )
+
+    def test_custom_fields_are_module_scoped_validated_and_persisted(self):
+        status, _ = self.request("/api/custom-fields", "POST", {
+            "module_key": "bugs", "name": "environment", "label": "Environment",
+            "field_type": "dropdown", "required": True,
+            "options": ["Development", "QA", "Production"],
+        }, authenticated=False)
+        self.assertEqual(status, 401)
+
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Custom fields", "project_key": "CFIELD", "qa_owner": "QA",
+        })
+        _, text_field = self.request("/api/custom-fields", "POST", {
+            "module_key": "bugs", "name": "build_number", "label": "Build Number",
+            "field_type": "text", "required": True, "display_order": 2,
+        })
+        _, number_field = self.request("/api/custom-fields", "POST", {
+            "module_key": "bugs", "name": "retry_count", "label": "Retry Count",
+            "field_type": "number", "required": False, "display_order": 1,
+        })
+        _, dropdown_field = self.request("/api/custom-fields", "POST", {
+            "module_key": "bugs", "name": "environment", "label": "Environment",
+            "field_type": "dropdown", "required": True, "display_order": 0,
+            "options": ["Development", "QA", "Production"],
+        })
+        _, requirement_field = self.request("/api/custom-fields", "POST", {
+            "module_key": "requirements", "name": "customer_type",
+            "label": "Customer Type", "field_type": "text",
+        })
+
+        status, error = self.request(
+            f"/api/projects/{project['id']}/bugs", "POST", {"title": "Missing values"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("is required", error["error"])
+        status, error = self.request(
+            f"/api/projects/{project['id']}/bugs", "POST", {
+                "title": "Bad values",
+                "custom_fields": {
+                    str(text_field["id"]): "5.4.2",
+                    str(number_field["id"]): "3x",
+                    str(dropdown_field["id"]): "QA",
+                },
+            }
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("Retry Count must be a valid number", error["error"])
+        status, bug = self.request(
+            f"/api/projects/{project['id']}/bugs", "POST", {
+                "title": "Valid values",
+                "custom_fields": {
+                    str(text_field["id"]): "5.4.2",
+                    str(number_field["id"]): "3",
+                    str(dropdown_field["id"]): "Production",
+                },
+            }
+        )
+        self.assertEqual(status, 201)
+        fields = self.request(
+            f"/api/custom-fields?module=bugs&record_id={bug['id']}"
+        )[1]["fields"]
+        self.assertEqual(
+            {item["id"]: item["value"] for item in fields},
+            {
+                text_field["id"]: "5.4.2",
+                number_field["id"]: "3",
+                dropdown_field["id"]: "Production",
+            },
+        )
+        self.assertEqual(
+            self.request(f"/api/custom-fields?module=test-cases")[1]["fields"], []
+        )
+        self.assertEqual(
+            self.request(f"/api/custom-fields?module=requirements")[1]["fields"][0]["id"],
+            requirement_field["id"],
+        )
+
+        _, updated = self.request(
+            f"/api/projects/{project['id']}/bugs/{bug['id']}", "PATCH", {
+                "custom_fields": {str(text_field["id"]): "5.4.3"},
+            }
+        )
+        self.assertEqual(updated["title"], "Valid values")
+        values = self.request(
+            f"/api/custom-fields?module=bugs&record_id={bug['id']}"
+        )[1]["fields"]
+        self.assertEqual(
+            {item["id"]: item["value"] for item in values}[number_field["id"]], "3"
+        )
+        status, error = self.request(
+            f"/api/custom-fields/{dropdown_field['id']}", "DELETE"
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("Deactivate it", error["error"])
+
+        _, deactivated = self.request(
+            f"/api/custom-fields/{dropdown_field['id']}", "PATCH",
+            {"active": False},
+        )
+        self.assertFalse(deactivated["active"])
+        self.assertNotIn(
+            dropdown_field["id"],
+            {item["id"] for item in self.request(
+                f"/api/custom-fields?module=bugs&record_id={bug['id']}"
+            )[1]["fields"]},
+        )
+        inactive_fields = self.request(
+            f"/api/custom-fields?module=bugs&record_id={bug['id']}&include_inactive=true"
+        )[1]["fields"]
+        self.assertEqual(
+            {item["id"]: item["value"] for item in inactive_fields}[dropdown_field["id"]],
+            "Production",
+        )
+
+    def test_custom_fields_are_saved_on_project_requirement_and_test_case_records(self):
+        created_fields = {}
+        for module, name, label in (
+            ("projects", "customer_segment", "Customer Segment"),
+            ("requirements", "source_system", "Source System"),
+            ("test-cases", "execution_count", "Execution Count"),
+        ):
+            _, created_fields[module] = self.request("/api/custom-fields", "POST", {
+                "module_key": module, "name": name, "label": label,
+                "field_type": "text" if module != "test-cases" else "number",
+                "required": True,
+            })
+
+        project_field = created_fields["projects"]
+        status, _ = self.request("/api/projects", "POST", {
+            "name": "Project custom field", "project_key": "PROJCF", "qa_owner": "QA",
+        })
+        self.assertEqual(status, 400)
+        status, project = self.request("/api/projects", "POST", {
+            "name": "Project custom field", "project_key": "PROJCF", "qa_owner": "QA",
+            "custom_fields": {str(project_field["id"]): "Retail"},
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            self.request(f"/api/custom-fields?module=projects&record_id={project['id']}")[1]
+            ["fields"][0]["value"],
+            "Retail",
+        )
+
+        requirement_field = created_fields["requirements"]
+        req_path = f"/api/projects/{project['id']}/requirements"
+        status, _ = self.request(req_path, "POST", {"title": "Custom requirement"})
+        self.assertEqual(status, 400)
+        status, requirement = self.request(req_path, "POST", {
+            "title": "Custom requirement",
+            "custom_fields": {str(requirement_field["id"]): "CRM"},
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            self.request(
+                f"/api/custom-fields?module=requirements&record_id={requirement['id']}"
+            )[1]["fields"][0]["value"],
+            "CRM",
+        )
+
+        case_field = created_fields["test-cases"]
+        case_path = f"/api/projects/{project['id']}/test-cases"
+        status, _ = self.request(case_path, "POST", {"scenario": "Check flow"})
+        self.assertEqual(status, 400)
+        status, case = self.request(case_path, "POST", {
+            "scenario": "Check flow",
+            "custom_fields": {str(case_field["id"]): "2"},
+        })
+        self.assertEqual(status, 201)
+        _, edited_case = self.request(
+            f"{case_path}/{case['id']}", "PATCH",
+            {"custom_fields": {str(case_field["id"]): "3"}},
+        )
+        self.assertEqual(
+            self.request(
+                f"/api/custom-fields?module=test-cases&record_id={case['id']}"
+            )[1]["fields"][0]["value"],
+            "3",
+        )
+        self.assertEqual(edited_case["id"], case["id"])
+
+    def test_record_attachments_upload_list_view_download_remove_and_validate(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Attachments", "project_key": "ATTACH", "qa_owner": "QA",
+        })
+        _, bug = self.request(
+            f"/api/projects/{project['id']}/bugs", "POST", {"title": "Upload files"}
+        )
+        base = f"/api/projects/{project['id']}/attachments"
+        target = (
+            f"{base}?module=bugs&record_id={bug['id']}&filename=notes.txt"
+        )
+        status, attachment = self.raw_request(
+            target, b"Investigation notes", "application/octet-stream"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(attachment["filename"], "notes.txt")
+        self.assertEqual(attachment["file_size_bytes"], len(b"Investigation notes"))
+        status, items = self.request(
+            f"{base}?module=bugs&record_id={bug['id']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in items], [attachment["id"]])
+
+        view_request = urllib.request.Request(
+            self.base + f"{base}/{attachment['id']}/view",
+            headers={"Cookie": self.auth_cookie},
+        )
+        with urllib.request.urlopen(view_request) as response:
+            self.assertEqual(response.read(), b"Investigation notes")
+            self.assertIn("inline", response.headers["Content-Disposition"])
+        download_request = urllib.request.Request(
+            self.base + f"{base}/{attachment['id']}/download",
+            headers={"Cookie": self.auth_cookie},
+        )
+        with urllib.request.urlopen(download_request) as response:
+            self.assertEqual(response.read(), b"Investigation notes")
+            self.assertIn("attachment", response.headers["Content-Disposition"])
+
+        status, error = self.raw_request(
+            target, b"Investigation notes", "application/octet-stream"
+        )
+        self.assertEqual(status, 409)
+        status, error = self.raw_request(
+            target.replace("notes.txt", "payload.exe"),
+            b"not executable", "application/octet-stream",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("Unsupported attachment type", error["error"])
+        status, error = self.raw_request(
+            target.replace("notes.txt", "large.txt"),
+            b"x" * (app.MAX_ATTACHMENT_SIZE + 1), "application/octet-stream",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("maximum 5 MB", error["error"])
+
+        status, result = self.request(
+            f"{base}/{attachment['id']}", method="DELETE"
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["deleted"])
+        self.assertEqual(self.request(
+            f"{base}?module=bugs&record_id={bug['id']}"
+        )[1], [])
 
     def test_ai_settings_show_enabled_provider_without_exposing_credentials(self):
         status, settings = self.request("/api/ai/settings")
@@ -1361,6 +1677,595 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.request("/api/auth/status")[1]["authenticated"], False)
         self.assertEqual(self.request("/api/ai/test", "POST", {}, authenticated=False)[0], 401)
+
+    def test_signup_login_password_storage_and_server_side_permissions(self):
+        status, error = self.request("/api/projects", authenticated=False)
+        self.assertEqual(status, 401)
+
+        signup = urllib.request.Request(
+            self.base + "/api/auth/signup",
+            data=json.dumps({
+                "first_name": "First",
+                "last_name": "Admin",
+                "email": "first.admin@example.test",
+                "password": "SecurePassword123",
+                "confirm_password": "SecurePassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(signup) as response:
+            self.assertEqual(response.status, 201)
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+            created = json.loads(response.read())
+        self.assertEqual(created["user"]["role_name"], "User")
+        self.assertNotEqual(created["user"]["role_name"], "Global Admin")
+        self.assertEqual(self.request("/api/auth/status")[1]["user"]["email"], "first.admin@example.test")
+        user_cookie = self.auth_cookie
+        with app.database(self.db_path) as db:
+            stored = db.execute(
+                "SELECT password_hash FROM users WHERE email=?",
+                ("first.admin@example.test",),
+            ).fetchone()["password_hash"]
+        self.assertTrue(stored.startswith("pbkdf2_sha256$"))
+        self.assertNotIn("SecurePassword123", stored)
+        self.assertEqual(
+            self.request("/api/auth/signup", "POST", {
+                "first_name": "Other", "last_name": "User",
+                "email": "first.admin@example.test",
+                "password": "SecurePassword123",
+                "confirm_password": "SecurePassword123",
+            }, authenticated=False)[0],
+            409,
+        )
+
+        self.auth_cookie = self.admin_cookie
+        _, role = self.request("/api/roles", "POST", {
+            "name": "Read only project access",
+            "description": "May only view projects.",
+            "permissions": ["projects.view"],
+        })
+        _, user = self.request("/api/users", "POST", {
+            "first_name": "Read", "last_name": "Only",
+            "email": "reader@example.test", "password": "ReaderPassword123",
+            "role_id": role["id"],
+        })
+        _, manager_role = self.request("/api/roles", "POST", {
+            "name": "Limited account manager",
+            "permissions": [
+                "projects.view", "users.create", "roles.edit",
+                "roles.manage-permissions",
+            ],
+        })
+        _, manager = self.request("/api/users", "POST", {
+            "first_name": "Limited", "last_name": "Manager",
+            "email": "manager@example.test", "password": "ManagerPassword123",
+            "role_id": manager_role["id"],
+        })
+        admin_role_id = next(
+            item["id"] for item in self.request("/api/roles")[1]["roles"]
+            if item["name"] == "Global Admin"
+        )
+        login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "reader@example.test",
+                "password": "ReaderPassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(login) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(self.request("/api/projects")[0], 200)
+        self.assertEqual(
+            self.request("/api/projects", "POST", {
+                "name": "Forbidden", "project_key": "FORBIDDEN", "qa_owner": "Reader",
+            })[0],
+            403,
+        )
+        self.assertEqual(self.request("/api/roles")[0], 403)
+        self.assertEqual(self.request("/api/users")[0], 403)
+        self.assertEqual(self.request(f"/api/users/{user['id']}", "DELETE")[0], 403)
+
+        manager_login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "manager@example.test",
+                "password": "ManagerPassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(manager_login) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(self.request("/api/users", "POST", {
+            "first_name": "Escalated", "last_name": "User",
+            "email": "escalated@example.test", "password": "EscalatedPassword123",
+            "role_id": admin_role_id,
+        })[0], 403)
+        self.assertEqual(self.request(f"/api/roles/{role['id']}", "PATCH", {
+            "name": role["name"], "description": role["description"],
+            "status": role["status"], "permissions": ["projects.view", "users.edit"],
+        })[0], 403)
+        self.auth_cookie = user_cookie
+        self.assertEqual(self.request("/api/users", "POST", {
+            "first_name": "Self", "last_name": "Promoted",
+            "email": "self.promoted@example.test", "password": "SelfPromoted123",
+        })[0], 403)
+
+    def test_reserved_tenant_admin_account_is_promoted_and_scoped(self):
+        self.assertEqual(self.request("/api/auth/signup", "POST", {
+            "first_name": "Reserved", "last_name": "Admin",
+            "email": app.TENANT_ADMIN_EMAIL,
+            "password": "ReservedAdmin123",
+            "confirm_password": "ReservedAdmin123",
+        }, authenticated=False)[0], 409)
+
+        _, tenant_admin = self.request("/api/users", "POST", {
+            "first_name": "Workspace", "last_name": "Administrator",
+            "email": app.TENANT_ADMIN_EMAIL,
+            "password": "TenantAdminPassword123",
+        })
+        self.assertEqual(tenant_admin["role_name"], "User")
+        _, removed_user = self.request("/api/users", "POST", {
+            "first_name": "Tenant", "last_name": "Member",
+            "email": "tenant.member@example.test",
+            "password": "TenantMemberPassword123",
+        })
+        with app.database(self.db_path) as db:
+            now = app.timestamp()
+            db.execute(
+                """INSERT INTO tenants(name,slug,status,created_at,updated_at)
+                VALUES('Second Workspace','second-workspace','Active',?,?)""",
+                (now, now),
+            )
+            tenant_two = db.execute(
+                "SELECT id FROM tenants WHERE slug='second-workspace'"
+            ).fetchone()["id"]
+            user_role = db.execute(
+                "SELECT id FROM roles WHERE name='User'"
+            ).fetchone()["id"]
+            for user_id in (tenant_admin["id"], removed_user["id"]):
+                db.execute(
+                    """INSERT INTO tenant_memberships
+                    (tenant_id,user_id,role_id,status,created_at,updated_at)
+                    VALUES(?,?,?,'Active',?,?)""",
+                    (tenant_two, user_id, user_role, now, now),
+                )
+            project_cursor = db.execute(
+                """INSERT INTO projects
+                (tenant_id,project_key,name,qa_owner,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)""",
+                (tenant_two, "TENANT-TWO", "Second tenant project", "QA", now, now),
+            )
+            tenant_two_project_id = project_cursor.lastrowid
+
+        app.initialize(self.db_path)
+        with app.database(self.db_path) as db:
+            memberships = {
+                row["tenant_id"]: row["role_name"]
+                for row in db.execute(
+                    """SELECT m.tenant_id,r.name role_name
+                    FROM tenant_memberships m JOIN roles r ON r.id=m.role_id
+                    WHERE m.user_id=?""",
+                    (tenant_admin["id"],),
+                )
+            }
+        self.assertEqual(memberships[1], "Global Admin")
+        self.assertEqual(memberships[tenant_two], "User")
+
+        login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": app.TENANT_ADMIN_EMAIL,
+                "password": "TenantAdminPassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(login) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+            authenticated = json.loads(response.read())
+        self.assertEqual(authenticated["user"]["role_name"], "Global Admin")
+        self.assertIn("*", authenticated["permissions"])
+        self.assertEqual(self.request("/api/users")[0], 200)
+        self.assertNotIn(
+            tenant_two_project_id,
+            {item["id"] for item in self.request("/api/projects")[1]},
+        )
+        self.assertEqual(self.request(f"/api/projects/{tenant_two_project_id}")[0], 404)
+
+        self.assertEqual(
+            self.request(f"/api/users/{removed_user['id']}/deactivate", "POST", {})[0],
+            200,
+        )
+        member_login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "tenant.member@example.test",
+                "password": "TenantMemberPassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(member_login) as response:
+            member_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        for selected_tenant, expected_status in ((1, 401), (tenant_two, 200)):
+            scoped_projects = urllib.request.Request(
+                self.base + "/api/projects",
+                headers={
+                    "Cookie": member_cookie,
+                    "X-Tenant-ID": str(selected_tenant),
+                },
+            )
+            try:
+                with urllib.request.urlopen(scoped_projects) as response:
+                    scoped_status = response.status
+                    projects = json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                scoped_status = error.code
+                projects = []
+            self.assertEqual(scoped_status, expected_status)
+            if selected_tenant == tenant_two:
+                self.assertIn(tenant_two_project_id, {item["id"] for item in projects})
+
+        self.assertEqual(
+            self.request(f"/api/users/{removed_user['id']}/activate", "POST", {})[0],
+            200,
+        )
+        status, removal = self.request(
+            f"/api/users/{removed_user['id']}", method="DELETE"
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(removal["account_deleted"])
+        with app.database(self.db_path) as db:
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM users WHERE id=?", (removed_user["id"],)
+            ).fetchone())
+            self.assertIsNone(db.execute(
+                """SELECT 1 FROM tenant_memberships
+                WHERE user_id=? AND tenant_id=1""",
+                (removed_user["id"],),
+            ).fetchone())
+            self.assertIsNotNone(db.execute(
+                """SELECT 1 FROM tenant_memberships
+                WHERE user_id=? AND tenant_id=?""",
+                (removed_user["id"], tenant_two),
+            ).fetchone())
+            event = db.execute(
+                """SELECT action,tenant_id FROM audit_events
+                WHERE target_id=? ORDER BY id DESC LIMIT 1""",
+                (str(removed_user["id"]),),
+            ).fetchone()
+        self.assertEqual(event["action"], "tenant_membership.removed")
+        self.assertEqual(event["tenant_id"], 1)
+
+        other_tenant_request = urllib.request.Request(
+            self.base + "/api/users",
+            headers={
+                "Cookie": self.auth_cookie,
+                "X-Tenant-ID": str(tenant_two),
+            },
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(other_tenant_request)
+        self.assertEqual(error.exception.code, 403)
+
+    def test_profile_password_teams_memberships_and_audit(self):
+        signup = urllib.request.Request(
+            self.base + "/api/auth/signup",
+            data=json.dumps({
+                "first_name": "Workspace", "last_name": "Admin",
+                "email": "workspace.admin@example.test",
+                "password": "SecurePassword123",
+                "confirm_password": "SecurePassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(signup) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        status, profile = self.request("/api/profile")
+        self.assertEqual(status, 200)
+        self.assertNotIn("password_hash", profile)
+        _, updated = self.request("/api/profile", "PATCH", {
+            "first_name": "Updated", "last_name": "Admin",
+            "email": "updated.admin@example.test", "phone": "+1 555 0100",
+        })
+        self.assertEqual(updated["first_name"], "Updated")
+        self.assertEqual(updated["email"], "updated.admin@example.test")
+        with app.database(self.db_path) as db:
+            profile_event = db.execute(
+                """SELECT details_json FROM audit_events
+                WHERE action='user.profile_updated' ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        profile_details = json.loads(profile_event["details_json"])
+        self.assertEqual(profile_details["previous"]["email"], "workspace.admin@example.test")
+        self.assertEqual(profile_details["new"]["email"], "updated.admin@example.test")
+        self.assertNotIn("password_hash", profile_details["new"])
+        self.assertEqual(self.request("/api/profile/password", "PATCH", {
+            "current_password": "SecurePassword123",
+            "new_password": "ChangedPassword456",
+            "confirm_password": "ChangedPassword456",
+        })[0], 200)
+        bad_login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "updated.admin@example.test",
+                "password": "SecurePassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(bad_login)
+        self.assertEqual(error.exception.code, 401)
+
+        self.auth_cookie = self.admin_cookie
+        qa_role = next(
+            item for item in self.request("/api/roles")[1]["roles"]
+            if item["name"] == "QA Engineer"
+        )
+        _, member = self.request("/api/users", "POST", {
+            "first_name": "Team", "last_name": "Member",
+            "email": "team.member@example.test",
+            "password": "TeamMemberPassword123",
+            "role_id": qa_role["id"],
+        })
+        _, team = self.request("/api/teams", "POST", {
+            "name": "Regression QA", "description": "Release regression testing",
+            "owner_user_id": member["id"],
+        })
+        self.assertEqual(team["member_count"], 1)
+        _, members = self.request(f"/api/teams/{team['id']}/members")
+        self.assertEqual({item["id"] for item in members}, {member["id"]})
+        self.assertEqual(
+            self.request(f"/api/teams/{team['id']}/members/{member['id']}", "DELETE")[0],
+            409,
+        )
+        self.request(f"/api/teams/{team['id']}", "PATCH", {
+            "name": team["name"], "description": team["description"],
+            "owner_user_id": profile["id"], "status": team["status"],
+        })
+        self.assertEqual(
+            self.request(f"/api/teams/{team['id']}/members/{member['id']}", "DELETE")[0],
+            200,
+        )
+        self.assertEqual(self.request(f"/api/teams/{team['id']}", "DELETE")[0], 200)
+        _, events = self.request("/api/audit-events")
+        self.assertTrue(any(event["action"] == "user.password_changed" for event in events))
+        self.assertTrue(any(event["action"] == "team.member_removed" for event in events))
+
+    def test_tenant_rbac_user_lifecycle_and_audit(self):
+        _, user = self.request("/api/users", "POST", {
+            "first_name": "Normal", "last_name": "User",
+            "email": "lifecycle.user@example.test",
+            "password": "LifecyclePassword123",
+        })
+        self.assertEqual(user["role_name"], "User")
+        self.assertEqual(user["tenant_id"], 1)
+        with app.database(self.db_path) as db:
+            membership = db.execute(
+                """SELECT tenant_id,status FROM tenant_memberships
+                WHERE user_id=?""",
+                (user["id"],),
+            ).fetchone()
+            user_permissions = app.QAHandler.user_permissions(
+                db, {"id": user["id"], "role_name": "User", "role_id": user["role_id"]}
+            )
+            db.execute(
+                """INSERT INTO tenants(name,slug,status,created_at,updated_at)
+                VALUES('Other Workspace','other-workspace','Active',?,?)""",
+                (app.timestamp(), app.timestamp()),
+            )
+            other_tenant_id = db.execute(
+                "SELECT id FROM tenants WHERE slug='other-workspace'"
+            ).fetchone()["id"]
+            now = app.timestamp()
+            cursor = db.execute(
+                """INSERT INTO projects
+                (tenant_id,project_key,name,qa_owner,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)""",
+                (other_tenant_id, "TENANT-B", "Other tenant project", "QA", now, now),
+            )
+            other_project_id = cursor.lastrowid
+        self.assertEqual(membership["tenant_id"], 1)
+        self.assertEqual(membership["status"], "Active")
+        self.assertNotIn("users.create", user_permissions)
+
+        user_login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "lifecycle.user@example.test",
+                "password": "LifecyclePassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(user_login) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+            authenticated_user = json.loads(response.read())["user"]
+        self.assertEqual(authenticated_user["role_name"], "User")
+        self.assertEqual(self.request("/api/users")[0], 403)
+        self.assertEqual(self.request(f"/api/users/{user['id']}", "PATCH", {
+            "first_name": "Promoted", "last_name": "User",
+            "email": "lifecycle.user@example.test", "role_id": user["role_id"],
+        })[0], 403)
+        project_ids = {row["id"] for row in self.request("/api/projects")[1]}
+        self.assertNotIn(other_project_id, project_ids)
+        self.assertEqual(self.request(f"/api/projects/{other_project_id}")[0], 404)
+
+        self.auth_cookie = self.admin_cookie
+        _, team_owner = self.request("/api/users", "POST", {
+            "first_name": "Team", "last_name": "Owner",
+            "email": "lifecycle.team.owner@example.test",
+            "password": "LifecycleOwnerPassword123",
+        })
+        team_status, team = self.request("/api/teams", "POST", {
+            "name": "Lifecycle Team", "owner_user_id": team_owner["id"],
+        })
+        self.assertEqual(team_status, 201)
+        qa_role = next(
+            item for item in self.request("/api/roles")[1]["roles"]
+            if item["name"] == "QA Engineer"
+        )
+        _, edited = self.request(f"/api/users/{user['id']}", "PATCH", {
+            "first_name": "Edited", "last_name": "User",
+            "email": "lifecycle.user@example.test", "phone": "",
+            "role_id": qa_role["id"], "status": "Active",
+            "team_ids": [team["id"]], "password": "",
+        })
+        self.assertEqual(edited["role_name"], "QA Engineer")
+        self.assertEqual(edited["team_ids"], [team["id"]])
+        self.assertEqual(
+            self.request(f"/api/users/{user['id']}/deactivate", "POST", {})[0], 200
+        )
+        inactive_login = self.request("/api/auth/login", "POST", {
+            "email": "lifecycle.user@example.test",
+            "password": "LifecyclePassword123",
+        }, authenticated=False)
+        self.assertEqual(inactive_login[0], 403)
+        self.assertEqual(
+            inactive_login[1]["error"],
+            "Your account has been deactivated.\nPlease contact your administrator.",
+        )
+        self.assertEqual(
+            self.request(f"/api/users/{user['id']}/activate", "POST", {})[0], 200
+        )
+
+        global_admin_role = next(
+            item for item in self.request("/api/roles")[1]["roles"]
+            if item["name"] == "Global Admin"
+        )
+        _, first_admin = self.request("/api/users", "POST", {
+            "first_name": "First", "last_name": "Global Admin",
+            "email": "first.global@example.test",
+            "password": "FirstGlobalPassword123",
+            "role_id": global_admin_role["id"],
+        })
+        with app.database(self.db_path) as db:
+            now = app.timestamp()
+            db.execute(
+                """INSERT INTO tenant_memberships
+                (tenant_id,user_id,role_id,status,created_at,updated_at)
+                VALUES(?,?,?,'Active',?,?)""",
+                (
+                    other_tenant_id, first_admin["id"],
+                    global_admin_role["id"], now, now,
+                ),
+            )
+        self.assertEqual(
+            self.request(f"/api/users/{first_admin['id']}/deactivate", "POST", {})[0],
+            409,
+        )
+        self.assertEqual(
+            self.request(f"/api/users/{first_admin['id']}", "DELETE")[1]["error"],
+            "The last active Global Admin cannot be deleted.",
+        )
+        _, second_admin = self.request("/api/users", "POST", {
+            "first_name": "Second", "last_name": "Global Admin",
+            "email": "second.global@example.test",
+            "password": "SecondGlobalPassword123",
+            "role_id": global_admin_role["id"],
+        })
+        self.assertEqual(
+            self.request(f"/api/users/{first_admin['id']}/deactivate", "POST", {})[0],
+            200,
+        )
+        self.assertEqual(
+            self.request(f"/api/users/{first_admin['id']}", "DELETE")[0], 200
+        )
+
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Preserved History", "project_key": "USER-HISTORY",
+            "qa_owner": "QA",
+        })
+        now = app.timestamp()
+        with app.database(self.db_path) as db:
+            db.execute(
+                """INSERT INTO requirements(project_id,requirement_key,title,created_at)
+                VALUES(?,?,?,?)""",
+                (project["id"], "REQ-USER-HISTORY", "Historical requirement", now),
+            )
+            db.execute(
+                """INSERT INTO test_cases(project_id,case_key,scenario,created_at,updated_at)
+                VALUES(?,?,?,?,?)""",
+                (project["id"], "TC-USER-HISTORY", "Historical test case", now, now),
+            )
+            db.execute(
+                """INSERT INTO bugs(project_id,bug_key,title,created_at,updated_at)
+                VALUES(?,?,?,?,?)""",
+                (project["id"], "BUG-USER-HISTORY", "Historical defect", now, now),
+            )
+        self.assertEqual(self.request(f"/api/users/{user['id']}", "DELETE")[0], 200)
+        self.assertEqual(
+            self.request(f"/api/users/{second_admin['id']}/deactivate", "POST", {})[0],
+            409,
+        )
+        self.assertEqual(
+            self.request(f"/api/users/{second_admin['id']}", "DELETE")[1]["error"],
+            "The last active Global Admin cannot be deleted.",
+        )
+        with app.database(self.db_path) as db:
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM users WHERE id=?", (user["id"],)
+            ).fetchone())
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM requirements WHERE project_id=?",
+                (project["id"],),
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM test_cases WHERE project_id=?",
+                (project["id"],),
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM bugs WHERE project_id=?",
+                (project["id"],),
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE action='user.deleted' AND target_id=?",
+                (str(user["id"]),),
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE action='user.role_changed' AND target_id=?",
+                (str(user["id"]),),
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE action='user.team_changed' AND target_id=?",
+                (str(user["id"]),),
+            ).fetchone()[0], 1)
+
+    def test_global_admin_profile_is_available_without_signing_out(self):
+        self.assertEqual(self.request("/api/profile", authenticated=False)[0], 401)
+        status, profile = self.request("/api/profile")
+        self.assertEqual(status, 200)
+        self.assertTrue(profile["global_admin"])
+        self.assertEqual(profile["role_name"], "Global Admin")
+        self.assertEqual(profile["first_name"], "Global")
+
+        status, updated = self.request("/api/profile", "PATCH", {
+            "first_name": "Workspace", "last_name": "Administrator",
+            "email": "workspace-admin@local.qa", "phone": "+1 555 0100",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(updated["global_admin"])
+        self.assertEqual(updated["email"], "workspace-admin@local.qa")
+
+        status, profile = self.request("/api/profile")
+        self.assertEqual(status, 200)
+        self.assertEqual(profile["first_name"], "Workspace")
+        status, auth = self.request("/api/auth/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(auth["authenticated"])
+        self.assertEqual(auth["user"]["role_name"], "Global Admin")
+        self.assertTrue(auth["user"]["global_admin"])
+        self.assertEqual(auth["user"]["email"], "workspace-admin@local.qa")
+        self.assertEqual(self.request("/api/profile/password", "PATCH", {
+            "current_password": "test-admin-password-123",
+            "new_password": "ChangedPassword456",
+            "confirm_password": "ChangedPassword456",
+        })[0], 401)
 
     def test_project_isolation_and_required_validation(self):
         status, one = self.request("/api/projects", "POST", {
@@ -1557,11 +2462,89 @@ class PlatformApiTests(unittest.TestCase):
         self.assertIn(b"<Valid credentials>", csv_bytes)
         self.assertIn(b"Not Covered", csv_bytes)
         self.assertIn(b"Sign in fails", csv_bytes)
+        _, defect_report = self.request(
+            f"/api/projects/{project['id']}/report/bugs.csv?q=Sign"
+        )
+        self.assertIn(b"Defect ID,Title,Description,Linked Test Case", defect_report)
+        self.assertIn(b"Sign in fails", defect_report)
+        self.assertNotIn(b"Requirement ID", defect_report)
+        _, testcase_report = self.request(
+            f"/api/projects/{project['id']}/report/test-cases.csv?q=Valid"
+        )
+        self.assertIn(b"Test Case ID,Title,Scenario", testcase_report)
+        self.assertIn(b"Valid sign in", testcase_report)
+        self.assertNotIn(b"Sign in fails", testcase_report)
+        self.assertNotIn(b"Requirement ID", testcase_report)
+        _, requirement_report = self.request(
+            f"/api/projects/{project['id']}/report/requirements.csv"
+        )
+        self.assertIn(b"Requirement ID,Title,Description", requirement_report)
+        self.assertNotIn(b"Test Case ID", requirement_report)
+        self.assertNotIn(b"Defect ID", requirement_report)
         saved_report = (
             self.server.storage_root / "projects" / str(project["id"]) /
             "exports" / "project-report.csv"
         )
         self.assertEqual(saved_report.read_bytes(), csv_bytes)
+        self.assertTrue(
+            (
+                self.server.storage_root / "projects" / str(project["id"]) /
+                "exports" / "Defect_Log_Report.csv"
+            ).is_file()
+        )
+
+    def test_defect_delete_requires_configured_permission(self):
+        project_status, project = self.request("/api/projects", "POST", {
+            "name": "Permission project", "project_key": "PERMBUG", "qa_owner": "QA",
+        })
+        self.assertEqual(project_status, 201)
+        _, defect = self.request(
+            f"/api/projects/{project['id']}/bugs", "POST",
+            {"title": "Protected defect"},
+        )
+        _, role = self.request("/api/roles", "POST", {
+            "name": "Defect viewer",
+            "permissions": ["projects.view", "bugs.view"],
+        })
+        _, user = self.request("/api/users", "POST", {
+            "first_name": "Defect", "last_name": "Viewer",
+            "email": "defect-viewer@example.test",
+            "password": "DefectViewer123",
+            "role_id": role["id"],
+        })
+        admin_cookie = self.auth_cookie
+        login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "defect-viewer@example.test",
+                "password": "DefectViewer123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(login) as response:
+            viewer_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+
+        self.auth_cookie = viewer_cookie
+        self.assertEqual(
+            self.request(f"/api/projects/{project['id']}/bugs/{defect['id']}", "DELETE")[0],
+            403,
+        )
+        self.assertEqual(len(self.request(f"/api/projects/{project['id']}/bugs")[1]), 1)
+
+        self.auth_cookie = admin_cookie
+        self.request(f"/api/roles/{role['id']}", "PATCH", {
+            "name": role["name"], "description": role["description"],
+            "status": role["status"],
+            "permissions": ["projects.view", "bugs.view", "bugs.delete"],
+        })
+        self.auth_cookie = viewer_cookie
+        status, deleted = self.request(
+            f"/api/projects/{project['id']}/bugs/{defect['id']}", "DELETE"
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(deleted["deleted"])
+        self.assertEqual(self.request(f"/api/projects/{project['id']}/bugs")[1], [])
 
     def test_project_delete_removes_records_and_archives_project_files(self):
         _, project = self.request("/api/projects", "POST", {
@@ -2690,120 +3673,34 @@ class PlatformApiTests(unittest.TestCase):
         self.assertIn(b"Evidence ID", report)
         self.assertIn(f"{evidence['id']}:result.png".encode(), report)
 
-    def test_rea_application_analysis_summary_history_and_project_isolation(self):
+    def test_app_analysis_is_coming_soon_and_does_not_create_jobs(self):
         _, project = self.request("/api/projects", "POST", {
             "name": "Analysis project", "project_key": "ANALYSIS", "qa_owner": "QA"
         })
-        _, other = self.request("/api/projects", "POST", {
-            "name": "Other analysis project", "project_key": "ANALYSIS2", "qa_owner": "QA"
-        })
-        source = Path(self.temp.name) / "source-app"
-        source.mkdir()
-        self.server.rea_runtime = lambda: {
-            "analysis_enabled": True, "available": True,
-            "provider": "REA static analysis via CLI",
-        }
-
-        def fake_runner(input_path, runtime):
-            return app.rea_result_summary({
-                "summary": {
-                    "kind": "summary",
-                    "fields": {
-                        "parent_operation": "analyze_javascript_application",
-                        "artifact": {"sha256": "a" * 64},
-                        "limitations": ["Some source files were outside analysis scope."],
-                    },
-                    "summary": {
-                        "format": "directory",
-                        "root_artifact_sha256": "a" * 64,
-                        "statistics": {
-                            "modules": 3, "relevant_files": 5, "text_bytes_read": 1200,
-                            "visited_ast_nodes": 25,
-                        },
-                        "electron": {"browser_windows": 1, "ipc": {"operations": 2}},
-                        "coverage": {"application": {"status": "partial"}},
-                    },
-                },
-                "evidence_bundle": {"path": "temporary", "bytes": 100},
-            }, input_path)
-
-        self.server.rea_runner = fake_runner
-        status, queued = self.request(
-            f"/api/projects/{project['id']}/analyses", "POST", {"input_path": str(source)}
-        )
-        self.assertEqual(status, 202)
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            _, result = self.request(f"/api/projects/{project['id']}/analyses/{queued['id']}")
-            if result["status"] in ("completed", "failed"):
-                break
-            time.sleep(0.02)
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["input_path"], str(source))
-        self.assertEqual(result["summary"]["provider_label"], "REA static analysis via CLI")
-        self.assertEqual(result["summary"]["statistics"]["modules"], 3)
-        self.assertEqual(result["summary"]["electron"]["ipc"]["operations"], 2)
-        self.assertEqual(len(result["summary"]["limitations"]), 1)
-        _, history = self.request(f"/api/projects/{project['id']}/analyses")
-        self.assertEqual([item["id"] for item in history], [queued["id"]])
-        _, isolated = self.request(f"/api/projects/{other['id']}/analyses")
-        self.assertEqual(isolated, [])
-        status, error = self.request(f"/api/projects/{other['id']}/analyses/{queued['id']}")
-        self.assertEqual(status, 404)
-
-    def test_rea_analysis_rejects_invalid_inputs_and_reports_unavailable_runtime(self):
-        _, project = self.request("/api/projects", "POST", {
-            "name": "Analysis validation", "project_key": "ANALYSIS-VALIDATION", "qa_owner": "QA"
-        })
-        source = Path(self.temp.name) / "local-app"
-        source.mkdir()
-        archive = Path(self.temp.name) / "not-an-app.zip"
-        archive.write_bytes(b"not accepted")
-        self.server.rea_runtime = lambda: {
-            "analysis_enabled": True, "available": True, "provider": "REA static analysis via CLI"
-        }
-        for path in ("relative/path", str(archive), str(Path(self.temp.name) / "missing")):
-            status, error = self.request(
-                f"/api/projects/{project['id']}/analyses", "POST", {"input_path": path}
-            )
-            self.assertEqual(status, 400)
-            self.assertTrue(error["error"])
-        self.server.rea_runtime = lambda: {
-            "analysis_enabled": False, "available": False,
-            "reason": "REA's compiled CLI runtime is missing.",
-        }
         status, error = self.request(
-            f"/api/projects/{project['id']}/analyses", "POST", {"input_path": str(source)}
+            f"/api/projects/{project['id']}/analyses",
+            "POST",
+            {"input_path": "unused"},
         )
         self.assertEqual(status, 503)
-        self.assertIn("compiled CLI runtime is missing", error["error"])
+        self.assertEqual(error["error"], "App Analysis is coming soon.")
+        with app.database(self.server.db_path) as db:
+            cursor = db.execute(
+                """INSERT INTO application_analyses
+                (project_id,input_path,status,summary_json,created_at,completed_at)
+                VALUES(?,?,'completed',?,?,?)""",
+                (
+                    project["id"],
+                    "C:/legacy-app",
+                    json.dumps({"statistics": {"modules": 2}}),
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:01:00+00:00",
+                ),
+            )
+            legacy_analysis_id = cursor.lastrowid
         _, history = self.request(f"/api/projects/{project['id']}/analyses")
-        self.assertEqual(history, [])
-
-    def test_rea_analysis_process_failure_is_saved_in_history(self):
-        _, project = self.request("/api/projects", "POST", {
-            "name": "Analysis failure", "project_key": "ANALYSIS-FAIL", "qa_owner": "QA"
-        })
-        source = Path(self.temp.name) / "failure-app"
-        source.mkdir()
-        self.server.rea_runtime = lambda: {"analysis_enabled": True, "available": True}
-
-        def fail_runner(input_path, runtime):
-            raise RuntimeError("REA CLI exited with status 1. Runtime build is missing.")
-
-        self.server.rea_runner = fail_runner
-        status, queued = self.request(
-            f"/api/projects/{project['id']}/analyses", "POST", {"input_path": str(source)}
-        )
-        self.assertEqual(status, 202)
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            _, result = self.request(f"/api/projects/{project['id']}/analyses/{queued['id']}")
-            if result["status"] == "failed":
-                break
-            time.sleep(0.02)
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("Runtime build is missing", result["error"])
+        self.assertEqual([item["id"] for item in history], [legacy_analysis_id])
+        self.assertEqual(history[0]["summary"]["statistics"]["modules"], 2)
 
     @staticmethod
     def png_image():

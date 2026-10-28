@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 350" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#121312" />
+      <stop offset="100%" stop-color="#090a09" />
+    </linearGradient>
+
+    <!-- Icon Top Bar Gradient -->
+    <linearGradient id="topBarGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#aef73e" />
+      <stop offset="100%" stop-color="#8ce319" />
+    </linearGradient>
+
+    <!-- Icon Stem Light Gradient -->
+    <linearGradient id="stemLeftGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#9ded29" />
+      <stop offset="100%" stop-color="#69c210" />
+    </linearGradient>
+
+    <!-- Icon Stem Shadow Gradient -->
+    <linearGradient id="stemRightGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5fa913" />
+      <stop offset="100%" stop-color="#3b6f07" />
+    </linearGradient>
+
+    <!-- Divider Glow Gradient -->
+    <linearGradient id="dividerGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#8de31b" stop-opacity="0" />
+      <stop offset="50%" stop-color="#8de31b" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#8de31b" stop-opacity="0" />
+    </linearGradient>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect width="1000" height="350" fill="url(#bgGrad)" />
+
+  <!-- ==================== LOGO ICON MARK ==================== -->
+  <g transform="translate(45, 45)">
+    <!-- Outer Box (260x260, Center is X = 130) -->
+    <rect x="0" y="0" width="260" height="260" rx="64" ry="64" fill="#0f110f" stroke="#8de31b" stroke-width="8" />
+
+    <!-- 'T' Mark (Center line of stem aligned exactly to X = 130) -->
+    <g>
+      <!-- Top Horizontal Bar -->
+      <path d="M 62,80 C 56,110 68,122 90,122 L 195,122 C 204,122 208,116 204,109 L 180,84 C 175,79 169,78 162,78 Z" fill="url(#topBarGrad)" />
+
+      <!-- Vertical Stem - Left Light Facet (Width 22px, X: 108 to 130) -->
+      <polygon points="108,122 130,104 130,192 108,219" fill="url(#stemLeftGrad)" />
+
+      <!-- Vertical Stem - Right Shadow Facet (Width 22px, X: 130 to 152) -->
+      <polygon points="130,104 152,122 130,219 130,179" fill="url(#stemRightGrad)" />
+    </g>
+  </g>
+
+  <!-- Vertical Divider Line -->
+  <line x1="345" y1="105" x2="345" y2="245" stroke="url(#dividerGrad)" stroke-width="2.5" />
+
+  <!-- ==================== BRAND NAME: TRACE ==================== -->
+  <g fill="#FFFFFF">
+    <!-- T -->
+    <path d="M 378,112 L 442,112 L 442,126 L 417,126 L 417,178 L 403,178 L 403,126 L 378,126 Z" />
+
+    <!-- R -->
+    <path d="M 456,112 L 490,112 C 504,112 513,118 513,129 C 513,138 506,144 496,145 L 515,178 L 499,178 L 482,147 L 470,147 L 470,178 L 456,178 Z M 470,124 L 470,136 L 488,136 C 495,136 499,133 499,129 C 499,125 495,124 488,124 Z" />
+
+    <!-- A -->
+    <path d="M 547,112 L 562,112 L 590,178 L 575,178 L 568,161 L 541,161 L 534,178 L 519,178 Z M 546,149 L 563,149 L 555,130 Z" />
+
+    <!-- C -->
+    <path d="M 645,126 C 638,116 627,112 613,112 C 596,112 584,125 584,145 C 584,165 596,178 613,178 C 627,178 638,174 645,164 L 645,150 L 631,150 L 631,162 C 627,166 620,167 614,167 C 603,167 598,158 598,145 C 598,132 603,123 614,123 C 620,123 627,124 631,128 L 631,140 L 645,140 Z" />
+
+    <!-- E (Three Bars) -->
+    <path d="M 660,112 L 715,112 L 715,124 L 660,124 Z" />
+    <path d="M 660,139 L 715,139 L 715,151 L 660,151 Z" />
+    <path d="M 660,166 L 715,166 L 715,178 L 660,178 Z" />
+  </g>
+
+  <!-- Green Dot inside A -->
+  <circle cx="554.5" cy="170" r="6" fill="#8de31b" />
+
+  <!-- Tagline -->
+  <text x="378" y="222" fill="#FFFFFF" font-family="system-ui, -apple-system, &#39;Segoe UI&#39;, Roboto, sans-serif" font-size="16.5" font-weight="300" letter-spacing="9" opacity="0.9">AI-POWERED QA WORKSPACE</text>
+</svg>

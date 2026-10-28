@@ -9,6 +9,7 @@ import ipaddress
 import hmac
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -18,7 +19,6 @@ import binascii
 import shutil
 import secrets
 import struct
-import subprocess
 import threading
 import time
 import traceback
@@ -32,7 +32,18 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
-from qa_platform.core.config import ROOT, database_path, server_address
+from qa_platform.core.config import (
+    DATA_ROOT,
+    FRONTEND_ROOT,
+    cors_origins,
+    database_connection,
+    server_address,
+)
+from qa_platform.core.database import (
+    DATABASE_ERRORS,
+    DATABASE_INTEGRITY_ERRORS,
+    connect_database,
+)
 from application_zip import (
     MAX_ARCHIVE_BYTES,
     analyze_application_zip,
@@ -66,16 +77,11 @@ from requirement_documents import (
 from test_case_generator import MAX_GENERATED_CASES, TEST_TYPES, generate_project_cases
 
 
-REA_ROOT = ROOT.parent / "rea"
-REA_CLI = REA_ROOT / "scripts" / "rea.mjs"
-DB_PATH = database_path()
+DB_PATH = database_connection()
 MAX_BODY = 27 * 1024 * 1024
 MAX_OPENAPI_SIZE = 1_000_000
 MAX_EVIDENCE_SIZE = 5 * 1024 * 1024
-REA_ANALYSIS_TIMEOUT_SECONDS = 600
-REA_STDOUT_LIMIT = 2 * 1024 * 1024
-REA_STDERR_LIMIT = 1024 * 1024
-REA_EVIDENCE_LIMIT = 1024 * 1024 * 1024
+MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024
 OPENAPI_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 IMAGE_TYPES = {
     "image/png": ".png",
@@ -85,16 +91,249 @@ IMAGE_TYPES = {
 }
 STATUSES = ("Not Executed", "In Progress", "Pass", "Fail", "Blocked", "Skipped")
 BUG_STATUSES = ("Open", "In Progress", "Resolved", "Closed")
-REA_REQUIRED_RUNTIME = (
-    "dist/cli-runtime/cliBuiltinArguments.js",
-    "dist/cli-runtime/cli.js",
-    "dist/cli-runtime/cliOutput.js",
-    "dist/cli-runtime/cliResultOutput.js",
-)
+CUSTOM_FIELD_MODULES = {
+    "projects": ("projects", "Project"),
+    "requirements": ("requirements", "Requirement"),
+    "test-cases": ("test_cases", "Test Case"),
+    "bugs": ("bugs", "Defect"),
+}
+CUSTOM_FIELD_TYPES = ("text", "number", "dropdown")
+ATTACHMENT_TYPES = {
+    ".csv": "text/csv",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".json": "application/json",
+    ".md": "text/markdown",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".txt": "text/plain",
+    ".webp": "image/webp",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".zip": "application/zip",
+}
+PERMISSION_MODULES = {
+    "projects": ("view", "create", "edit", "delete"),
+    "requirements": ("view", "create", "edit", "delete"),
+    "test-cases": ("view", "create", "edit", "delete"),
+    "applications": ("view", "create", "edit", "delete"),
+    "api-docs": ("view", "create", "edit", "delete"),
+    "app-analysis": ("view", "create", "edit", "delete"),
+    "bugs": ("view", "create", "edit", "delete"),
+    "users": ("view", "create", "update", "edit", "delete", "activate", "deactivate", "change_role"),
+    "teams": ("view", "create", "edit", "delete", "manage-members"),
+    "roles": ("view", "create", "edit", "delete", "manage-permissions"),
+    "reports": ("view",),
+    "profile": ("view", "edit"),
+}
+ALL_PERMISSIONS = [
+    f"{module}.{action}"
+    for module, actions in PERMISSION_MODULES.items()
+    for action in actions
+]
+DEFAULT_ROLE_PERMISSIONS = {
+    "Global Admin": ["*"],
+    "User": [
+        "projects.view", "projects.create", "projects.edit",
+        "requirements.view", "requirements.create", "requirements.edit",
+        "test-cases.view", "test-cases.create", "test-cases.edit",
+        "applications.view", "applications.create", "applications.edit",
+        "api-docs.view", "api-docs.create", "api-docs.edit",
+        "app-analysis.view", "app-analysis.create",
+        "bugs.view", "bugs.create", "bugs.edit", "reports.view",
+        "teams.view", "profile.view", "profile.edit",
+    ],
+    "QA Engineer": [
+        "projects.view", "projects.create", "projects.edit",
+        "requirements.view", "requirements.create", "requirements.edit",
+        "test-cases.view", "test-cases.create", "test-cases.edit",
+        "applications.view", "applications.create", "applications.edit",
+        "api-docs.view", "api-docs.create", "api-docs.edit",
+        "app-analysis.view", "app-analysis.create",
+        "bugs.view", "bugs.create", "bugs.edit", "reports.view",
+        "teams.view", "profile.view", "profile.edit",
+    ],
+    "Viewer": [
+        "projects.view", "requirements.view", "test-cases.view",
+        "applications.view", "api-docs.view", "app-analysis.view",
+        "bugs.view", "reports.view", "profile.view", "profile.edit",
+    ],
+}
+TENANT_ADMIN_EMAIL = "global-admin@local.qa"
 
 
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def active_global_admin_count(db, tenant_id=None) -> int:
+    tenant_clause = " AND m.tenant_id=?" if tenant_id is not None else ""
+    parameters = (tenant_id,) if tenant_id is not None else ()
+    return db.execute(
+        """SELECT COUNT(DISTINCT u.id) FROM tenant_memberships m
+        JOIN users u ON u.id=m.user_id JOIN roles r ON r.id=m.role_id
+        WHERE r.name IN ('Admin','Global Admin')
+        AND m.status='Active' AND u.status='Active'""" + tenant_clause,
+        parameters,
+    ).fetchone()[0]
+
+
+def lock_global_admin_role(db) -> None:
+    # A no-op update serializes final-admin checks on SQLite and PostgreSQL.
+    db.execute(
+        "UPDATE roles SET updated_at=updated_at WHERE name='Global Admin'"
+    )
+
+
+def integrity_error_is(exc, *identifiers: str) -> bool:
+    constraint_name = getattr(getattr(exc, "diag", None), "constraint_name", "")
+    message = str(exc)
+    return any(identifier == constraint_name or identifier in message for identifier in identifiers)
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+    return f"pbkdf2_sha256$310000${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, rounds, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds)
+        )
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def audit_event(db, actor_id, action, target_type, target_id, details=None, tenant_id=None):
+    if tenant_id is None and actor_id is not None:
+        membership = db.execute(
+            """SELECT tenant_id FROM tenant_memberships
+            WHERE user_id=? AND status='Active' ORDER BY tenant_id LIMIT 1""",
+            (actor_id,),
+        ).fetchone()
+        tenant_id = membership["tenant_id"] if membership else None
+    db.execute(
+        """INSERT INTO audit_events
+        (actor_user_id,actor_label,action,target_type,target_id,tenant_id,details_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            actor_id, "Global Admin" if actor_id is None else None,
+            action, target_type, str(target_id) if target_id is not None else "",
+            tenant_id,
+            json.dumps(details or {}, ensure_ascii=True), timestamp(),
+        ),
+    )
+
+
+def user_public_dict(db, user_id, tenant_id=None):
+    membership_sql = """SELECT tenant_id,role_id FROM tenant_memberships
+        WHERE user_id=?"""
+    membership_params = [user_id]
+    if tenant_id is not None:
+        membership_sql += " AND tenant_id=?"
+        membership_params.append(tenant_id)
+    membership_sql += " ORDER BY CASE status WHEN 'Active' THEN 0 ELSE 1 END,tenant_id LIMIT 1"
+    membership = db.execute(membership_sql, membership_params).fetchone()
+    if not membership:
+        return None
+    row = db.execute(
+        """SELECT         u.id,u.first_name,u.last_name,u.email,u.phone,
+        CASE WHEN u.status='Active' THEN m.status ELSE u.status END status,u.created_at,
+        u.last_login_at,r.id role_id,r.name role_name,m.tenant_id,
+        GROUP_CONCAT(t.name, ', ') team_names,GROUP_CONCAT(t.id, ',') team_ids
+        FROM users u
+        JOIN tenant_memberships m ON m.user_id=u.id AND m.tenant_id=?
+        JOIN roles r ON r.id=m.role_id
+        LEFT JOIN team_memberships tm ON tm.user_id=u.id
+        LEFT JOIN teams t ON t.id=tm.team_id AND t.tenant_id=m.tenant_id
+        WHERE u.id=? GROUP BY u.id,m.tenant_id,m.status,r.id,r.name""",
+        (membership["tenant_id"], user_id),
+    ).fetchone()
+    result = dict(row) if row else None
+    if result:
+        result["team_ids"] = [
+            int(item) for item in (result.pop("team_ids") or "").split(",") if item
+        ]
+    return result
+
+
+def sync_user_teams(db, user_id, tenant_id, team_ids, actor_id):
+    if team_ids is None:
+        return
+    if not isinstance(team_ids, list):
+        raise ValueError("Teams must be provided as a list.")
+    normalized = []
+    for value in team_ids:
+        if isinstance(value, bool):
+            raise ValueError("Team IDs must be positive integers.")
+        try:
+            team_id = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("Team IDs must be positive integers.")
+        if team_id <= 0:
+            raise ValueError("Team IDs must be positive integers.")
+        if team_id not in normalized:
+            normalized.append(team_id)
+    available = {
+        row["id"] for row in db.execute(
+            """SELECT id FROM teams WHERE tenant_id=? AND status='Active'
+            AND id IN ({})""".format(",".join("?" for _ in normalized) or "NULL"),
+            (tenant_id, *normalized),
+        )
+    }
+    if available != set(normalized):
+        raise ValueError("Choose active teams from the user's workspace.")
+    previous = [
+        row["team_id"] for row in db.execute(
+            """SELECT tm.team_id FROM team_memberships tm
+            JOIN teams t ON t.id=tm.team_id
+            WHERE tm.user_id=? AND t.tenant_id=? ORDER BY tm.team_id""",
+            (user_id, tenant_id),
+        )
+    ]
+    for team_id in set(previous) - set(normalized):
+        db.execute(
+            "DELETE FROM team_memberships WHERE team_id=? AND user_id=?",
+            (team_id, user_id),
+        )
+    for team_id in set(normalized) - set(previous):
+        db.execute(
+            """INSERT OR IGNORE INTO team_memberships(team_id,user_id,added_at)
+            VALUES(?,?,?)""",
+            (team_id, user_id, timestamp()),
+        )
+    if set(previous) != set(normalized):
+        audit_event(
+            db, actor_id, "user.team_changed", "user", user_id,
+            {"previous": previous, "new": sorted(normalized)},
+            tenant_id=tenant_id,
+        )
+
+
+def sync_role_permissions(db, role_id, permissions):
+    db.execute("DELETE FROM role_permissions WHERE role_id=?", (role_id,))
+    for permission in permissions:
+        db.execute(
+            "INSERT INTO role_permissions(role_id,permission_key) VALUES(?,?)",
+            (role_id, permission),
+        )
+
+
+def role_permission_keys(db, role_id):
+    return [
+        row["permission_key"] for row in db.execute(
+            "SELECT permission_key FROM role_permissions WHERE role_id=? ORDER BY permission_key",
+            (role_id,),
+        )
+    ]
 
 
 def project_storage_dir(storage_root: Path | str, project_id: int) -> Path:
@@ -108,11 +347,51 @@ def ensure_project_storage(storage_root: Path | str, project_id: int) -> Path:
     return project_dir
 
 
-def connect(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
-    db = sqlite3.connect(str(db_path))
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
-    return db
+def cleanup_record_form_data(db, module_key: str, record_id: int) -> None:
+    db.execute(
+        "DELETE FROM custom_field_values WHERE module_key=? AND record_id=?",
+        (module_key, record_id),
+    )
+    db.execute(
+        "DELETE FROM form_attachments WHERE module_key=? AND record_id=?",
+        (module_key, record_id),
+    )
+
+
+def cleanup_project_form_data(db, project_id: int) -> None:
+    db.execute(
+        """DELETE FROM custom_field_values WHERE
+        (module_key='projects' AND record_id=?) OR
+        (module_key='requirements' AND record_id IN
+            (SELECT id FROM requirements WHERE project_id=?)) OR
+        (module_key='test-cases' AND record_id IN
+            (SELECT id FROM test_cases WHERE project_id=?)) OR
+        (module_key='bugs' AND record_id IN
+            (SELECT id FROM bugs WHERE project_id=?))""",
+        (project_id, project_id, project_id, project_id),
+    )
+    db.execute("DELETE FROM form_attachments WHERE project_id=?", (project_id,))
+
+
+def sync_project_tenant_data(db, project_id: int) -> None:
+    for table in (
+        "requirements", "requirement_documents", "requirement_analysis_previews",
+        "requirement_suggestions", "test_cases", "bugs", "form_attachments",
+        "api_docs", "api_endpoints", "execution_evidence",
+        "application_analyses", "application_uploads",
+    ):
+        db.execute(
+            f"""UPDATE {table} SET tenant_id=(
+                SELECT tenant_id FROM projects WHERE id=?
+            ) WHERE project_id=? AND tenant_id<>(
+                SELECT tenant_id FROM projects WHERE id=?
+            )""",
+            (project_id, project_id, project_id),
+        )
+
+
+def connect(db_path: Path | str = DB_PATH):
+    return connect_database(db_path)
 
 
 @contextmanager
@@ -129,6 +408,14 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
     with database(db_path) as db:
         db.executescript(
             """
+            CREATE TABLE IF NOT EXISTS tenants (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active','Inactive')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY,
                 project_key TEXT NOT NULL UNIQUE,
@@ -272,6 +559,75 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
                 updated_at TEXT NOT NULL,
                 UNIQUE(project_id, bug_key)
             );
+            CREATE TABLE IF NOT EXISTS custom_fields (
+                id INTEGER PRIMARY KEY,
+                module_key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                field_type TEXT NOT NULL CHECK(field_type IN ('text','number','dropdown')),
+                description TEXT NOT NULL DEFAULT '',
+                required INTEGER NOT NULL DEFAULT 0 CHECK(required IN (0,1)),
+                active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                display_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_custom_fields_module_name
+                ON custom_fields(module_key, lower(name));
+            CREATE TABLE IF NOT EXISTS custom_field_options (
+                id INTEGER PRIMARY KEY,
+                custom_field_id INTEGER NOT NULL REFERENCES custom_fields(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                value TEXT NOT NULL,
+                display_order INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(custom_field_id, value)
+            );
+            CREATE TABLE IF NOT EXISTS custom_field_values (
+                id INTEGER PRIMARY KEY,
+                custom_field_id INTEGER NOT NULL REFERENCES custom_fields(id) ON DELETE CASCADE,
+                module_key TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                UNIQUE(custom_field_id, module_key, record_id)
+            );
+            CREATE TABLE IF NOT EXISTS form_attachments (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                module_key TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                file_size_bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                file_data BLOB NOT NULL,
+                uploaded_at TEXT NOT NULL,
+                UNIQUE(module_key, record_id, sha256)
+            );
+            CREATE INDEX IF NOT EXISTS ix_custom_field_values_record
+                ON custom_field_values(module_key, record_id);
+            CREATE INDEX IF NOT EXISTS ix_form_attachments_record
+                ON form_attachments(project_id, module_key, record_id);
+            CREATE TRIGGER IF NOT EXISTS clean_requirement_form_data
+            AFTER DELETE ON requirements BEGIN
+                DELETE FROM custom_field_values WHERE module_key='requirements' AND record_id=OLD.id;
+                DELETE FROM form_attachments WHERE module_key='requirements' AND record_id=OLD.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS clean_test_case_form_data
+            AFTER DELETE ON test_cases BEGIN
+                DELETE FROM custom_field_values WHERE module_key='test-cases' AND record_id=OLD.id;
+                DELETE FROM form_attachments WHERE module_key='test-cases' AND record_id=OLD.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS clean_bug_form_data
+            AFTER DELETE ON bugs BEGIN
+                DELETE FROM custom_field_values WHERE module_key='bugs' AND record_id=OLD.id;
+                DELETE FROM form_attachments WHERE module_key='bugs' AND record_id=OLD.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS clean_project_form_data
+            AFTER DELETE ON projects BEGIN
+                DELETE FROM custom_field_values WHERE module_key='projects' AND record_id=OLD.id;
+                DELETE FROM form_attachments WHERE module_key='projects' AND record_id=OLD.id;
+            END;
             CREATE TABLE IF NOT EXISTS api_docs (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -338,6 +694,99 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
                 api_key_ciphertext BLOB,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS roles (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                description TEXT NOT NULL DEFAULT '',
+                permissions_json TEXT NOT NULL DEFAULT '[]',
+                tenant_id INTEGER REFERENCES tenants(id) ON DELETE CASCADE,
+                is_system INTEGER NOT NULL DEFAULT 0 CHECK(is_system IN (0,1)),
+                status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active','Inactive')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_hash TEXT NOT NULL,
+                role_id INTEGER NOT NULL REFERENCES roles(id),
+                phone TEXT NOT NULL DEFAULT '',
+                profile_image_type TEXT NOT NULL DEFAULT '',
+                profile_image_data BLOB,
+                status TEXT NOT NULL DEFAULT 'Active'
+                    CHECK(status IN ('Active','Inactive','Invited','Suspended')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS tenant_memberships (
+                id INTEGER PRIMARY KEY,
+                tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role_id INTEGER NOT NULL REFERENCES roles(id),
+                status TEXT NOT NULL DEFAULT 'Active'
+                    CHECK(status IN ('Active','Inactive','Invited','Suspended')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(tenant_id,user_id)
+            );
+            CREATE TABLE IF NOT EXISTS permissions (
+                key TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                permission_key TEXT NOT NULL REFERENCES permissions(key) ON DELETE CASCADE,
+                PRIMARY KEY(role_id,permission_key)
+            );
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS global_admin_profile (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                phone TEXT NOT NULL DEFAULT '',
+                profile_image_type TEXT NOT NULL DEFAULT '',
+                profile_image_data BLOB,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS teams (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                description TEXT NOT NULL DEFAULT '',
+                tenant_id INTEGER REFERENCES tenants(id) ON DELETE CASCADE,
+                owner_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active','Inactive')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS team_memberships (
+                team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY(team_id,user_id)
+            );
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY,
+                actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                actor_label TEXT,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL DEFAULT '',
+                tenant_id INTEGER REFERENCES tenants(id) ON DELETE SET NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_team_memberships_user ON team_memberships(user_id,team_id);
+            CREATE INDEX IF NOT EXISTS ix_tenant_memberships_user ON tenant_memberships(user_id,status,tenant_id);
+            CREATE INDEX IF NOT EXISTS ix_tenant_memberships_role ON tenant_memberships(role_id,status);
+            CREATE INDEX IF NOT EXISTS ix_audit_events_created ON audit_events(created_at DESC);
             CREATE INDEX IF NOT EXISTS ix_requirements_project ON requirements(project_id);
             CREATE INDEX IF NOT EXISTS ix_requirement_documents_project ON requirement_documents(project_id, id DESC);
             CREATE INDEX IF NOT EXISTS ix_requirement_suggestions_project
@@ -350,8 +799,152 @@ def initialize(db_path: Path | str = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS ix_evidence_execution ON execution_evidence(execution_id);
             CREATE INDEX IF NOT EXISTS ix_application_analyses_project ON application_analyses(project_id, id DESC);
             CREATE INDEX IF NOT EXISTS ix_application_uploads_project ON application_uploads(project_id, id DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_roles_name_ci ON roles(lower(name));
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_users_email_ci ON users(lower(email));
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_teams_name_ci ON teams(lower(name));
             """
         )
+        now = timestamp()
+        db.execute(
+            """INSERT OR IGNORE INTO tenants(id,name,slug,status,created_at,updated_at)
+            VALUES(1,'Default Workspace','default','Active',?,?)""",
+            (now, now),
+        )
+        for table_name in (
+            "projects", "requirements", "requirement_documents",
+            "requirement_analysis_previews", "requirement_suggestions",
+            "test_cases", "bugs", "custom_fields", "form_attachments",
+            "custom_field_values",
+            "api_docs", "api_endpoints", "execution_evidence",
+            "application_analyses", "application_uploads", "teams",
+        ):
+            table_columns = {
+                row["name"] for row in db.execute(f"PRAGMA table_info({table_name})")
+            }
+            if "tenant_id" not in table_columns:
+                db.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN tenant_id INTEGER NOT NULL DEFAULT 1"
+                )
+        db.execute("DROP INDEX IF EXISTS ux_custom_fields_module_name")
+        db.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS ux_custom_fields_tenant_module_name
+            ON custom_fields(tenant_id,module_key,lower(name))"""
+        )
+        audit_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(audit_events)")
+        }
+        if "tenant_id" not in audit_columns:
+            db.execute("ALTER TABLE audit_events ADD COLUMN tenant_id INTEGER")
+        if "actor_label" not in audit_columns:
+            db.execute("ALTER TABLE audit_events ADD COLUMN actor_label TEXT")
+        role_columns = {row["name"] for row in db.execute("PRAGMA table_info(roles)")}
+        if "tenant_id" not in role_columns:
+            db.execute("ALTER TABLE roles ADD COLUMN tenant_id INTEGER")
+        legacy_admin = db.execute(
+            "SELECT id FROM roles WHERE name='Admin' COLLATE NOCASE"
+        ).fetchone()
+        global_admin_role = db.execute(
+            "SELECT id FROM roles WHERE name='Global Admin' COLLATE NOCASE"
+        ).fetchone()
+        if legacy_admin and not global_admin_role:
+            db.execute(
+                "UPDATE roles SET name='Global Admin',description='System administrator',is_system=1 WHERE id=?",
+                (legacy_admin["id"],),
+            )
+        elif legacy_admin and global_admin_role:
+            db.execute(
+                "UPDATE users SET role_id=? WHERE role_id=?",
+                (global_admin_role["id"], legacy_admin["id"]),
+            )
+            db.execute(
+                "UPDATE tenant_memberships SET role_id=? WHERE role_id=?",
+                (global_admin_role["id"], legacy_admin["id"]),
+            )
+            db.execute(
+                "DELETE FROM role_permissions WHERE role_id=?",
+                (legacy_admin["id"],),
+            )
+            db.execute("DELETE FROM roles WHERE id=?", (legacy_admin["id"],))
+        db.execute(
+            """INSERT OR IGNORE INTO global_admin_profile
+            (id,first_name,last_name,email,created_at,updated_at)
+            VALUES(1,'Global','Administrator','global-admin@local.qa',?,?)""",
+            (now, now),
+        )
+        for role_name, permissions in DEFAULT_ROLE_PERMISSIONS.items():
+            db.execute(
+                """INSERT OR IGNORE INTO roles
+                (name,description,permissions_json,is_system,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?)""",
+                (
+                    role_name,
+                    "System administrator" if role_name == "Global Admin" else f"Default {role_name} access",
+                    json.dumps(permissions),
+                    int(role_name == "Global Admin"),
+                    "Active",
+                    timestamp(),
+                    timestamp(),
+                ),
+            )
+        db.execute("INSERT OR IGNORE INTO permissions(key,description) VALUES('*','All permissions')")
+        for permission in ALL_PERMISSIONS:
+            db.execute(
+                "INSERT OR IGNORE INTO permissions(key,description) VALUES(?,?)",
+                (permission, permission.replace(".", " ").replace("-", " ").capitalize()),
+            )
+        for role in db.execute("SELECT id,permissions_json FROM roles"):
+            for permission in json.loads(role["permissions_json"]):
+                db.execute(
+                    "INSERT OR IGNORE INTO role_permissions(role_id,permission_key) VALUES(?,?)",
+                    (role["id"], permission),
+                )
+        for user in db.execute("SELECT id,role_id,status,created_at,updated_at FROM users"):
+            db.execute(
+                """INSERT OR IGNORE INTO tenant_memberships
+                (tenant_id,user_id,role_id,status,created_at,updated_at)
+                VALUES(1,?,?,?,?,?)""",
+                (
+                    user["id"], user["role_id"], user["status"],
+                    user["created_at"], user["updated_at"],
+                ),
+            )
+        tenant_admin_migration = db.execute(
+            "SELECT value FROM system_settings WHERE key='tenant_admin_account_promoted'"
+        ).fetchone()
+        if not tenant_admin_migration:
+            tenant_admin = db.execute(
+                """SELECT u.id,m.role_id,r.name role_name
+                FROM users u
+                JOIN tenant_memberships m ON m.user_id=u.id AND m.tenant_id=1
+                JOIN roles r ON r.id=m.role_id
+                WHERE lower(u.email)=?""",
+                (TENANT_ADMIN_EMAIL,),
+            ).fetchone()
+            if tenant_admin:
+                global_admin_role = db.execute(
+                    "SELECT id FROM roles WHERE name='Global Admin' AND status='Active'"
+                ).fetchone()
+                if not global_admin_role:
+                    raise ValueError("The Global Admin role is not available.")
+                if tenant_admin["role_id"] != global_admin_role["id"]:
+                    db.execute(
+                        """UPDATE tenant_memberships SET role_id=?,updated_at=?
+                        WHERE user_id=? AND tenant_id=1""",
+                        (global_admin_role["id"], now, tenant_admin["id"]),
+                    )
+                    audit_event(
+                        db, None, "user.role_changed", "user", tenant_admin["id"],
+                        {
+                            "previous": tenant_admin["role_name"],
+                            "new": "Global Admin",
+                            "source": "tenant_admin_account_migration",
+                        },
+                        tenant_id=1,
+                    )
+                db.execute(
+                    """INSERT INTO system_settings(key,value)
+                    VALUES('tenant_admin_account_promoted','true')"""
+                )
         requirement_columns = {
             row["name"] for row in db.execute("PRAGMA table_info(requirements)")
         }
@@ -527,6 +1120,262 @@ def validate_text(data, field: str, required: bool = False, limit: int = 12000) 
     return value
 
 
+def custom_field_options(db: sqlite3.Connection, field_id: int) -> list[dict]:
+    return [
+        dict(row) for row in db.execute(
+            """SELECT id,label,value,display_order FROM custom_field_options
+            WHERE custom_field_id=? ORDER BY display_order,id""",
+            (field_id,),
+        )
+    ]
+
+
+def custom_field_dict(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    field = dict(row)
+    field["required"] = bool(field["required"])
+    field["active"] = bool(field["active"])
+    field["options"] = custom_field_options(db, field["id"])
+    return field
+
+
+def record_tenant_id(db, module_key, record_id):
+    tables = {
+        "projects": ("projects", "id"),
+        "requirements": ("requirements", "project_id"),
+        "test-cases": ("test_cases", "project_id"),
+        "bugs": ("bugs", "project_id"),
+    }
+    if record_id is None or module_key not in tables:
+        return None
+    table, project_column = tables[module_key]
+    if module_key == "projects":
+        row = db.execute(
+            "SELECT tenant_id FROM projects WHERE id=?", (record_id,)
+        ).fetchone()
+    else:
+        row = db.execute(
+            f"""SELECT p.tenant_id FROM {table} r JOIN projects p
+            ON p.id=r.{project_column} WHERE r.id=?""",
+            (record_id,),
+        ).fetchone()
+    return row["tenant_id"] if row else None
+
+
+def validate_custom_field_values(
+    db: sqlite3.Connection,
+    module_key: str,
+    record_id: int,
+    values,
+    required_on_create: bool = False,
+) -> None:
+    if not isinstance(values, dict):
+        raise ValueError("Custom field values must be an object.")
+    tenant_id = record_tenant_id(db, module_key, record_id)
+    fields = db.execute(
+        """SELECT * FROM custom_fields
+        WHERE module_key=? AND active=1 AND (? IS NULL OR tenant_id=?)
+        ORDER BY display_order,id""",
+        (module_key, tenant_id, tenant_id),
+    ).fetchall()
+    field_by_id = {str(row["id"]): row for row in fields}
+    unknown = set(values) - field_by_id.keys()
+    if unknown:
+        raise ValueError("One or more custom fields are not configured for this form.")
+
+    normalized = {}
+    for field in fields:
+        field_id = str(field["id"])
+        value = values.get(field_id, "")
+        previous = None
+        if field_id not in values and not required_on_create:
+            previous = db.execute(
+                """SELECT value FROM custom_field_values
+                WHERE custom_field_id=? AND module_key=? AND record_id=?""",
+                (field["id"], module_key, record_id),
+            ).fetchone()
+            value = previous["value"] if previous else ""
+        if value is None:
+            value = ""
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            raise ValueError(f"{field['label']} must be a scalar value.")
+        value = str(value).strip()
+        if (
+            field["required"] and not value
+            and (
+                required_on_create or field_id in values
+                or previous is None or not previous["value"]
+            )
+        ):
+            raise ValueError(f"{field['label']} is required.")
+        if field["field_type"] == "text" and len(value) > 1000:
+            raise ValueError(f"{field['label']} is too long (maximum 1000 characters).")
+        if field["field_type"] == "number" and value:
+            try:
+                valid_number = math.isfinite(float(value))
+            except ValueError:
+                valid_number = False
+            if not valid_number:
+                raise ValueError(f"{field['label']} must be a valid number.")
+        if field["field_type"] == "dropdown" and value:
+            if not db.execute(
+                """SELECT 1 FROM custom_field_options
+                WHERE custom_field_id=? AND value=?""",
+                (field["id"], value),
+            ).fetchone():
+                raise ValueError(f"Choose a valid option for {field['label']}.")
+        normalized[field["id"]] = value
+
+    for field_id, value in normalized.items():
+        db.execute(
+            """INSERT INTO custom_field_values
+            (custom_field_id,module_key,record_id,tenant_id,value,updated_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(custom_field_id,module_key,record_id)
+            DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+            (field_id, module_key, record_id, tenant_id or 1, value, timestamp()),
+        )
+
+
+def custom_fields_for_record(
+    db: sqlite3.Connection, module_key: str, record_id: int | None = None,
+    include_inactive: bool = False, tenant_id: int | None = None,
+) -> list[dict]:
+    if module_key not in CUSTOM_FIELD_MODULES:
+        raise ValueError("Select a supported form/module.")
+    active_filter = "" if include_inactive else " AND active=1"
+    tenant_id = record_tenant_id(db, module_key, record_id) or tenant_id
+    rows = db.execute(
+        f"""SELECT * FROM custom_fields WHERE module_key=?{active_filter}
+        AND (? IS NULL OR tenant_id=?)
+        ORDER BY display_order,id""",
+        (module_key, tenant_id, tenant_id),
+    ).fetchall()
+    values = {}
+    if record_id is not None:
+        values = {
+            str(row["custom_field_id"]): row["value"]
+            for row in db.execute(
+                """SELECT custom_field_id,value FROM custom_field_values
+                WHERE module_key=? AND record_id=? AND (? IS NULL OR tenant_id=?)""",
+                (module_key, record_id, tenant_id, tenant_id),
+            )
+        }
+    result = []
+    for row in rows:
+        field = custom_field_dict(db, row)
+        field["value"] = values.get(str(row["id"]), "")
+        result.append(field)
+    return result
+
+
+def normalize_custom_field_options(field_type: str, raw_options) -> list[dict]:
+    if field_type != "dropdown":
+        if raw_options not in (None, []):
+            raise ValueError("Options are only supported for dropdown fields.")
+        return []
+    if not isinstance(raw_options, list) or not raw_options or len(raw_options) > 100:
+        raise ValueError("Dropdown fields need between 1 and 100 options.")
+    options = []
+    seen = set()
+    for index, option in enumerate(raw_options):
+        if isinstance(option, str):
+            label = option.strip()
+            value = label
+        elif isinstance(option, dict):
+            label = option.get("label", "")
+            value = option.get("value", label)
+            if not isinstance(label, str) or not isinstance(value, str):
+                raise ValueError("Dropdown option labels and values must be text.")
+            label, value = label.strip(), value.strip()
+        else:
+            raise ValueError("Dropdown options must be text or option objects.")
+        if not label or not value or len(label) > 200 or len(value) > 200:
+            raise ValueError("Dropdown option labels and values must contain 1 to 200 characters.")
+        if value.casefold() in seen:
+            raise ValueError("Dropdown option values must be unique.")
+        seen.add(value.casefold())
+        options.append({
+            "label": label,
+            "value": value,
+            "display_order": index,
+        })
+    return options
+
+
+def custom_field_configuration(data: dict, existing: sqlite3.Row | None = None) -> dict:
+    module_key = data.get(
+        "module_key", existing["module_key"] if existing else ""
+    )
+    if not isinstance(module_key, str) or module_key not in CUSTOM_FIELD_MODULES:
+        raise ValueError("Select a supported form/module.")
+    name = validate_text(
+        data if "name" in data else {"name": existing["name"] if existing else ""},
+        "name", True, 80,
+    )
+    label = validate_text(
+        data if "label" in data else {"label": existing["label"] if existing else ""},
+        "label", True, 120,
+    )
+    field_type = data.get(
+        "field_type", existing["field_type"] if existing else ""
+    )
+    if field_type not in CUSTOM_FIELD_TYPES:
+        raise ValueError("Select Text, Number, or Dropdown as the field type.")
+    description = validate_text(
+        data if "description" in data else {
+            "description": existing["description"] if existing else "",
+        },
+        "description", limit=500,
+    )
+    required = data.get(
+        "required", bool(existing["required"]) if existing else False
+    )
+    active = data.get("active", bool(existing["active"]) if existing else True)
+    if not isinstance(required, bool) or not isinstance(active, bool):
+        raise ValueError("Required and active must be boolean values.")
+    display_order = data.get(
+        "display_order", existing["display_order"] if existing else 0
+    )
+    if (
+        not isinstance(display_order, int)
+        or isinstance(display_order, bool)
+        or display_order < 0
+    ):
+        raise ValueError("Display order must be a non-negative integer.")
+    if "options" in data:
+        options = normalize_custom_field_options(field_type, data["options"])
+    elif existing:
+        options = [] if field_type != existing["field_type"] else None
+    elif field_type == "dropdown":
+        raise ValueError("Dropdown fields need between 1 and 100 options.")
+    else:
+        options = []
+    return {
+        "module_key": module_key,
+        "name": name,
+        "label": label,
+        "field_type": field_type,
+        "description": description,
+        "required": int(required),
+        "active": int(active),
+        "display_order": display_order,
+        "options": options,
+    }
+
+
+def record_belongs_to_project(
+    db: sqlite3.Connection, module_key: str, project_id: int, record_id: int
+) -> bool:
+    if module_key not in CUSTOM_FIELD_MODULES:
+        raise ValueError("Select a supported form/module.")
+    table = CUSTOM_FIELD_MODULES[module_key][0]
+    return bool(db.execute(
+        f"SELECT 1 FROM {table} WHERE id=? AND " +
+        ("id=?" if module_key == "projects" else "project_id=?"),
+        (record_id, record_id if module_key == "projects" else project_id),
+    ).fetchone())
+
+
 REQUIREMENT_CONTENT_FIELDS = (
     "title", "description", "acceptance_criteria", "business_rules",
     "validation_rules", "dependencies",
@@ -680,206 +1529,10 @@ def project_exists(db: sqlite3.Connection, project_id: int) -> bool:
     return db.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is not None
 
 
-def _supported_node_version(version: str) -> bool:
-    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", version)
-    if not match:
-        return False
-    major, minor, patch = (int(part) for part in match.groups())
-    return (
-        (major == 22 and (minor, patch) >= (23, 4))
-        or (major == 24 and (minor, patch) >= (22, 1))
-        or (major > 26 or (major == 26 and (minor, patch) >= (12, 1)))
-    )
 
 
-def rea_runtime(server=None) -> dict:
-    node = shutil.which("node")
-    node_version = None
-    reasons = []
-    if not node:
-        reasons.append("Node.js was not found on the server PATH.")
-    else:
-        try:
-            result = subprocess.run(
-                [node, "--version"],
-                cwd=str(REA_ROOT),
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-                shell=False,
-            )
-            node_version = result.stdout.strip()[:80]
-            if result.returncode != 0 or not _supported_node_version(node_version):
-                reasons.append("REA requires Node.js 22.23.4+, 24.22.1+, or 26.12.1+.")
-        except (OSError, subprocess.TimeoutExpired):
-            reasons.append("Node.js version could not be read.")
-
-    cli_available = REA_CLI.is_file()
-    if not cli_available:
-        reasons.append("The sibling rea/scripts/rea.mjs CLI entry was not found.")
-    missing_runtime = [
-        name for name in REA_REQUIRED_RUNTIME if not (REA_ROOT / name).is_file()
-    ]
-    if missing_runtime:
-        reasons.append("REA's compiled CLI runtime is missing; build REA in the sibling rea/ folder.")
-    if not (REA_ROOT / "node_modules").is_dir():
-        reasons.append("REA dependencies are not installed in the sibling rea/ folder.")
-
-    loopback = False
-    if server is not None:
-        try:
-            loopback = ipaddress.ip_address(server.server_address[0]).is_loopback
-        except ValueError:
-            loopback = False
-    else:
-        loopback = True
-    if not loopback:
-        reasons.append("REA analysis is disabled unless the QA server is bound to a loopback address.")
-    available = not reasons
-    return {
-        "available": available,
-        "analysis_enabled": available,
-        "provider": "REA static analysis via CLI",
-        "operation": "analyze_javascript_application",
-        "node_version": node_version,
-        "cli_available": cli_available,
-        "compiled_runtime_available": not missing_runtime,
-        "dependencies_available": (REA_ROOT / "node_modules").is_dir(),
-        "loopback_only": loopback,
-        "timeout_seconds": REA_ANALYSIS_TIMEOUT_SECONDS,
-        "output_limit_bytes": REA_STDOUT_LIMIT,
-        "reason": " ".join(reasons) if reasons else None,
-    }
 
 
-def validate_application_path(value) -> str:
-    if not isinstance(value, str) or not value or "\x00" in value:
-        raise ValueError("Application path is required and must be a valid path string.")
-    try:
-        target = Path(value)
-        if not target.is_absolute():
-            raise ValueError("Application path must be absolute.")
-        if not target.exists():
-            raise ValueError("Application path does not exist on the QA server.")
-        if target.is_dir():
-            return value
-        if target.is_file() and target.suffix.lower() == ".asar":
-            return value
-    except (OSError, ValueError) as exc:
-        if isinstance(exc, ValueError) and str(exc).startswith("Application path"):
-            raise
-        raise ValueError("Application path could not be accessed.") from exc
-    raise ValueError("Select an application directory or a .asar file; other file types are not accepted.")
-
-
-def _safe_cli_error(payload) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    for key in ("error", "message", "user_message", "userMessage"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()[:1200]
-    for key in ("result", "details", "diagnostics"):
-        nested = payload.get(key)
-        if isinstance(nested, dict):
-            message = _safe_cli_error(nested)
-            if message:
-                return message
-    return None
-
-
-def _number_fields(value, fields):
-    if not isinstance(value, dict):
-        return {}
-    return {key: value[key] for key in fields if isinstance(value.get(key), int) and value[key] >= 0}
-
-
-def rea_result_summary(payload, requested_path: str) -> dict:
-    if not isinstance(payload, dict):
-        raise RuntimeError("REA CLI returned an unexpected JSON result.")
-    error = _safe_cli_error(payload)
-    if error:
-        raise RuntimeError(error)
-    view = payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
-    if view.get("kind") != "summary" or not isinstance(view.get("summary"), dict):
-        # Accept complete Evidence for compatible REA CLI versions, but only
-        # retain the same bounded fields exposed by the summary view.
-        evidence = payload.get("normalized_result")
-        if not isinstance(evidence, dict):
-            raise RuntimeError("REA CLI did not return an application summary.")
-        analysis = evidence
-        fields = {}
-    else:
-        analysis = view["summary"]
-        fields = view.get("fields") if isinstance(view.get("fields"), dict) else {}
-    statistics = _number_fields(
-        analysis.get("statistics"),
-        (
-            "relevant_files", "nested_asar_containers", "text_bytes_read",
-            "invalid_utf8_files", "parsed_javascript_files", "skipped_javascript_files",
-            "visited_ast_nodes", "findings", "modules", "parse_failures",
-        ),
-    )
-    summary_coverage = analysis.get("coverage")
-    coverage = {}
-    if isinstance(summary_coverage, dict):
-        for key in ("static_sources", "application", "semantic"):
-            if isinstance(summary_coverage.get(key), dict):
-                coverage[key] = summary_coverage[key]
-    electron = analysis.get("electron")
-    if not isinstance(electron, dict):
-        electron = analysis.get("summary")
-    electron_summary = {}
-    if isinstance(electron, dict):
-        allowed_electron = (
-            "browser_windows", "explicit_web_preferences", "preload_entrypoints",
-            "context_bridge_apis", "exposed_api_members", "sender_validation_observations",
-            "utility_processes", "resolved_utility_entrypoints", "native_addon_bindings",
-            "resolved_native_addon_bindings",
-        )
-        electron_summary = _number_fields(electron, allowed_electron)
-        if isinstance(electron.get("ipc"), dict):
-            electron_summary["ipc"] = _number_fields(
-                electron["ipc"],
-                (
-                    "operations", "literal_channels", "dynamic_channel_operations",
-                    "renderer_transmissions", "renderer_listeners", "main_handlers",
-                    "paired_renderer_transmissions", "ambiguous_renderer_transmissions",
-                    "unpaired_literal_renderer_transmissions",
-                ),
-            )
-    raw_limits = fields.get("limitations", analysis.get("limitations", []))
-    limitations = [
-        item.strip()[:500] for item in raw_limits
-        if isinstance(item, str) and item.strip()
-    ][:20] if isinstance(raw_limits, list) else []
-    route_inventory = analysis.get("route_inventory")
-    routes = None
-    if isinstance(route_inventory, dict):
-        routes = _number_fields(
-            route_inventory.get("statistics"),
-            ("sources_seen", "sources_retained", "route_patterns"),
-        )
-        if isinstance(route_inventory.get("coverage"), dict):
-            routes["coverage"] = route_inventory["coverage"]
-    artifact = fields.get("artifact") if isinstance(fields.get("artifact"), dict) else {}
-    return {
-        "provider": "rea-javascript-application",
-        "provider_label": "REA static analysis via CLI",
-        "operation": "analyze_javascript_application",
-        "status": "completed",
-        "artifact": {
-            "path": requested_path,
-            "format": analysis.get("format"),
-            "sha256": analysis.get("root_artifact_sha256", artifact.get("sha256")),
-        },
-        "statistics": statistics,
-        "coverage": coverage,
-        "electron": electron_summary,
-        "routes": routes,
-        "limitations": limitations,
-    }
 
 
 def application_analysis_dict(row: sqlite3.Row) -> dict:
@@ -918,144 +1571,7 @@ def application_upload_dict(
     return result
 
 
-def run_saved_analysis(server, analysis_id: int):
-    try:
-        with database(server.db_path) as db:
-            row = db.execute(
-                "SELECT input_path FROM application_analyses WHERE id=?",
-                (analysis_id,),
-            ).fetchone()
-            if not row:
-                return
-            db.execute(
-                "UPDATE application_analyses SET status='running', started_at=? WHERE id=?",
-                (timestamp(), analysis_id),
-            )
-            input_path = row["input_path"]
-        summary = server.rea_runner(input_path, server.rea_runtime())
-        with database(server.db_path) as db:
-            db.execute(
-                """UPDATE application_analyses
-                SET status='completed', summary_json=?, completed_at=?, error=''
-                WHERE id=?""",
-                (json.dumps(summary, ensure_ascii=False), timestamp(), analysis_id),
-            )
-    except Exception as exc:
-        with database(server.db_path) as db:
-            db.execute(
-                """UPDATE application_analyses
-                SET status='failed', error=?, completed_at=?
-                WHERE id=?""",
-                (str(exc).strip()[:1500] or "REA analysis failed.", timestamp(), analysis_id),
-            )
 
-
-def _drain_process_output(stream, output: bytearray, limit: int, exceeded: threading.Event):
-    while True:
-        chunk = stream.read(65536)
-        if not chunk:
-            return
-        remaining = limit - len(output)
-        if remaining > 0:
-            output.extend(chunk[:remaining])
-        if len(chunk) > remaining:
-            exceeded.set()
-
-
-def execute_rea_cli(input_path: str, runtime: dict) -> dict:
-    if not runtime.get("analysis_enabled"):
-        raise RuntimeError(runtime.get("reason") or "REA runtime is unavailable.")
-    output_path = ROOT / f".rea-evidence-{uuid.uuid4().hex}.bundle"
-    command = [
-        shutil.which("node") or "node",
-        str(REA_CLI),
-        "analyze-javascript-application",
-        input_path,
-        "--detail", "summary",
-        "--evidence_output", str(output_path),
-        "--json",
-    ]
-    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(REA_ROOT),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            creationflags=creationflags,
-        )
-    except OSError as exc:
-        raise RuntimeError(f"REA CLI could not be started: {exc}") from exc
-
-    stdout = bytearray()
-    stderr = bytearray()
-    exceeded = threading.Event()
-    readers = [
-        threading.Thread(target=_drain_process_output, args=(process.stdout, stdout, REA_STDOUT_LIMIT, exceeded), daemon=True),
-        threading.Thread(target=_drain_process_output, args=(process.stderr, stderr, REA_STDERR_LIMIT, exceeded), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
-    deadline = time.monotonic() + REA_ANALYSIS_TIMEOUT_SECONDS
-    failure = None
-    try:
-        while process.poll() is None:
-            if time.monotonic() >= deadline:
-                failure = f"REA analysis exceeded the {REA_ANALYSIS_TIMEOUT_SECONDS}-second timeout."
-                process.kill()
-                break
-            if exceeded.is_set():
-                failure = "REA analysis exceeded the CLI output size limit."
-                process.kill()
-                break
-            try:
-                if output_path.exists() and output_path.stat().st_size > REA_EVIDENCE_LIMIT:
-                    failure = "REA evidence bundle exceeded the 1 GiB output limit."
-                    process.kill()
-                    break
-            except OSError:
-                pass
-            time.sleep(0.1)
-        process.wait(timeout=5)
-        try:
-            if output_path.exists() and output_path.stat().st_size > REA_EVIDENCE_LIMIT:
-                failure = "REA evidence bundle exceeded the 1 GiB output limit."
-        except OSError:
-            pass
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-        failure = failure or "REA process did not stop after cancellation."
-    finally:
-        for reader in readers:
-            reader.join(timeout=5)
-        if process.stdout:
-            process.stdout.close()
-        if process.stderr:
-            process.stderr.close()
-        try:
-            if output_path.is_dir():
-                shutil.rmtree(output_path)
-            else:
-                output_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-    if failure:
-        raise RuntimeError(failure)
-    if exceeded.is_set():
-        raise RuntimeError("REA analysis exceeded the CLI output size limit.")
-    try:
-        result = json.loads(stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        diagnostic = stderr.decode("utf-8", errors="replace").strip()
-        detail = diagnostic[-1000:] if diagnostic else "No diagnostic was returned."
-        raise RuntimeError(f"REA CLI returned invalid JSON. {detail}") from exc
-    if process.returncode != 0:
-        message = _safe_cli_error(result) or stderr.decode("utf-8", errors="replace").strip()[-1000:]
-        raise RuntimeError(f"REA CLI exited with status {process.returncode}. {message}".strip())
-    return rea_result_summary(result, input_path)
 
 
 def openapi_inventory(filename: str, content: str):
@@ -1215,8 +1731,14 @@ class QAHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "no-store")
+        origin = self.headers.get("Origin")
+        if origin and origin in self.server.cors_origins:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
         for key, value in (extra or {}).items():
-            self.send_header(key, value)
+            for item in value if isinstance(value, (list, tuple)) else (value,):
+                self.send_header(key, item)
         self.end_headers()
         self.wfile.write(data)
 
@@ -1228,31 +1750,249 @@ class QAHandler(BaseHTTPRequestHandler):
             extra,
         )
 
-    def is_admin(self):
+    def session_cookie(self, name):
         cookie = SimpleCookie()
         try:
             cookie.load(self.headers.get("Cookie", ""))
-            session_cookie = cookie.get("trace_admin_session")
         except CookieError:
-            return False
-        if not session_cookie:
-            return False
-        token = session_cookie.value
+            return None
+        item = cookie.get(name)
+        return item.value if item else None
+
+    def current_user(self, db=None):
+        admin_token = self.session_cookie("trace_admin_session")
         with self.server.admin_session_lock:
-            expiry = self.server.admin_sessions.get(token)
-            if expiry is None:
-                return False
+            expiry = self.server.admin_sessions.get(admin_token)
+            if expiry is not None and expiry > time.time():
+                return {
+                    "id": None, "role_name": "Global Admin",
+                    "email": "", "global_admin": True, "tenant_id": 1,
+                }
+            if expiry is not None:
+                self.server.admin_sessions.pop(admin_token, None)
+
+        token = self.session_cookie("trace_user_session")
+        with self.server.admin_session_lock:
+            session = self.server.user_sessions.get(token)
+            if session is None:
+                return None
+            user_id, expiry = session
             if expiry <= time.time():
-                self.server.admin_sessions.pop(token, None)
+                self.server.user_sessions.pop(token, None)
+                return None
+        close_db = db is None
+        if close_db:
+            db = connect(self.server.db_path)
+        try:
+            requested_tenant = self.headers.get("X-Tenant-ID")
+            tenant_id = None
+            if requested_tenant:
+                try:
+                    tenant_id = int(requested_tenant)
+                except ValueError:
+                    return None
+            row = db.execute(
+                """SELECT u.id,u.email,u.first_name,u.last_name,u.status,r.name role_name,
+                m.tenant_id,m.role_id
+                FROM users u
+                JOIN tenant_memberships m ON m.user_id=u.id AND m.status='Active'
+                JOIN roles r ON r.id=m.role_id AND r.status='Active'
+                JOIN tenants t ON t.id=m.tenant_id AND t.status='Active'
+                WHERE u.id=? AND u.status='Active'
+                AND (? IS NULL OR m.tenant_id=?)
+                ORDER BY m.tenant_id LIMIT 1""",
+                (user_id, tenant_id, tenant_id),
+            ).fetchone()
+            if not row:
+                active_account = db.execute(
+                    """SELECT 1 FROM users u WHERE u.id=? AND u.status='Active'
+                    AND EXISTS (
+                        SELECT 1 FROM tenant_memberships m
+                        JOIN tenants t ON t.id=m.tenant_id AND t.status='Active'
+                        JOIN roles r ON r.id=m.role_id AND r.status='Active'
+                        WHERE m.user_id=u.id AND m.status='Active'
+                    )""",
+                    (user_id,),
+                ).fetchone()
+                if not active_account:
+                    with self.server.admin_session_lock:
+                        self.server.user_sessions.pop(token, None)
+                return None
+            if row["status"] != "Active":
+                with self.server.admin_session_lock:
+                    self.server.user_sessions.pop(token, None)
+                return None
+            return dict(row)
+        finally:
+            if close_db:
+                db.close()
+
+    def is_authenticated(self):
+        return self.current_user() is not None
+
+    def is_admin(self, db=None):
+        user = self.current_user(db)
+        return bool(user and self.is_global_admin(user))
+
+    @staticmethod
+    def is_global_admin(user):
+        return bool(user and user.get("global_admin"))
+
+    @staticmethod
+    def is_tenant_admin(user):
+        return bool(
+            user and not user.get("global_admin")
+            and user.get("role_name") in ("Global Admin", "Admin")
+        )
+
+    def auth_status(self, db):
+        password = os.environ.get("QA_ADMIN_PASSWORD", "")
+        user = self.current_user(db)
+        if user and user.get("global_admin"):
+            profile = db.execute(
+                "SELECT first_name,last_name,email FROM global_admin_profile WHERE id=1"
+            ).fetchone()
+            if profile:
+                user.update(dict(profile))
+        return {
+            "authenticated": user is not None,
+            "admin_configured": len(password.strip()) >= 12,
+            "user": user,
+            "permissions": self.user_permissions(db, user) if user else [],
+        }
+
+    @classmethod
+    def user_permissions(cls, db, user):
+        if not user:
+            return []
+        if cls.is_global_admin(user):
+            return ["*"]
+        if not user.get("role_id"):
+            return []
+        return role_permission_keys(db, user["role_id"])
+
+    def can_assign_role(self, db, actor, role):
+        if self.is_global_admin(actor) or self.is_tenant_admin(actor):
+            return True
+        if role["name"] in ("Admin", "Global Admin"):
+            return False
+        actor_permissions = set(self.user_permissions(db, actor))
+        target_permissions = set(role_permission_keys(db, role["id"]))
+        return "*" not in target_permissions and target_permissions.issubset(actor_permissions)
+
+    def request_permission(self, method, path):
+        parts = path.strip("/").split("/")
+        if parts[:2] == ["api", "users"]:
+            if len(parts) == 4 and parts[3] in ("activate", "deactivate"):
+                return f"users.{parts[3]}" if method == "POST" else None
+            action = {"GET": "view", "POST": "create", "PATCH": "update", "DELETE": "delete"}.get(method)
+            return f"users.{action}" if action else None
+        if parts[:2] == ["api", "teams"]:
+            action = {"GET": "view", "POST": "create", "PATCH": "edit", "DELETE": "delete"}.get(method)
+            if len(parts) >= 4 and parts[3] in ("members", "owner"):
+                return "teams.manage-members" if method in ("POST", "DELETE", "PATCH") else "teams.view"
+            return f"teams.{action}" if action else None
+        if parts[:2] == ["api", "roles"]:
+            action = {"GET": "view", "POST": "create", "PATCH": "edit", "DELETE": "delete"}.get(method)
+            if len(parts) >= 4 and parts[3] == "permissions":
+                return "roles.manage-permissions"
+            return f"roles.{action}" if action else None
+        if parts[:2] == ["api", "profile"]:
+            return "profile.edit" if method in ("PATCH", "POST") else "profile.view"
+        if parts[:2] == ["api", "auth"]:
+            return None
+        if parts[:2] == ["api", "ai"]:
+            return "admin" if method != "GET" else None
+        if parts[:2] == ["api", "custom-fields"]:
+            return "admin" if method in ("POST", "PATCH", "DELETE") else None
+        if parts[:2] == ["api", "archive"] or parts[:2] == ["api", "audit-events"]:
+            return "admin"
+        if len(parts) >= 2 and parts[:2] == ["api", "projects"]:
+            module = "projects"
+            if len(parts) >= 4:
+                module = {
+                    "requirements": "requirements",
+                    "test-cases": "test-cases",
+                    "applications": "applications",
+                    "api-docs": "api-docs",
+                    "analyses": "app-analysis",
+                    "bugs": "bugs",
+                    "report": "reports",
+                    "dashboard": "projects",
+                    "attachments": "projects",
+                    "files": "projects",
+                    "executions": "test-cases",
+                    "evidence": "test-cases",
+                }.get(parts[3], "projects")
+            action = {"GET": "view", "POST": "create", "PATCH": "edit", "DELETE": "delete"}.get(method)
+            if method == "POST" and len(parts) >= 5 and parts[4] in ("generate", "analyze", "validate-requirements"):
+                action = "create"
+            if method == "POST" and len(parts) >= 4 and parts[3] == "executions":
+                action = "edit"
+            if method == "POST" and len(parts) >= 5 and parts[3:5] == ["requirements", "suggestions"]:
+                action = "edit"
+            return f"{module}.{action}" if action else None
+        return None
+
+    def authorize_request(self, method, path, db=None):
+        if path.strip("/").split("/")[:2] == ["api", "auth"]:
+            return True
+        user = self.current_user(db)
+        if user is None:
+            self.send_json({"error": "Sign in is required."}, 401)
+            return False
+        permission = self.request_permission(method, path)
+        parts = path.strip("/").split("/")
+        tenant_admin_area = parts[:2] in (
+            ["api", "users"], ["api", "teams"], ["api", "roles"],
+            ["api", "audit-events"],
+        )
+        if tenant_admin_area and not (
+            self.is_global_admin(user) or self.is_tenant_admin(user)
+        ):
+            self.send_json({"error": "Global Admin access is required."}, 403)
+            return False
+        if parts[:2] == ["api", "archive"] and not self.is_global_admin(user):
+            self.send_json({"error": "System Global Admin access is required."}, 403)
+            return False
+        if permission == "admin":
+            tenant_audit_access = (
+                parts[:2] == ["api", "audit-events"]
+                and self.is_tenant_admin(user)
+            )
+            tenant_custom_field_access = (
+                parts[:2] == ["api", "custom-fields"]
+                and self.is_tenant_admin(user)
+            )
+            if not self.is_global_admin(user) and not (
+                tenant_audit_access or tenant_custom_field_access
+            ):
+                self.send_json({"error": "System Global Admin access is required."}, 403)
+                return False
+            if self.is_global_admin(user):
+                return True
+            if tenant_audit_access:
+                return True
+        permissions = self.user_permissions(db, user)
+        if permission is not None and "*" not in permissions and permission not in permissions:
+            self.send_json({"error": f"Your role does not allow this action ({permission})."}, 403)
+            return False
+        if len(parts) >= 3 and parts[:2] == ["api", "projects"]:
+            try:
+                project_id = int(parts[2])
+            except ValueError:
+                self.send_json({"error": "Invalid project ID."}, 400)
+                return False
+            project = db.execute(
+                "SELECT tenant_id FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            if not project or (
+                not self.is_global_admin(user)
+                and project["tenant_id"] != user.get("tenant_id")
+            ):
+                self.send_json({"error": "Project not found."}, 404)
                 return False
         return True
-
-    def auth_status(self):
-        password = os.environ.get("QA_ADMIN_PASSWORD", "")
-        return {
-            "authenticated": self.is_admin(),
-            "admin_configured": len(password.strip()) >= 12,
-        }
 
     def ai_auth_required(self, method: str, path: str) -> bool:
         if method != "POST":
@@ -1279,26 +2019,69 @@ class QAHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    @staticmethod
+    def custom_field_admin_required(method: str, path: str) -> bool:
+        return method in ("POST", "PATCH", "DELETE") and path.strip("/").split("/")[:2] == [
+            "api", "custom-fields",
+        ]
+
     def issue_admin_session(self):
         token = secrets.token_urlsafe(32)
         with self.server.admin_session_lock:
             self.server.admin_sessions[token] = time.time() + 12 * 60 * 60
         return token
 
-    def logout_admin(self):
-        cookie = SimpleCookie()
+    def issue_user_session(self, user_id):
+        token = secrets.token_urlsafe(32)
+        with self.server.admin_session_lock:
+            self.server.user_sessions[token] = (user_id, time.time() + 12 * 60 * 60)
+        return token
+
+    def invalidate_user_sessions(self, user_id, keep_current=False):
+        current_token = self.session_cookie("trace_user_session")
+        with self.server.admin_session_lock:
+            for token, (session_user_id, _) in list(self.server.user_sessions.items()):
+                if session_user_id == user_id and (
+                    not keep_current or token != current_token
+                ):
+                    self.server.user_sessions.pop(token, None)
+
+    def peer_is_local(self):
         try:
-            cookie.load(self.headers.get("Cookie", ""))
-        except CookieError:
-            cookie = SimpleCookie()
-        session_cookie = cookie.get("trace_admin_session")
-        if session_cookie:
-            with self.server.admin_session_lock:
-                self.server.admin_sessions.pop(session_cookie.value, None)
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return False
+
+    @staticmethod
+    def validate_password(password):
+        if not isinstance(password, str) or len(password) < 12:
+            raise ValueError("Password must be at least 12 characters.")
+        if not any(char.islower() for char in password) or not any(
+            char.isupper() for char in password
+        ) or not any(char.isdigit() for char in password):
+            raise ValueError("Password must include uppercase and lowercase letters and a number.")
+
+    @staticmethod
+    def validated_permissions(value):
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError("Permissions must be a list of permission keys.")
+        permissions = list(dict.fromkeys(value))
+        invalid = set(permissions) - set(ALL_PERMISSIONS)
+        if invalid:
+            raise ValueError(f"Unknown permission: {sorted(invalid)[0]}")
+        return permissions
+
+    def logout_admin(self):
+        admin_token = self.session_cookie("trace_admin_session")
+        user_token = self.session_cookie("trace_user_session")
+        with self.server.admin_session_lock:
+            self.server.admin_sessions.pop(admin_token, None)
+            self.server.user_sessions.pop(user_token, None)
         return {
-            "Set-Cookie": (
-                "trace_admin_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
-            )
+            "Set-Cookie": [
+                "trace_admin_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+                "trace_user_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+            ],
         }
 
     def body(self):
@@ -1309,7 +2092,22 @@ class QAHandler(BaseHTTPRequestHandler):
         if size < 0 or size > MAX_BODY:
             raise ValueError("Request is too large (maximum 27 MB).")
         raw = self.rfile.read(size)
+        if len(raw) != size:
+            raise ValueError("Request body was interrupted before upload completed.")
         content_type = self.headers.get("Content-Type", "")
+        if urlparse(self.path).path.rstrip("/").endswith("/attachments") and \
+            content_type.split(";", 1)[0].strip().lower() != "application/json":
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if media_type == "multipart/form-data":
+                raise ValueError("Send attachment contents as a raw file upload.")
+            filename = parse_qs(urlparse(self.path).query).get("filename", [""])[0]
+            return {
+                "filename": filename,
+                "content_type": media_type,
+                "file_bytes": raw,
+                "module_key": parse_qs(urlparse(self.path).query).get("module", [""])[0],
+                "record_id": parse_qs(urlparse(self.path).query).get("record_id", [""])[0],
+            }
         upload_path = urlparse(self.path).path.rstrip("/").endswith("/applications/import")
         is_zip_upload = (
             content_type.split(";", 1)[0].strip().lower() == "application/zip"
@@ -1336,8 +2134,10 @@ class QAHandler(BaseHTTPRequestHandler):
             return
         try:
             with database(self.server.db_path) as db:
+                if not self.authorize_request("GET", path, db):
+                    return
                 self.get_api(db, path)
-        except (ValueError, sqlite3.Error) as exc:
+        except (ValueError, *DATABASE_ERRORS) as exc:
             self.send_json({"error": str(exc)}, 400)
         except OSError:
             self.send_json({"error": "Storage error while reading the requested file."}, 500)
@@ -1345,26 +2145,51 @@ class QAHandler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.send_json({"error": "Unexpected server error while handling the request. Check the server console."}, 500)
 
+    def do_OPTIONS(self):
+        origin = self.headers.get("Origin")
+        if not origin or origin not in self.server.cors_origins:
+            self.send_json({"error": "Origin is not allowed."}, 403)
+            return
+        self.send_bytes(
+            b"",
+            "text/plain; charset=utf-8",
+            204,
+            {
+                "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, X-Tenant-ID",
+                "Access-Control-Max-Age": "600",
+            },
+        )
+
     def do_POST(self):
-        analysis_id = None
         try:
             request_path = urlparse(self.path).path
-            if self.ai_auth_required("POST", request_path) and not self.is_admin():
-                self.send_json({"error": "Admin sign-in is required for AI settings and analysis."}, 401)
-                return
+            with database(self.server.db_path) as db:
+                if not self.authorize_request("POST", request_path, db):
+                    return
             data = self.body()
             with database(self.server.db_path) as db:
-                analysis_id = self.post_api(db, request_path, data)
-            if analysis_id is not None:
-                self.server.schedule_analysis(analysis_id)
-        except sqlite3.IntegrityError as exc:
-            if "ux_application_analyses_active" in str(exc):
-                self.send_json({"error": "Another REA analysis is already queued or running."}, 409)
+                self.post_api(db, request_path, data)
+                parts = request_path.strip("/").split("/")
+                if len(parts) >= 3 and parts[:2] == ["api", "projects"]:
+                    try:
+                        project_id = int(parts[2])
+                    except ValueError:
+                        project_id = None
+                    if project_id is not None:
+                        sync_project_tenant_data(db, project_id)
+        except DATABASE_INTEGRITY_ERRORS as exc:
+            if integrity_error_is(exc, "users.email", "users_email_key", "ux_users_email_ci"):
+                self.send_json({"error": "An account with this email already exists."}, 409)
+            elif integrity_error_is(exc, "teams.name", "teams_name_key", "ux_teams_name_ci"):
+                self.send_json({"error": "A team with this name already exists."}, 409)
+            elif integrity_error_is(exc, "roles.name", "roles_name_key", "ux_roles_name_ci"):
+                self.send_json({"error": "A role with this name already exists."}, 409)
             else:
                 self.send_json({"error": str(exc)}, 400)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, 400)
-        except sqlite3.Error as exc:
+        except DATABASE_ERRORS as exc:
             self.send_json({"error": f"Database error: {exc}"}, 400)
         except OSError:
             self.send_json({"error": "Storage error while processing the request."}, 500)
@@ -1374,12 +2199,33 @@ class QAHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         try:
+            request_path = urlparse(self.path).path
+            with database(self.server.db_path) as db:
+                if not self.authorize_request("PATCH", request_path, db):
+                    return
             data = self.body()
             with database(self.server.db_path) as db:
-                self.patch_api(db, urlparse(self.path).path, data)
-        except (ValueError, sqlite3.IntegrityError) as exc:
+                self.patch_api(db, request_path, data)
+                parts = request_path.strip("/").split("/")
+                if len(parts) >= 3 and parts[:2] == ["api", "projects"]:
+                    try:
+                        project_id = int(parts[2])
+                    except ValueError:
+                        project_id = None
+                    if project_id is not None:
+                        sync_project_tenant_data(db, project_id)
+        except DATABASE_INTEGRITY_ERRORS as exc:
+            if integrity_error_is(exc, "users.email", "users_email_key", "ux_users_email_ci"):
+                self.send_json({"error": "An account with this email already exists."}, 409)
+            elif integrity_error_is(exc, "teams.name", "teams_name_key", "ux_teams_name_ci"):
+                self.send_json({"error": "A team with this name already exists."}, 409)
+            elif integrity_error_is(exc, "roles.name", "roles_name_key", "ux_roles_name_ci"):
+                self.send_json({"error": "A role with this name already exists."}, 409)
+            else:
+                self.send_json({"error": str(exc)}, 400)
+        except ValueError as exc:
             self.send_json({"error": str(exc)}, 400)
-        except sqlite3.Error as exc:
+        except DATABASE_ERRORS as exc:
             self.send_json({"error": f"Database error: {exc}"}, 400)
         except Exception:
             traceback.print_exc()
@@ -1387,6 +2233,13 @@ class QAHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
+        try:
+            with database(self.server.db_path) as db:
+                if not self.authorize_request("DELETE", path, db):
+                    return
+        except DATABASE_ERRORS as exc:
+            self.send_json({"error": f"Database error: {exc}"}, 400)
+            return
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[:2] == ["api", "projects"]:
             project_dir = None
@@ -1411,6 +2264,7 @@ class QAHandler(BaseHTTPRequestHandler):
                             )
                             project_dir.replace(archived_dir)
                             os.utime(archived_dir, None)
+                        cleanup_project_form_data(db, pid)
                         db.execute("DELETE FROM projects WHERE id=?", (pid,))
                         response = ({
                             "deleted": True,
@@ -1433,9 +2287,9 @@ class QAHandler(BaseHTTPRequestHandler):
             self._handle_delete_exception(exc)
 
     def _handle_delete_exception(self, exc):
-        if isinstance(exc, (ValueError, sqlite3.IntegrityError)):
+        if isinstance(exc, (ValueError, *DATABASE_INTEGRITY_ERRORS)):
             self.send_json({"error": str(exc)}, 400)
-        elif isinstance(exc, sqlite3.Error):
+        elif isinstance(exc, DATABASE_ERRORS):
             self.send_json({"error": f"Database error: {exc}"}, 400)
         elif isinstance(exc, OSError):
             self.send_json({"error": "Storage error while deleting the record."}, 500)
@@ -1444,11 +2298,14 @@ class QAHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "Unexpected server error while deleting the record. Check the server console."}, 500)
 
     def static(self, path):
-        if path in ("/", "/index.html"):
+        if (path.rstrip("/") or "/") in (
+            "/", "/index.html", "/about", "/privacy", "/terms",
+            "/login", "/signup", "/workspace",
+        ):
             path = "/index.html"
-        target = (ROOT / "static" / path.lstrip("/")).resolve()
+        target = (FRONTEND_ROOT / path.lstrip("/")).resolve()
         try:
-            target.relative_to((ROOT / "static").resolve())
+            target.relative_to(FRONTEND_ROOT.resolve())
         except ValueError:
             self.send_json({"error": "Not found"}, 404)
             return
@@ -1464,6 +2321,126 @@ class QAHandler(BaseHTTPRequestHandler):
 
     def get_api(self, db, path):
         parts = path.strip("/").split("/")
+        if parts == ["api", "profile"]:
+            user = self.current_user(db)
+            if not user or not user.get("id"):
+                if not user or not user.get("global_admin"):
+                    self.send_json({"error": "A user account is required to view a profile."}, 401)
+                    return
+                row = db.execute(
+                    """SELECT first_name,last_name,email,phone,'Active' status,
+                    created_at,NULL last_login_at,profile_image_type,profile_image_data
+                    FROM global_admin_profile WHERE id=1"""
+                ).fetchone()
+                profile = dict(row)
+                profile["global_admin"] = True
+                profile["role_name"] = "Global Admin"
+                if profile["profile_image_data"] is not None:
+                    profile["profile_image_data"] = base64.b64encode(
+                        profile["profile_image_data"]
+                    ).decode("ascii")
+                self.send_json(profile)
+                return
+            row = db.execute(
+                """SELECT id,first_name,last_name,email,phone,status,created_at,last_login_at,
+                profile_image_type,profile_image_data FROM users WHERE id=?""",
+                (user["id"],),
+            ).fetchone()
+            profile = dict(row)
+            if profile["profile_image_data"] is not None:
+                profile["profile_image_data"] = base64.b64encode(
+                    profile["profile_image_data"]
+                ).decode("ascii")
+            self.send_json(profile)
+            return
+        if parts == ["api", "users"]:
+            actor = self.current_user(db) or {}
+            tenant_id = actor.get("tenant_id", 1)
+            users = [
+                user_public_dict(db, row["id"], tenant_id)
+                for row in db.execute(
+                    """SELECT DISTINCT u.id FROM users u
+                    JOIN tenant_memberships m ON m.user_id=u.id
+                    WHERE m.tenant_id=? ORDER BY u.created_at DESC,u.id DESC""",
+                    (tenant_id,),
+                )
+            ]
+            self.send_json(users)
+            return
+        if parts == ["api", "roles"]:
+            actor = self.current_user(db) or {}
+            tenant_id = actor.get("tenant_id", 1)
+            roles = []
+            for row in db.execute(
+                """SELECT r.*,COUNT(u.id) user_count FROM roles r
+                LEFT JOIN tenant_memberships m ON m.role_id=r.id
+                    AND m.tenant_id=?
+                LEFT JOIN users u ON u.id=m.user_id
+                WHERE r.tenant_id IS NULL OR r.tenant_id=?
+                GROUP BY r.id ORDER BY r.name COLLATE NOCASE"""
+                , (tenant_id, tenant_id)
+            ):
+                item = dict(row)
+                item["permissions"] = json.loads(item.pop("permissions_json"))
+                item["permission_count"] = len(item["permissions"])
+                roles.append(item)
+            self.send_json({"roles": roles, "permission_modules": PERMISSION_MODULES})
+            return
+        if parts == ["api", "teams"]:
+            actor = self.current_user(db) or {}
+            teams = [
+                dict(row) for row in db.execute(
+                    """SELECT t.*,u.first_name||' '||u.last_name owner_name,
+                    (SELECT COUNT(*) FROM team_memberships tm WHERE tm.team_id=t.id) member_count
+                    FROM teams t LEFT JOIN users u ON u.id=t.owner_user_id
+                    WHERE (?=1 OR t.tenant_id=?)
+                    ORDER BY t.created_at DESC,t.id DESC"""
+                    , (int(self.is_global_admin(actor)), actor.get("tenant_id", 1))
+                )
+            ]
+            self.send_json(teams)
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "teams"] and parts[3] == "members":
+            team_id = self.parse_project_id(parts[2])
+            team = db.execute(
+                "SELECT tenant_id FROM teams WHERE id=?", (team_id,)
+            ).fetchone()
+            actor = self.current_user(db) or {}
+            if not team or (
+                not self.is_global_admin(actor)
+                and team["tenant_id"] != actor.get("tenant_id")
+            ):
+                self.send_json({"error": "Team not found."}, 404)
+                return
+            members = [
+                user_public_dict(db, row["user_id"], team["tenant_id"])
+                for row in db.execute(
+                    """SELECT user_id FROM team_memberships WHERE team_id=?
+                    ORDER BY added_at,user_id""",
+                    (team_id,),
+                )
+            ]
+            self.send_json(members)
+            return
+        if parts == ["api", "audit-events"]:
+            actor = self.current_user(db) or {}
+            tenant_filter = "" if self.is_global_admin(actor) else "WHERE a.tenant_id=?"
+            parameters = () if self.is_global_admin(actor) else (actor.get("tenant_id", 1),)
+            events = []
+            for row in db.execute(
+                f"""SELECT a.*,u.email actor_email,t.name tenant_name
+                FROM audit_events a
+                LEFT JOIN users u ON u.id=a.actor_user_id
+                LEFT JOIN tenants t ON t.id=a.tenant_id
+                {tenant_filter}
+                ORDER BY a.created_at DESC,a.id DESC LIMIT 500"""
+                , parameters
+            ):
+                event = dict(row)
+                event["details"] = json.loads(event.pop("details_json"))
+                events.append(event)
+            self.send_json(events)
+            return
         if parts == ["api", "archive"]:
             archive_root = Path(self.server.storage_root) / "archived-projects"
             if archive_root.is_symlink():
@@ -1484,16 +2461,53 @@ class QAHandler(BaseHTTPRequestHandler):
             self.send_json({"archives": archives})
             return
         if parts == ["api", "auth", "status"]:
-            self.send_json(self.auth_status())
-            return
-        if parts == ["api", "rea", "runtime"]:
-            self.send_json(self.server.rea_runtime())
+            self.send_json(self.auth_status(db))
             return
         if parts == ["api", "ai", "settings"]:
             self.send_json(provider_settings(db, self.is_admin()))
             return
+        if parts == ["api", "custom-fields"]:
+            query = parse_qs(urlparse(self.path).query)
+            module_key = query.get("module", [""])[0]
+            actor = self.current_user(db) or {}
+            tenant_id = actor.get("tenant_id", 1)
+            record_id = None
+            if query.get("record_id", [""])[0]:
+                record_id = self.parse_project_id(query["record_id"][0])
+                record_tenant = record_tenant_id(db, module_key, record_id)
+                if record_tenant is None or (
+                    not self.is_global_admin(actor) and record_tenant != tenant_id
+                ):
+                    self.send_json({"error": "Record not found."}, 404)
+                    return
+            if module_key:
+                include_inactive = query.get("include_inactive", [""])[0] == "true"
+                self.send_json({
+                    "fields": custom_fields_for_record(
+                        db, module_key, record_id, include_inactive, tenant_id
+                    ),
+                })
+            else:
+                fields = [
+                    custom_field_dict(db, row)
+                    for row in db.execute(
+                        """SELECT * FROM custom_fields
+                        WHERE (?=1 OR tenant_id=?)
+                        ORDER BY module_key,display_order,id"""
+                        , (int(self.is_global_admin(actor)), tenant_id)
+                    )
+                ]
+                for field in fields:
+                    field["module_label"] = CUSTOM_FIELD_MODULES[field["module_key"]][1]
+                self.send_json(fields)
+            return
         if parts == ["api", "projects"]:
-            rows = db.execute("SELECT * FROM projects ORDER BY id DESC").fetchall()
+            actor = self.current_user(db) or {}
+            rows = db.execute(
+                """SELECT * FROM projects WHERE (?=1 OR tenant_id=?)
+                ORDER BY id DESC""",
+                (int(self.is_global_admin(actor)), actor.get("tenant_id", 1)),
+            ).fetchall()
             self.send_json([dict(r) for r in rows])
             return
         if len(parts) >= 3 and parts[1] == "projects":
@@ -1506,6 +2520,54 @@ class QAHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[3] == "dashboard":
                 self.send_json(dashboard(db, pid))
+                return
+            if len(parts) == 4 and parts[3] == "attachments":
+                query = parse_qs(urlparse(self.path).query)
+                module_key = query.get("module", [""])[0]
+                record_id = self.parse_project_id(query.get("record_id", [""])[0])
+                if not record_belongs_to_project(db, module_key, pid, record_id):
+                    self.send_json({"error": "Record not found in this project."}, 404)
+                    return
+                self.send_json([
+                    {
+                        key: row[key] for key in (
+                            "id", "module_key", "record_id", "filename",
+                            "content_type", "file_size_bytes", "uploaded_at",
+                        )
+                    }
+                    for row in db.execute(
+                        """SELECT id,module_key,record_id,filename,content_type,
+                        file_size_bytes,uploaded_at FROM form_attachments
+                        WHERE project_id=? AND module_key=? AND record_id=?
+                        ORDER BY id""",
+                        (pid, module_key, record_id),
+                    )
+                ])
+                return
+            if (
+                len(parts) == 6 and parts[3] == "attachments"
+                and parts[5] in ("download", "view")
+            ):
+                attachment_id = self.parse_project_id(parts[4])
+                row = db.execute(
+                    """SELECT filename,content_type,file_size_bytes,file_data
+                    FROM form_attachments WHERE id=? AND project_id=?""",
+                    (attachment_id, pid),
+                ).fetchone()
+                if not row:
+                    self.send_json({"error": "Attachment not found."}, 404)
+                    return
+                safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", row["filename"]) or "attachment"
+                disposition = "attachment" if parts[5] == "download" else "inline"
+                self.send_bytes(
+                    bytes(row["file_data"]),
+                    row["content_type"],
+                    extra={
+                        "Content-Disposition": (
+                            f'{disposition}; filename="{safe_name}"'
+                        )
+                    },
+                )
                 return
             if len(parts) == 4 and parts[3] == "files":
                 project_dir = project_storage_dir(self.server.storage_root, pid)
@@ -1793,6 +2855,13 @@ class QAHandler(BaseHTTPRequestHandler):
                     WHERE b.project_id = ? ORDER BY b.id DESC""", (pid,)
                 )])
                 return
+            if len(parts) == 5 and parts[3] == "report" and parts[4] in (
+                "requirements.csv", "test-cases.csv", "bugs.csv",
+            ):
+                module = parts[4][:-4]
+                query = parse_qs(urlparse(self.path).query)
+                self.module_csv_report(db, pid, module, query.get("q", [""])[0])
+                return
             if len(parts) == 5 and parts[3] == "report" and parts[4] == "csv":
                 self.csv_report(db, pid)
                 return
@@ -1801,27 +2870,157 @@ class QAHandler(BaseHTTPRequestHandler):
     def post_api(self, db, path, data):
         parts = path.strip("/").split("/")
         now = timestamp()
-        if parts == ["api", "auth", "login"]:
-            try:
-                peer_is_local = ipaddress.ip_address(self.client_address[0]).is_loopback
-            except ValueError:
-                peer_is_local = False
-            expected = os.environ.get("QA_ADMIN_PASSWORD", "")
-            if not peer_is_local:
-                self.send_json({"error": "Admin sign-in is available only over a loopback connection."}, 403)
+        if parts == ["api", "auth", "signup"]:
+            if not self.peer_is_local():
+                self.send_json({"error": "Sign-up is available only over a loopback connection."}, 403)
                 return
+            first_name = validate_text(data, "first_name", True, 80)
+            last_name = validate_text(data, "last_name", True, 80)
+            email = validate_text(data, "email", True, 254).lower()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                raise ValueError("Enter a valid email address.")
+            if email == TENANT_ADMIN_EMAIL:
+                self.send_json({
+                    "error": "This email is reserved for the existing workspace administrator account."
+                }, 409)
+                return
+            password = data.get("password")
+            self.validate_password(password)
+            if data.get("confirm_password") != password:
+                raise ValueError("Password and confirmation must match.")
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (email,)).fetchone():
+                self.send_json({"error": "An account with this email already exists."}, 409)
+                return
+            role_name = "User"
+            role = db.execute(
+                "SELECT id FROM roles WHERE name=? AND status='Active'", (role_name,)
+            ).fetchone()
+            if not role:
+                raise ValueError("The default account role is not available.")
+            cursor = db.execute(
+                """INSERT INTO users
+                (first_name,last_name,email,password_hash,role_id,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,'Active',?,?)""",
+                (first_name, last_name, email, hash_password(password), role["id"], now, now),
+            )
+            user_id = cursor.lastrowid
+            db.execute(
+                """INSERT INTO tenant_memberships
+                (tenant_id,user_id,role_id,status,created_at,updated_at)
+                VALUES(1,?,?,'Active',?,?)""",
+                (user_id, role["id"], now, now),
+            )
+            audit_event(
+                db, user_id, "user.created", "user", user_id,
+                {
+                    "previous": None,
+                    "new": {
+                        "email": email, "role": role_name, "status": "Active",
+                    },
+                    "source": "signup",
+                },
+                tenant_id=1,
+            )
+            token = self.issue_user_session(user_id)
+            user = user_public_dict(db, user_id, 1)
+            self.send_json(
+                {
+                    "authenticated": True,
+                    "user": user,
+                    "permissions": self.user_permissions(
+                        db, {"id": user_id, "role_name": role_name, "role_id": role["id"]}
+                    ),
+                },
+                201,
+                extra={
+                    "Set-Cookie": (
+                        f"trace_user_session={token}; Path=/; HttpOnly; SameSite=Strict; "
+                        "Max-Age=43200"
+                    )
+                },
+            )
+            return
+        if parts == ["api", "auth", "login"]:
+            if not self.peer_is_local():
+                self.send_json({"error": "Sign-in is available only over a loopback connection."}, 403)
+                return
+            email = data.get("email")
+            password = data.get("password")
+            if isinstance(email, str) and email.strip():
+                row = db.execute(
+                    """SELECT u.id,u.password_hash,u.status FROM users u
+                    WHERE u.email=? COLLATE NOCASE""",
+                    (email.strip(),),
+                ).fetchone()
+                if not row or not verify_password(
+                    password if isinstance(password, str) else "", row["password_hash"]
+                ):
+                    self.send_json({"error": "Email or password is incorrect."}, 401)
+                    return
+                if row["status"] != "Active":
+                    self.send_json({
+                        "error": "Your account has been deactivated.\nPlease contact your administrator."
+                    }, 403)
+                    return
+                membership = db.execute(
+                    """SELECT m.tenant_id FROM tenant_memberships m
+                    JOIN tenants t ON t.id=m.tenant_id
+                    JOIN roles r ON r.id=m.role_id AND r.status='Active'
+                    WHERE m.user_id=? AND m.status='Active' AND t.status='Active'
+                    ORDER BY m.tenant_id LIMIT 1""",
+                    (row["id"],),
+                ).fetchone()
+                if not membership:
+                    inactive_membership = db.execute(
+                        """SELECT 1 FROM tenant_memberships
+                        WHERE user_id=? AND status!='Active' LIMIT 1""",
+                        (row["id"],),
+                    ).fetchone()
+                    if inactive_membership:
+                        self.send_json({
+                            "error": "Your account has been deactivated.\nPlease contact your administrator."
+                        }, 403)
+                        return
+                    self.send_json({"error": "Email or password is incorrect."}, 401)
+                    return
+                db.execute(
+                    "UPDATE users SET last_login_at=?,updated_at=? WHERE id=?",
+                    (now, now, row["id"]),
+                )
+                user = user_public_dict(db, row["id"], membership["tenant_id"])
+                token = self.issue_user_session(row["id"])
+                self.send_json(
+                    {
+                        "authenticated": True,
+                        "user": user,
+                        "permissions": self.user_permissions(
+                            db, {
+                                "id": row["id"], "role_name": user["role_name"],
+                                "role_id": user["role_id"],
+                            }
+                        ),
+                    },
+                    extra={
+                        "Set-Cookie": (
+                            f"trace_user_session={token}; Path=/; HttpOnly; SameSite=Strict; "
+                            "Max-Age=43200"
+                        )
+                    },
+                )
+                return
+            expected = os.environ.get("QA_ADMIN_PASSWORD", "")
             if len(expected.strip()) < 12:
                 self.send_json({
                     "error": "Set QA_ADMIN_PASSWORD to at least 12 characters in qa-platform/.env, then restart the server."
                 }, 503)
                 return
-            password = data.get("password")
             if not isinstance(password, str) or not hmac.compare_digest(password, expected):
                 self.send_json({"error": "Admin password is incorrect."}, 401)
                 return
             token = self.issue_admin_session()
             self.send_json(
-                {"authenticated": True, "role": "Admin"},
+                {"authenticated": True, "role": "Global Admin"},
                 extra={
                     "Set-Cookie": (
                         f"trace_admin_session={token}; Path=/; HttpOnly; SameSite=Strict; "
@@ -1833,8 +3032,294 @@ class QAHandler(BaseHTTPRequestHandler):
         if parts == ["api", "auth", "logout"]:
             self.send_json({"authenticated": False}, extra=self.logout_admin())
             return
+        if len(parts) == 4 and parts[:2] == ["api", "users"] and \
+            parts[3] in ("activate", "deactivate"):
+            user_id = self.parse_project_id(parts[2])
+            actor = self.current_user(db) or {}
+            tenant_id = actor.get("tenant_id", 1)
+            user = db.execute(
+                """SELECT u.id,u.status,m.id membership_id,m.status membership_status,
+                r.name role_name,m.tenant_id
+                FROM users u JOIN tenant_memberships m ON m.user_id=u.id
+                JOIN roles r ON r.id=m.role_id
+                WHERE u.id=? AND m.tenant_id=?""",
+                (user_id, tenant_id),
+            ).fetchone()
+            if not user:
+                self.send_json({"error": "User not found in this workspace."}, 404)
+                return
+            new_status = "Active" if parts[3] == "activate" else "Inactive"
+            tenant_scoped_admin = self.is_tenant_admin(actor)
+            if tenant_scoped_admin and new_status == "Active" and user["status"] != "Active":
+                self.send_json({
+                    "error": "This account is inactive at the system level. Contact the system administrator."
+                }, 409)
+                return
+            if user["membership_status"] == new_status and (
+                tenant_scoped_admin or user["status"] == new_status
+            ):
+                self.send_json({"status": new_status})
+                return
+            if new_status == "Inactive" and user["role_name"] in ("Admin", "Global Admin"):
+                lock_global_admin_role(db)
+                active_admins = active_global_admin_count(
+                    db, tenant_id if tenant_scoped_admin else None
+                )
+                if (
+                    user["membership_status"] == "Active"
+                    and (tenant_scoped_admin or user["status"] == "Active")
+                    and active_admins <= 1
+                ):
+                    self.send_json({
+                        "error": "The last active Global Admin cannot be deactivated."
+                    }, 409)
+                    return
+            previous = (
+                user["membership_status"] if tenant_scoped_admin else user["status"]
+            )
+            if not tenant_scoped_admin:
+                db.execute(
+                    "UPDATE users SET status=?,updated_at=? WHERE id=?",
+                    (new_status, now, user_id),
+                )
+            db.execute(
+                """UPDATE tenant_memberships SET status=?,updated_at=? WHERE id=?""",
+                (new_status, now, user["membership_id"]),
+            )
+            if new_status == "Inactive" and not tenant_scoped_admin:
+                self.invalidate_user_sessions(user_id)
+            action = "user.activated" if new_status == "Active" else "user.deactivated"
+            audit_event(
+                db, actor.get("id"), action, "user", user_id,
+                {"previous": previous, "new": new_status},
+                tenant_id=tenant_id,
+            )
+            audit_event(
+                db, actor.get("id"), "tenant_membership.changed",
+                "tenant_membership", user["membership_id"],
+                {
+                    "previous": user["membership_status"],
+                    "new": new_status,
+                    "tenant_id": tenant_id,
+                },
+                tenant_id=tenant_id,
+            )
+            self.send_json({"status": new_status})
+            return
+        if parts == ["api", "users"]:
+            first_name = validate_text(data, "first_name", True, 80)
+            last_name = validate_text(data, "last_name", True, 80)
+            email = validate_text(data, "email", True, 254).lower()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                raise ValueError("Enter a valid email address.")
+            password = data.get("password")
+            self.validate_password(password)
+            default_role = db.execute(
+                "SELECT id FROM roles WHERE name='User' AND status='Active'"
+            ).fetchone()
+            role_id = self.parse_project_id(
+                data.get("role_id", default_role["id"] if default_role else None)
+            )
+            role = db.execute(
+                "SELECT * FROM roles WHERE id=? AND status='Active'", (role_id,)
+            ).fetchone()
+            if not role:
+                raise ValueError("Choose an active role.")
+            if not self.can_assign_role(db, self.current_user(db), role):
+                self.send_json({"error": "You cannot assign a role with permissions beyond your own."}, 403)
+                return
+            status = self.choice(data, "status", ("Active", "Inactive", "Invited", "Suspended"), "Active")
+            cursor = db.execute(
+                """INSERT INTO users
+                (first_name,last_name,email,password_hash,role_id,phone,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    first_name, last_name, email, hash_password(password), role_id,
+                    validate_text(data, "phone", False, 40), status, now, now,
+                ),
+            )
+            user_id = cursor.lastrowid
+            actor = self.current_user(db)
+            tenant_id = actor.get("tenant_id", 1) if actor else 1
+            db.execute(
+                """INSERT INTO tenant_memberships
+                (tenant_id,user_id,role_id,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)""",
+                (tenant_id, user_id, role_id, status, now, now),
+            )
+            sync_user_teams(db, user_id, tenant_id, data.get("team_ids", []), actor.get("id"))
+            audit_event(
+                db, actor.get("id"), "user.created",
+                "user", user_id,
+                {
+                    "previous": None,
+                    "new": {
+                        "email": email, "role": role["name"], "status": status,
+                    },
+                },
+                tenant_id=tenant_id,
+            )
+            audit_event(
+                db, actor.get("id"), "tenant_membership.created",
+                "tenant_membership", user_id,
+                {"tenant_id": tenant_id, "role": role["name"], "status": status},
+                tenant_id=tenant_id,
+            )
+            self.send_json(user_public_dict(db, user_id, tenant_id), 201)
+            return
+        if parts == ["api", "teams"]:
+            name = validate_text(data, "name", True, 120)
+            description = validate_text(data, "description", False, 2000)
+            owner_id = self.parse_project_id(data.get("owner_user_id"))
+            actor = self.current_user(db) or {}
+            tenant_id = actor.get("tenant_id", 1)
+            owner = db.execute(
+                """SELECT id FROM tenant_memberships
+                WHERE user_id=? AND tenant_id=? AND status='Active'""",
+                (owner_id, tenant_id),
+            ).fetchone()
+            if not owner:
+                raise ValueError("Choose an active team owner.")
+            status = self.choice(data, "status", ("Active", "Inactive"), "Active")
+            cursor = db.execute(
+                """INSERT INTO teams(name,description,tenant_id,owner_user_id,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?)""",
+                (name, description, tenant_id, owner_id, status, now, now),
+            )
+            team_id = cursor.lastrowid
+            db.execute(
+                "INSERT INTO team_memberships(team_id,user_id,added_at) VALUES(?,?,?)",
+                (team_id, owner_id, now),
+            )
+            actor_id = (self.current_user(db) or {}).get("id")
+            if actor_id and actor_id != owner_id:
+                db.execute(
+                    """INSERT OR IGNORE INTO team_memberships(team_id,user_id,added_at)
+                    VALUES(?,?,?)""",
+                    (team_id, actor_id, now),
+                )
+            audit_event(
+                db, actor_id,
+                "team.created", "team", team_id, {"name": name, "owner_user_id": owner_id},
+                tenant_id=tenant_id,
+            )
+            self.send_json(
+                dict(db.execute(
+                    """SELECT t.*,u.first_name||' '||u.last_name owner_name,
+                    (SELECT COUNT(*) FROM team_memberships tm WHERE tm.team_id=t.id) member_count
+                    FROM teams t JOIN users u ON u.id=t.owner_user_id WHERE t.id=?""",
+                    (team_id,),
+                ).fetchone()),
+                201,
+            )
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "teams"] and parts[3] == "members":
+            team_id = self.parse_project_id(parts[2])
+            user_id = self.parse_project_id(data.get("user_id"))
+            actor = self.current_user(db) or {}
+            team = db.execute(
+                "SELECT id,tenant_id FROM teams WHERE id=? AND status='Active'",
+                (team_id,),
+            ).fetchone()
+            if team and not self.is_global_admin(actor) and \
+                team["tenant_id"] != actor.get("tenant_id"):
+                self.send_json({"error": "Team not found in this workspace."}, 404)
+                return
+            user = db.execute(
+                """SELECT u.id FROM users u JOIN tenant_memberships m
+                ON m.user_id=u.id WHERE u.id=? AND u.status='Active'
+                AND m.tenant_id=? AND m.status='Active'""",
+                (user_id, team["tenant_id"] if team else None),
+            ).fetchone()
+            if not team or not user:
+                raise ValueError("Choose an active team and active user.")
+            inserted = db.execute(
+                """INSERT OR IGNORE INTO team_memberships(team_id,user_id,added_at)
+                VALUES(?,?,?)""",
+                (team_id, user_id, now),
+            ).rowcount
+            if inserted:
+                audit_event(
+                    db, (self.current_user(db) or {}).get("id"),
+                    "team.member_added", "team", team_id, {"user_id": user_id},
+                    tenant_id=team["tenant_id"],
+                )
+            self.send_json({"added": bool(inserted)})
+            return
+        if parts == ["api", "roles"]:
+            name = validate_text(data, "name", True, 80)
+            if name.casefold() in ("admin", "global admin"):
+                raise ValueError("The system Global Admin role is protected.")
+            permissions = self.validated_permissions(data.get("permissions", []))
+            actor = self.current_user(db)
+            actor_permissions = set(self.user_permissions(db, actor))
+            if not (self.is_global_admin(actor) or self.is_tenant_admin(actor)) and \
+                not set(permissions).issubset(actor_permissions):
+                self.send_json({"error": "You cannot grant permissions beyond your own."}, 403)
+                return
+            description = validate_text(data, "description", False, 1000)
+            tenant_id = (actor or {}).get("tenant_id", 1)
+            cursor = db.execute(
+                """INSERT INTO roles
+                (name,description,permissions_json,tenant_id,is_system,status,created_at,updated_at)
+                VALUES(?,?,?,?,0,'Active',?,?)""",
+                (name, description, json.dumps(permissions), tenant_id, now, now),
+            )
+            role_id = cursor.lastrowid
+            sync_role_permissions(db, role_id, permissions)
+            audit_event(
+                db, (self.current_user(db) or {}).get("id"),
+                "role.created", "role", role_id,
+                {"name": name, "permission_count": len(permissions)},
+                tenant_id=tenant_id,
+            )
+            self.send_json({
+                "id": role_id,
+                "name": name,
+                "description": description,
+                "permissions": permissions,
+                "status": "Active",
+                "created_at": now,
+                "user_count": 0,
+                "permission_count": len(permissions),
+            }, 201)
+            return
         if parts == ["api", "ai", "settings"]:
             self.send_json(save_provider_settings(db, data))
+            return
+        if parts == ["api", "custom-fields"]:
+            configuration = custom_field_configuration(data)
+            tenant_id = (self.current_user(db) or {}).get("tenant_id", 1)
+            duplicate = db.execute(
+                """SELECT 1 FROM custom_fields
+                WHERE tenant_id=? AND module_key=? AND lower(name)=lower(?)""",
+                (tenant_id, configuration["module_key"], configuration["name"]),
+            ).fetchone()
+            if duplicate:
+                self.send_json({"error": "A field with this name already exists for that form."}, 409)
+                return
+            cursor = db.execute(
+                """INSERT INTO custom_fields
+                (tenant_id,module_key,name,label,field_type,description,required,active,
+                display_order,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    tenant_id, configuration["module_key"], configuration["name"],
+                    configuration["label"], configuration["field_type"],
+                    configuration["description"], configuration["required"],
+                    configuration["active"], configuration["display_order"], now, now,
+                ),
+            )
+            field_id = cursor.lastrowid
+            for option in configuration["options"]:
+                db.execute(
+                    """INSERT INTO custom_field_options
+                    (custom_field_id,label,value,display_order) VALUES(?,?,?,?)""",
+                    (field_id, option["label"], option["value"], option["display_order"]),
+                )
+            self.send_json(custom_field_dict(
+                db, db.execute("SELECT * FROM custom_fields WHERE id=?", (field_id,)).fetchone()
+            ), 201)
             return
         if parts in (["api", "ai", "test"], ["api", "ai", "ollama", "test"]):
             settings = active_provider_config(db)
@@ -1865,14 +3350,20 @@ class QAHandler(BaseHTTPRequestHandler):
                 raise ValueError("Project key may contain only letters, numbers, hyphens, and underscores.")
             owner = validate_text(data, "qa_owner", True, 120)
             status = self.choice(data, "status", ("Active", "Inactive"), "Active")
+            tenant_id = (self.current_user(db) or {}).get("tenant_id", 1)
             cur = db.execute(
-                "INSERT INTO projects(project_key,name,product_type,description,version,environment,status,qa_owner,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (key, name, validate_text(data, "product_type", limit=80),
+                "INSERT INTO projects(tenant_id,project_key,name,product_type,description,version,environment,status,qa_owner,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (tenant_id, key, name, validate_text(data, "product_type", limit=80),
                  validate_text(data, "description"), validate_text(data, "version", limit=40),
                  validate_text(data, "environment", limit=80), status, owner, now, now),
             )
-            ensure_project_storage(self.server.storage_root, cur.lastrowid)
-            self.send_json(row_dict(db.execute("SELECT * FROM projects WHERE id=?", (cur.lastrowid,)).fetchone()), 201)
+            project_id = cur.lastrowid
+            validate_custom_field_values(
+                db, "projects", project_id, data.get("custom_fields", {}),
+                required_on_create=True,
+            )
+            ensure_project_storage(self.server.storage_root, project_id)
+            self.send_json(row_dict(db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()), 201)
             return
         if len(parts) < 4 or parts[:2] != ["api", "projects"]:
             self.send_json({"error": "Not found"}, 404)
@@ -1880,6 +3371,60 @@ class QAHandler(BaseHTTPRequestHandler):
         pid = self.parse_project_id(parts[2])
         if not project_exists(db, pid):
             self.send_json({"error": "Project not found"}, 404)
+            return
+        if parts[3] == "attachments" and len(parts) == 4:
+            module_key = data.get("module_key", "")
+            record_id = self.parse_project_id(data.get("record_id", ""))
+            if not record_belongs_to_project(db, module_key, pid, record_id):
+                self.send_json({"error": "Record not found in this project."}, 404)
+                return
+            filename = data.get("filename")
+            file_bytes = data.get("file_bytes")
+            if not isinstance(filename, str) or not filename.strip():
+                raise ValueError("Choose a file to upload.")
+            if not isinstance(file_bytes, bytes) or not file_bytes:
+                raise ValueError("Attachment upload is empty.")
+            if len(file_bytes) > MAX_ATTACHMENT_SIZE:
+                raise ValueError("Attachment is too large (maximum 5 MB).")
+            filename = filename.replace("\\", "/").split("/")[-1]
+            filename = "".join(
+                character for character in filename
+                if character.isprintable() and character not in '\"<>|:*?'
+            ).strip()
+            filename = filename[:180]
+            extension = Path(filename).suffix.lower()
+            if not filename or extension not in ATTACHMENT_TYPES:
+                raise ValueError(
+                    "Unsupported attachment type. Choose PDF, DOCX, XLSX, ZIP, CSV, "
+                    "JSON, Markdown, TXT, PNG, JPEG, GIF, or WebP."
+                )
+            media_type = ATTACHMENT_TYPES[extension]
+            digest = hashlib.sha256(file_bytes).hexdigest()
+            if db.execute(
+                """SELECT 1 FROM form_attachments
+                WHERE module_key=? AND record_id=? AND sha256=?""",
+                (module_key, record_id, digest),
+            ).fetchone():
+                self.send_json({"error": "This file is already attached to the record."}, 409)
+                return
+            cursor = db.execute(
+                """INSERT INTO form_attachments
+                (project_id,module_key,record_id,filename,content_type,file_size_bytes,
+                sha256,file_data,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    pid, module_key, record_id, filename, media_type, len(file_bytes),
+                    digest, file_bytes, now,
+                ),
+            )
+            self.send_json({
+                "id": cursor.lastrowid,
+                "module_key": module_key,
+                "record_id": record_id,
+                "filename": filename,
+                "content_type": media_type,
+                "file_size_bytes": len(file_bytes),
+                "uploaded_at": now,
+            }, 201)
             return
         if parts[3] == "applications" and len(parts) == 5 and parts[4] == "import":
             filename = data.get("filename")
@@ -1987,31 +3532,8 @@ class QAHandler(BaseHTTPRequestHandler):
             })
             return
         if parts[3] == "analyses" and len(parts) == 4:
-            input_path = validate_application_path(data.get("input_path"))
-            runtime = self.server.rea_runtime()
-            if not runtime.get("analysis_enabled"):
-                self.send_json(
-                    {"error": runtime.get("reason") or "REA runtime is unavailable."},
-                    503,
-                )
-                return
-            cursor = db.execute(
-                """INSERT INTO application_analyses
-                (project_id,input_path,status,created_at) VALUES(?,?,'queued',?)""",
-                (pid, input_path, now),
-            )
-            analysis_id = cursor.lastrowid
-            self.send_json(
-                {
-                    "id": analysis_id,
-                    "project_id": pid,
-                    "input_path": input_path,
-                    "status": "queued",
-                    "created_at": now,
-                },
-                202,
-            )
-            return analysis_id
+            self.send_json({"error": "App Analysis is coming soon."}, 503)
+            return
         if parts[3] == "requirements" and len(parts) == 4:
             title = validate_text(data, "title", True, 200)
             requirement = {
@@ -2066,6 +3588,10 @@ class QAHandler(BaseHTTPRequestHandler):
                  )),
                  validate_text(data, "source_document", limit=200),
                  validate_text(data, "source_section", limit=200), "Needs review", now),
+            )
+            validate_custom_field_values(
+                db, "requirements", cur.lastrowid,
+                data.get("custom_fields", {}), required_on_create=True,
             )
             self.send_json(row_dict(db.execute("SELECT * FROM requirements WHERE id=?", (cur.lastrowid,)).fetchone()), 201)
             return
@@ -2765,6 +4291,10 @@ class QAHandler(BaseHTTPRequestHandler):
                  source_requirement["title"] if source_requirement else "",
                  now, now),
             )
+            validate_custom_field_values(
+                db, "test-cases", cur.lastrowid,
+                data.get("custom_fields", {}), required_on_create=True,
+            )
             self.send_json(row_dict(db.execute("SELECT * FROM test_cases WHERE id=?", (cur.lastrowid,)).fetchone()), 201)
             return
         if parts[3] == "bugs" and len(parts) == 4:
@@ -2778,6 +4308,10 @@ class QAHandler(BaseHTTPRequestHandler):
                  self.choice(data, "severity", ("Critical", "High", "Medium", "Low"), "Medium"),
                  self.choice(data, "priority", ("P1", "P2", "P3", "P4"), "P2"), "Open",
                  validate_text(data, "assigned_to", limit=120), now, now),
+            )
+            validate_custom_field_values(
+                db, "bugs", cur.lastrowid,
+                data.get("custom_fields", {}), required_on_create=True,
             )
             self.send_json(row_dict(db.execute("SELECT * FROM bugs WHERE id=?", (cur.lastrowid,)).fetchone()), 201)
             return
@@ -2829,6 +4363,516 @@ class QAHandler(BaseHTTPRequestHandler):
 
     def patch_api(self, db, path, data):
         parts = path.strip("/").split("/")
+        actor = self.current_user(db) or {}
+        actor_id = actor.get("id")
+        if parts == ["api", "profile"]:
+            global_admin = bool(actor.get("global_admin") and not actor_id)
+            if not actor_id and not global_admin:
+                self.send_json({"error": "A user account is required to update a profile."}, 401)
+                return
+            existing = db.execute(
+                "SELECT * FROM global_admin_profile WHERE id=1" if global_admin
+                else "SELECT * FROM users WHERE id=?",
+                () if global_admin else (actor_id,),
+            ).fetchone()
+            first_name = validate_text(data, "first_name", True, 80)
+            last_name = validate_text(data, "last_name", True, 80)
+            email = validate_text(data, "email", True, 254).lower()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                raise ValueError("Enter a valid email address.")
+            if not global_admin and db.execute(
+                "SELECT 1 FROM users WHERE email=? COLLATE NOCASE AND id<>?",
+                (email, actor_id),
+            ).fetchone():
+                self.send_json({"error": "An account with this email already exists."}, 409)
+                return
+            phone = validate_text(data, "phone", False, 40)
+            image_data = existing["profile_image_data"]
+            image_type = existing["profile_image_type"]
+            if "profile_image_data" in data:
+                encoded = data.get("profile_image_data")
+                if encoded in (None, ""):
+                    image_data, image_type = None, ""
+                else:
+                    image_type = data.get("profile_image_type", "")
+                    if image_type not in IMAGE_TYPES:
+                        raise ValueError("Choose a supported profile image (PNG, JPEG, GIF, or WebP).")
+                    if not isinstance(encoded, str):
+                        raise ValueError("Profile image data is invalid.")
+                    try:
+                        image_data = base64.b64decode(encoded, validate=True)
+                    except (ValueError, binascii.Error):
+                        raise ValueError("Profile image data is invalid.")
+                    if len(image_data) > 1024 * 1024:
+                        raise ValueError("Profile image must be 1 MB or smaller.")
+            if global_admin:
+                db.execute(
+                    """UPDATE global_admin_profile SET first_name=?,last_name=?,email=?,phone=?,
+                    profile_image_type=?,profile_image_data=?,updated_at=? WHERE id=1""",
+                    (first_name, last_name, email, phone, image_type, image_data, timestamp()),
+                )
+                audit_event(
+                    db, None, "global_admin.profile_updated", "global_admin", 1,
+                    {
+                        "previous": {
+                            "first_name": existing["first_name"],
+                            "last_name": existing["last_name"],
+                            "email": existing["email"],
+                            "phone": existing["phone"],
+                            "profile_image_type": existing["profile_image_type"],
+                            "has_profile_image": existing["profile_image_data"] is not None,
+                        },
+                        "new": {
+                            "first_name": first_name,
+                            "last_name": last_name,
+                            "email": email,
+                            "phone": phone,
+                            "profile_image_type": image_type,
+                            "has_profile_image": image_data is not None,
+                        },
+                    },
+                )
+                profile = dict(db.execute(
+                    """SELECT first_name,last_name,email,phone,'Active' status,
+                    created_at,NULL last_login_at,profile_image_type,profile_image_data
+                    FROM global_admin_profile WHERE id=1"""
+                ).fetchone())
+                profile["global_admin"] = True
+                profile["role_name"] = "Global Admin"
+                if profile["profile_image_data"] is not None:
+                    profile["profile_image_data"] = base64.b64encode(
+                        profile["profile_image_data"]
+                    ).decode("ascii")
+                self.send_json(profile)
+            else:
+                db.execute(
+                    """UPDATE users SET first_name=?,last_name=?,email=?,phone=?,
+                    profile_image_type=?,profile_image_data=?,updated_at=? WHERE id=?""",
+                    (first_name, last_name, email, phone, image_type, image_data, timestamp(), actor_id),
+                )
+                audit_event(
+                    db, actor_id, "user.profile_updated", "user", actor_id,
+                    {
+                        "previous": {
+                            "first_name": existing["first_name"],
+                            "last_name": existing["last_name"],
+                            "email": existing["email"],
+                            "phone": existing["phone"],
+                            "profile_image_type": existing["profile_image_type"],
+                            "has_profile_image": existing["profile_image_data"] is not None,
+                        },
+                        "new": {
+                            "first_name": first_name,
+                            "last_name": last_name,
+                            "email": email,
+                            "phone": phone,
+                            "profile_image_type": image_type,
+                            "has_profile_image": image_data is not None,
+                        },
+                    },
+                    tenant_id=actor.get("tenant_id"),
+                )
+                self.send_json(user_public_dict(db, actor_id))
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "profile"] and parts[2] == "password":
+            if not actor_id:
+                self.send_json({"error": "A user account is required to change a password."}, 401)
+                return
+            row = db.execute(
+                "SELECT password_hash FROM users WHERE id=?", (actor_id,)
+            ).fetchone()
+            current = data.get("current_password", "")
+            new_password = data.get("new_password")
+            if not row or not verify_password(current, row["password_hash"]):
+                self.send_json({"error": "Current password is incorrect."}, 401)
+                return
+            self.validate_password(new_password)
+            if data.get("confirm_password") != new_password:
+                raise ValueError("New password and confirmation must match.")
+            db.execute(
+                "UPDATE users SET password_hash=?,updated_at=? WHERE id=?",
+                (hash_password(new_password), timestamp(), actor_id),
+            )
+            self.invalidate_user_sessions(actor_id, keep_current=True)
+            audit_event(
+                db, actor_id, "user.password_changed", "user", actor_id,
+                tenant_id=actor.get("tenant_id"),
+            )
+            self.send_json({"updated": True})
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "users"]:
+            user_id = self.parse_project_id(parts[2])
+            existing = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            if not existing:
+                self.send_json({"error": "User not found."}, 404)
+                return
+            actor = self.current_user(db) or {}
+            actor_id = actor.get("id")
+            tenant_id = actor.get("tenant_id", 1)
+            membership = db.execute(
+                """SELECT m.*,r.name role_name FROM tenant_memberships m
+                JOIN roles r ON r.id=m.role_id
+                WHERE m.user_id=? AND m.tenant_id=?""",
+                (user_id, tenant_id),
+            ).fetchone()
+            if not membership:
+                self.send_json({"error": "User not found in this workspace."}, 404)
+                return
+            tenant_scoped_admin = self.is_tenant_admin(actor)
+            other_memberships = db.execute(
+                """SELECT COUNT(*) FROM tenant_memberships
+                WHERE user_id=? AND tenant_id<>?""",
+                (user_id, tenant_id),
+            ).fetchone()[0]
+            first_name = validate_text(data, "first_name", True, 80)
+            last_name = validate_text(data, "last_name", True, 80)
+            email = validate_text(data, "email", True, 254).lower()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                raise ValueError("Enter a valid email address.")
+            if db.execute(
+                "SELECT 1 FROM users WHERE email=? COLLATE NOCASE AND id<>?",
+                (email, user_id),
+            ).fetchone():
+                self.send_json({"error": "An account with this email already exists."}, 409)
+                return
+            phone = validate_text(data, "phone", False, 40)
+            profile_changed = (
+                first_name != existing["first_name"]
+                or last_name != existing["last_name"]
+                or email != existing["email"]
+                or phone != existing["phone"]
+            )
+            if tenant_scoped_admin and other_memberships and (
+                profile_changed or bool(data.get("password"))
+            ):
+                self.send_json({
+                    "error": "This account belongs to another workspace. Its shared profile and password can only be changed by the account owner or system administrator."
+                }, 409)
+                return
+            role_id = self.parse_project_id(data.get("role_id", membership["role_id"]))
+            role = db.execute(
+                "SELECT * FROM roles WHERE id=? AND status='Active'", (role_id,)
+            ).fetchone()
+            if not role:
+                raise ValueError("Choose an active role.")
+            role_changed = membership["role_id"] != role_id
+            if role_changed and not self.can_assign_role(db, actor, role):
+                self.send_json({"error": "You cannot assign a role with permissions beyond your own."}, 403)
+                return
+            if role_changed and "users.change_role" not in self.user_permissions(db, actor) and \
+                "*" not in self.user_permissions(db, actor):
+                self.send_json({"error": "Your role does not allow this action (users.change_role)."}, 403)
+                return
+            status = self.choice(
+                data, "status", ("Active", "Inactive", "Invited", "Suspended"),
+                membership["status"] if tenant_scoped_admin else existing["status"],
+            )
+            if tenant_scoped_admin and status == "Active" and existing["status"] != "Active":
+                self.send_json({
+                    "error": "This account is inactive at the system level. Contact the system administrator."
+                }, 409)
+                return
+            if status != existing["status"]:
+                status_permission = "users.activate" if status == "Active" else "users.deactivate"
+                if status_permission not in self.user_permissions(db, actor) and \
+                    "*" not in self.user_permissions(db, actor):
+                    self.send_json({"error": f"Your role does not allow this action ({status_permission})."}, 403)
+                    return
+            is_active_target_admin = (
+                membership["role_name"] in ("Admin", "Global Admin")
+                and existing["status"] == "Active"
+                and membership["status"] == "Active"
+            )
+            if is_active_target_admin and (
+                role["name"] != "Global Admin" or status != "Active"
+            ):
+                lock_global_admin_role(db)
+                active_admins = active_global_admin_count(
+                    db, tenant_id if tenant_scoped_admin else None
+                )
+                if active_admins <= 1:
+                    message = (
+                        "The last active Global Admin cannot be deactivated."
+                        if status != "Active" else
+                        "The last active Global Admin cannot be reassigned."
+                    )
+                    self.send_json({"error": message}, 409)
+                    return
+            if actor_id == user_id and role["name"] == "Global Admin" and \
+                membership["role_name"] != "Global Admin":
+                self.send_json({"error": "You cannot assign Global Admin to your own account."}, 403)
+                return
+            previous = {
+                "first_name": existing["first_name"], "last_name": existing["last_name"],
+                "email": existing["email"], "phone": existing["phone"],
+                "role": membership["role_name"], "status": membership["status"],
+            }
+            password_hash = existing["password_hash"]
+            if data.get("password"):
+                self.validate_password(data["password"])
+                password_hash = hash_password(data["password"])
+            if tenant_scoped_admin:
+                db.execute(
+                    """UPDATE users SET first_name=?,last_name=?,email=?,phone=?,
+                    password_hash=?,updated_at=? WHERE id=?""",
+                    (
+                        first_name, last_name, email, phone,
+                        password_hash, timestamp(), user_id,
+                    ),
+                )
+            else:
+                db.execute(
+                    """UPDATE users SET first_name=?,last_name=?,email=?,phone=?,role_id=?,
+                    status=?,password_hash=?,updated_at=? WHERE id=?""",
+                    (
+                        first_name, last_name, email, phone, role_id, status,
+                        password_hash, timestamp(), user_id,
+                    ),
+                )
+            db.execute(
+                """UPDATE tenant_memberships SET role_id=?,status=?,updated_at=?
+                WHERE id=?""",
+                (role_id, status, timestamp(), membership["id"]),
+            )
+            sync_user_teams(db, user_id, tenant_id, data.get("team_ids"), actor_id)
+            membership_status_changed = status != membership["status"]
+            new_team_ids = [
+                row["team_id"] for row in db.execute(
+                    """SELECT tm.team_id FROM team_memberships tm JOIN teams t
+                    ON t.id=tm.team_id WHERE tm.user_id=? AND t.tenant_id=?
+                    ORDER BY tm.team_id""",
+                    (user_id, tenant_id),
+                )
+            ]
+            new_values = {
+                "first_name": first_name, "last_name": last_name, "email": email,
+                "phone": validate_text(data, "phone", False, 40),
+                "role": role["name"], "status": status, "team_ids": new_team_ids,
+            }
+            audit_event(
+                db, actor_id, "user.updated", "user", user_id,
+                {"previous": previous, "new": new_values},
+                tenant_id=tenant_id,
+            )
+            if role_changed:
+                audit_event(
+                    db, actor_id, "user.role_changed", "user", user_id,
+                    {"previous": membership["role_name"], "new": role["name"]},
+                    tenant_id=tenant_id,
+                )
+            if role_changed or membership_status_changed:
+                audit_event(
+                    db, actor_id, "tenant_membership.changed",
+                    "tenant_membership", membership["id"],
+                    {
+                        "previous": {
+                            "role": membership["role_name"],
+                            "status": membership["status"],
+                        },
+                        "new": {"role": role["name"], "status": status},
+                        "tenant_id": tenant_id,
+                    },
+                    tenant_id=tenant_id,
+                )
+            if membership_status_changed:
+                action = "user.activated" if status == "Active" else "user.deactivated"
+                audit_event(
+                    db, actor_id, action, "user", user_id,
+                    {"previous": membership["status"], "new": status},
+                    tenant_id=tenant_id,
+                )
+            if status != "Active" and not tenant_scoped_admin:
+                self.invalidate_user_sessions(user_id)
+            if data.get("password"):
+                audit_event(
+                    db, actor_id, "user.password_reset", "user", user_id,
+                    tenant_id=tenant_id,
+                )
+                self.invalidate_user_sessions(user_id, keep_current=(actor_id == user_id))
+            self.send_json(user_public_dict(db, user_id, tenant_id))
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "teams"]:
+            team_id = self.parse_project_id(parts[2])
+            existing = db.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone()
+            actor = self.current_user(db) or {}
+            if not existing or (
+                not self.is_global_admin(actor)
+                and existing["tenant_id"] != actor.get("tenant_id")
+            ):
+                self.send_json({"error": "Team not found."}, 404)
+                return
+            name = validate_text(data, "name", True, 120)
+            description = validate_text(data, "description", False, 2000)
+            owner_id = self.parse_project_id(data.get("owner_user_id", existing["owner_user_id"]))
+            owner = db.execute(
+                """SELECT id FROM tenant_memberships
+                WHERE user_id=? AND tenant_id=? AND status='Active'""",
+                (owner_id, existing["tenant_id"]),
+            ).fetchone()
+            if not owner:
+                raise ValueError("Choose an active team owner.")
+            status = self.choice(data, "status", ("Active", "Inactive"), existing["status"])
+            db.execute(
+                """UPDATE teams SET name=?,description=?,owner_user_id=?,status=?,updated_at=?
+                WHERE id=?""",
+                (name, description, owner_id, status, timestamp(), team_id),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO team_memberships(team_id,user_id,added_at)
+                VALUES(?,?,?)""",
+                (team_id, owner_id, timestamp()),
+            )
+            audit_event(
+                db, actor_id, "team.updated", "team", team_id,
+                {"name": name, "owner_user_id": owner_id, "status": status},
+                tenant_id=existing["tenant_id"],
+            )
+            self.send_json(dict(db.execute(
+                """SELECT t.*,u.first_name||' '||u.last_name owner_name,
+                (SELECT COUNT(*) FROM team_memberships tm WHERE tm.team_id=t.id) member_count
+                FROM teams t LEFT JOIN users u ON u.id=t.owner_user_id WHERE t.id=?""",
+                (team_id,),
+            ).fetchone()))
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "roles"]:
+            role_id = self.parse_project_id(parts[2])
+            existing = db.execute("SELECT * FROM roles WHERE id=?", (role_id,)).fetchone()
+            if not existing or (
+                not self.is_global_admin(actor)
+                and existing["tenant_id"] != actor.get("tenant_id")
+            ):
+                self.send_json({"error": "Role not found."}, 404)
+                return
+            if existing["is_system"]:
+                self.send_json({"error": "System roles are protected from modification."}, 403)
+                return
+            name = validate_text(data, "name", True, 80)
+            description = validate_text(data, "description", False, 1000)
+            status = self.choice(data, "status", ("Active", "Inactive"), existing["status"])
+            if status == "Inactive" and db.execute(
+                "SELECT 1 FROM tenant_memberships WHERE role_id=? LIMIT 1", (role_id,)
+            ).fetchone():
+                self.send_json(
+                    {"error": "Reassign users from this role before deactivating it."}, 409
+                )
+                return
+            permissions = json.loads(existing["permissions_json"])
+            if "permissions" in data:
+                actor_permissions = self.user_permissions(db, actor)
+                if "*" not in actor_permissions and "roles.manage-permissions" not in actor_permissions:
+                    self.send_json({"error": "You cannot manage role permissions."}, 403)
+                    return
+                permissions = self.validated_permissions(data["permissions"])
+                if not (self.is_global_admin(actor) or self.is_tenant_admin(actor)) \
+                    and not set(permissions).issubset(actor_permissions):
+                    self.send_json({"error": "You cannot grant permissions beyond your own."}, 403)
+                    return
+            previous_permissions = json.loads(existing["permissions_json"])
+            db.execute(
+                """UPDATE roles SET name=?,description=?,permissions_json=?,status=?,updated_at=?
+                WHERE id=?""",
+                (name, description, json.dumps(permissions), status, timestamp(), role_id),
+            )
+            if permissions != previous_permissions:
+                sync_role_permissions(db, role_id, permissions)
+            audit_event(
+                db, actor_id, "role.updated", "role", role_id,
+                {
+                    "name": name, "status": status,
+                    "permission_count": len(permissions),
+                },
+                tenant_id=(actor or {}).get("tenant_id", 1),
+            )
+            if permissions != previous_permissions:
+                audit_event(
+                    db, actor_id, "permission.changed", "role", role_id,
+                    {"previous": previous_permissions, "new": permissions},
+                    tenant_id=(actor or {}).get("tenant_id", 1),
+                )
+            self.send_json({
+                "id": role_id, "name": name, "description": description,
+                "permissions": permissions, "status": status,
+                "created_at": existing["created_at"],
+            })
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "custom-fields"]:
+            field_id = self.parse_project_id(parts[2])
+            actor = self.current_user(db) or {}
+            tenant_id = actor.get("tenant_id", 1)
+            existing = db.execute(
+                """SELECT * FROM custom_fields WHERE id=?
+                AND (?=1 OR tenant_id=?)""",
+                (field_id, int(self.is_global_admin(actor)), tenant_id),
+            ).fetchone()
+            if not existing:
+                self.send_json({"error": "Custom field not found."}, 404)
+                return
+            configuration = custom_field_configuration(data, existing)
+            duplicate = db.execute(
+                """SELECT 1 FROM custom_fields WHERE tenant_id=? AND module_key=?
+                AND lower(name)=lower(?) AND id<>?""",
+                (
+                    existing["tenant_id"], configuration["module_key"],
+                    configuration["name"], field_id,
+                ),
+            ).fetchone()
+            if duplicate:
+                self.send_json({"error": "A field with this name already exists for that form."}, 409)
+                return
+            value_count = db.execute(
+                "SELECT COUNT(*) FROM custom_field_values WHERE custom_field_id=?",
+                (field_id,),
+            ).fetchone()[0]
+            if value_count and (
+                configuration["module_key"] != existing["module_key"]
+                or configuration["field_type"] != existing["field_type"]
+            ):
+                self.send_json(
+                    {"error": "A field with saved values cannot change form or field type."},
+                    409,
+                )
+                return
+            if configuration["options"] is not None:
+                valid_values = {item["value"] for item in configuration["options"]}
+                stored_values = {
+                    row["value"] for row in db.execute(
+                        """SELECT value FROM custom_field_values
+                        WHERE custom_field_id=? AND value<>''""",
+                        (field_id,),
+                    )
+                }
+                if not stored_values.issubset(valid_values):
+                    self.send_json(
+                        {"error": "An option with saved record values cannot be removed."},
+                        409,
+                    )
+                    return
+            db.execute(
+                """UPDATE custom_fields SET module_key=?,name=?,label=?,field_type=?,
+                description=?,required=?,active=?,display_order=?,updated_at=? WHERE id=?""",
+                (
+                    configuration["module_key"], configuration["name"],
+                    configuration["label"], configuration["field_type"],
+                    configuration["description"], configuration["required"],
+                    configuration["active"], configuration["display_order"],
+                    timestamp(), field_id,
+                ),
+            )
+            if configuration["options"] is not None:
+                db.execute(
+                    "DELETE FROM custom_field_options WHERE custom_field_id=?",
+                    (field_id,),
+                )
+                for option in configuration["options"]:
+                    db.execute(
+                        """INSERT INTO custom_field_options
+                        (custom_field_id,label,value,display_order) VALUES(?,?,?,?)""",
+                        (field_id, option["label"], option["value"], option["display_order"]),
+                    )
+            self.send_json(custom_field_dict(
+                db, db.execute("SELECT * FROM custom_fields WHERE id=?", (field_id,)).fetchone()
+            ))
+            return
         if len(parts) == 3 and parts[:2] == ["api", "projects"]:
             pid = self.parse_project_id(parts[2])
             row = db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
@@ -2857,6 +4901,10 @@ class QAHandler(BaseHTTPRequestHandler):
                 version=?,environment=?,status=?,qa_owner=?,updated_at=? WHERE id=?""",
                 (key, name, product_type, description, version, environment, status, owner, timestamp(), pid),
             )
+            if "custom_fields" in data:
+                validate_custom_field_values(
+                    db, "projects", pid, data["custom_fields"]
+                )
             self.send_json(row_dict(db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()))
             return
         if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:5] == [
@@ -3108,11 +5156,225 @@ class QAHandler(BaseHTTPRequestHandler):
         else:
             self.send_json({"error": "Not found"}, 404)
             return
+        if "custom_fields" in data:
+            module_key = {
+                "requirements": "requirements",
+                "test-cases": "test-cases",
+                "bugs": "bugs",
+            }[kind]
+            validate_custom_field_values(
+                db, module_key, record, data["custom_fields"]
+            )
         table = {"requirements": "requirements", "test-cases": "test_cases", "bugs": "bugs"}[kind]
         self.send_json(row_dict(db.execute(f"SELECT * FROM {table} WHERE id=?", (record,)).fetchone()))
 
     def delete_api(self, db, path):
         parts = path.strip("/").split("/")
+        actor_id = (self.current_user(db) or {}).get("id")
+        if len(parts) == 3 and parts[:2] == ["api", "users"]:
+            user_id = self.parse_project_id(parts[2])
+            user = db.execute(
+                """SELECT u.id,u.first_name,u.last_name,u.email,u.phone,u.status,
+                r.name role_name,m.id membership_id,m.tenant_id,m.status membership_status
+                FROM users u JOIN tenant_memberships m ON m.user_id=u.id
+                JOIN roles r ON r.id=m.role_id
+                WHERE u.id=? AND m.tenant_id=?
+                ORDER BY CASE m.status WHEN 'Active' THEN 0 ELSE 1 END LIMIT 1""",
+                (user_id, (self.current_user(db) or {}).get("tenant_id", 1)),
+            ).fetchone()
+            if not user:
+                self.send_json({"error": "User not found in this workspace."}, 404)
+                return
+            if actor_id == user_id:
+                self.send_json({
+                    "error": "You cannot delete your own account while signed in."
+                }, 409)
+                return
+            actor = self.current_user(db) or {}
+            tenant_scoped_admin = self.is_tenant_admin(actor)
+            other_memberships = db.execute(
+                """SELECT COUNT(*) FROM tenant_memberships
+                WHERE user_id=? AND tenant_id<>?""",
+                (user_id, user["tenant_id"]),
+            ).fetchone()[0]
+            if user["role_name"] in ("Admin", "Global Admin") and \
+                user["status"] == "Active" and user["membership_status"] == "Active":
+                lock_global_admin_role(db)
+                admin_count = active_global_admin_count(
+                    db, user["tenant_id"] if tenant_scoped_admin else None
+                )
+                if admin_count <= 1:
+                    self.send_json({
+                        "error": "The last active Global Admin cannot be deleted."
+                    }, 409)
+                    return
+            previous = {
+                "first_name": user["first_name"], "last_name": user["last_name"],
+                "email": user["email"], "phone": user["phone"],
+                "role": user["role_name"], "status": user["status"],
+            }
+            audit_event(
+                db, actor_id,
+                "tenant_membership.removed"
+                if tenant_scoped_admin and other_memberships
+                else "user.deleted",
+                "tenant_membership"
+                if tenant_scoped_admin and other_memberships
+                else "user",
+                user["membership_id"]
+                if tenant_scoped_admin and other_memberships
+                else user_id,
+                {"previous": previous, "account_deleted": not (
+                    tenant_scoped_admin and other_memberships
+                )},
+                tenant_id=user["tenant_id"],
+            )
+            if tenant_scoped_admin and other_memberships:
+                db.execute(
+                    """DELETE FROM team_memberships WHERE user_id=? AND team_id IN
+                    (SELECT id FROM teams WHERE tenant_id=?)""",
+                    (user_id, user["tenant_id"]),
+                )
+                db.execute(
+                    "DELETE FROM tenant_memberships WHERE id=?",
+                    (user["membership_id"],),
+                )
+            else:
+                db.execute("DELETE FROM users WHERE id=?", (user_id,))
+                self.invalidate_user_sessions(user_id)
+            self.send_json({
+                "deleted": True,
+                "account_deleted": not (tenant_scoped_admin and other_memberships),
+            })
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "teams"]:
+            team_id = self.parse_project_id(parts[2])
+            actor = self.current_user(db) or {}
+            row = db.execute(
+                "SELECT id,name,tenant_id FROM teams WHERE id=?", (team_id,)
+            ).fetchone()
+            if not row or (
+                not self.is_global_admin(actor)
+                and row["tenant_id"] != actor.get("tenant_id")
+            ):
+                self.send_json({"error": "Team not found."}, 404)
+                return
+            db.execute(
+                "UPDATE teams SET status='Inactive',updated_at=? WHERE id=?",
+                (timestamp(), team_id),
+            )
+            audit_event(
+                db, actor_id, "team.archived", "team", team_id,
+                {"name": row["name"]}, tenant_id=row["tenant_id"],
+            )
+            self.send_json({"archived": True})
+            return
+        if (
+            len(parts) == 5
+            and parts[:2] == ["api", "teams"]
+            and parts[3] == "members"
+        ):
+            team_id = self.parse_project_id(parts[2])
+            user_id = self.parse_project_id(parts[4])
+            actor = self.current_user(db) or {}
+            team = db.execute(
+                "SELECT owner_user_id,tenant_id FROM teams WHERE id=?", (team_id,)
+            ).fetchone()
+            if team and not self.is_global_admin(actor) and \
+                team["tenant_id"] != actor.get("tenant_id"):
+                self.send_json({"error": "Team not found in this workspace."}, 404)
+                return
+            membership = db.execute(
+                "SELECT 1 FROM team_memberships WHERE team_id=? AND user_id=?",
+                (team_id, user_id),
+            ).fetchone()
+            if not team or not membership:
+                self.send_json({"error": "Team member not found."}, 404)
+                return
+            if team["owner_user_id"] == user_id:
+                self.send_json({"error": "Transfer team ownership before removing its owner."}, 409)
+                return
+            db.execute(
+                "DELETE FROM team_memberships WHERE team_id=? AND user_id=?",
+                (team_id, user_id),
+            )
+            audit_event(
+                db, actor_id, "team.member_removed", "team", team_id,
+                {"user_id": user_id},
+                tenant_id=team["tenant_id"],
+            )
+            self.send_json({"removed": True})
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "roles"]:
+            role_id = self.parse_project_id(parts[2])
+            actor = self.current_user(db) or {}
+            role = db.execute(
+                "SELECT name,is_system,tenant_id FROM roles WHERE id=?", (role_id,)
+            ).fetchone()
+            if not role or (
+                not self.is_global_admin(actor)
+                and role["tenant_id"] != actor.get("tenant_id")
+            ):
+                self.send_json({"error": "Role not found."}, 404)
+                return
+            if role["is_system"]:
+                self.send_json({"error": "System roles cannot be deleted."}, 403)
+                return
+            if db.execute(
+                """SELECT 1 FROM tenant_memberships WHERE role_id=?
+                UNION SELECT 1 FROM users WHERE role_id=? LIMIT 1""",
+                (role_id, role_id),
+            ).fetchone():
+                self.send_json(
+                    {"error": "Reassign users from this role before deleting it."}, 409
+                )
+                return
+            db.execute("DELETE FROM roles WHERE id=?", (role_id,))
+            audit_event(
+                db, actor_id, "role.deleted", "role", role_id,
+                {"name": role["name"]},
+                tenant_id=(actor or {}).get("tenant_id", 1),
+            )
+            self.send_json({"deleted": True})
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "custom-fields"]:
+            field_id = self.parse_project_id(parts[2])
+            actor = self.current_user(db) or {}
+            tenant_id = actor.get("tenant_id", 1)
+            if not db.execute(
+                """SELECT 1 FROM custom_fields WHERE id=?
+                AND (?=1 OR tenant_id=?)""",
+                (field_id, int(self.is_global_admin(actor)), tenant_id),
+            ).fetchone():
+                self.send_json({"error": "Custom field not found."}, 404)
+                return
+            if db.execute(
+                "SELECT 1 FROM custom_field_values WHERE custom_field_id=? LIMIT 1",
+                (field_id,),
+            ).fetchone():
+                self.send_json(
+                    {"error": "This field has saved values. Deactivate it instead of deleting it."},
+                    409,
+                )
+                return
+            db.execute("DELETE FROM custom_fields WHERE id=?", (field_id,))
+            self.send_json({"deleted": True})
+            return
+        if (
+            len(parts) == 5 and parts[:2] == ["api", "projects"]
+            and parts[3] == "attachments"
+        ):
+            project_id = self.parse_project_id(parts[2])
+            attachment_id = self.parse_project_id(parts[4])
+            cursor = db.execute(
+                "DELETE FROM form_attachments WHERE id=? AND project_id=?",
+                (attachment_id, project_id),
+            )
+            if not cursor.rowcount:
+                self.send_json({"error": "Attachment not found."}, 404)
+                return
+            self.send_json({"deleted": True})
+            return
         if (
             len(parts) == 6
             and parts[:2] == ["api", "projects"]
@@ -3132,11 +5394,22 @@ class QAHandler(BaseHTTPRequestHandler):
                 return
             self.send_json({"deleted": True})
             return
-        if len(parts) != 5 or parts[:2] != ["api", "projects"] or parts[3] not in ("requirements", "test-cases"):
+        if len(parts) != 5 or parts[:2] != ["api", "projects"] or parts[3] not in ("requirements", "test-cases", "bugs"):
             self.send_json({"error": "Not found"}, 404)
             return
         pid = self.parse_project_id(parts[2])
         record = self.parse_project_id(parts[4])
+        if parts[3] == "bugs":
+            bug = db.execute(
+                "SELECT id FROM bugs WHERE id=? AND project_id=?", (record, pid)
+            ).fetchone()
+            if not bug:
+                self.send_json({"error": "Defect not found"}, 404)
+                return
+            cleanup_record_form_data(db, "bugs", record)
+            db.execute("DELETE FROM bugs WHERE id=? AND project_id=?", (record, pid))
+            self.send_json({"deleted": True})
+            return
         if parts[3] == "test-cases":
             case = db.execute(
                 "SELECT id FROM test_cases WHERE id=? AND project_id=?", (record, pid)
@@ -3144,6 +5417,7 @@ class QAHandler(BaseHTTPRequestHandler):
             if not case:
                 self.send_json({"error": "Test case not found"}, 404)
                 return
+            cleanup_record_form_data(db, "test-cases", record)
             db.execute("DELETE FROM test_cases WHERE id=? AND project_id=?", (record, pid))
             self.send_json({"deleted": True})
             return
@@ -3154,6 +5428,7 @@ class QAHandler(BaseHTTPRequestHandler):
         if not requirement:
             self.send_json({"error": "Requirement not found"}, 404)
             return
+        cleanup_record_form_data(db, "requirements", record)
         linked_cases = db.execute(
             "SELECT COUNT(*) FROM test_cases WHERE project_id=? AND requirement_id=?",
             (pid, record),
@@ -3228,6 +5503,129 @@ class QAHandler(BaseHTTPRequestHandler):
         self.send_bytes(content, "text/csv; charset=utf-8",
                         extra={"Content-Disposition": f'attachment; filename="qa-report-{project["project_key"]}.csv"'})
 
+    def module_csv_report(self, db, pid, module, search=""):
+        search = str(search or "").strip().casefold()[:200]
+        if module == "bugs":
+            rows = [
+                dict(row) for row in db.execute(
+                    """SELECT b.*,tc.case_key FROM bugs b
+                    LEFT JOIN test_cases tc ON tc.id=b.test_case_id
+                    WHERE b.project_id=? ORDER BY b.id""",
+                    (pid,),
+                )
+            ]
+            custom_fields = custom_fields_for_record(db, "bugs", include_inactive=True)
+            headers = [
+                "Defect ID", "Title", "Description", "Linked Test Case",
+                "Severity", "Priority", "Status", "Assignee", "Created At",
+                "Updated At",
+            ] + [field["label"] for field in custom_fields] + ["Attachments"]
+            output_rows = []
+            for row in rows:
+                searchable = " ".join(
+                    str(row[key] or "") for key in ("bug_key", "title", "case_key")
+                ).casefold()
+                if search and search not in searchable:
+                    continue
+                values = [
+                    row["bug_key"], row["title"], row["description"],
+                    row["case_key"] or "", row["severity"], row["priority"],
+                    row["status"], row["assigned_to"], row["created_at"],
+                    row["updated_at"],
+                ]
+                field_values = {
+                    str(item["custom_field_id"]): item["value"]
+                    for item in db.execute(
+                        """SELECT custom_field_id,value FROM custom_field_values
+                        WHERE module_key='bugs' AND record_id=?""",
+                        (row["id"],),
+                    )
+                }
+                values.extend(field_values.get(str(field["id"]), "") for field in custom_fields)
+                attachments = db.execute(
+                    """SELECT filename FROM form_attachments
+                    WHERE project_id=? AND module_key='bugs' AND record_id=?
+                    ORDER BY id""",
+                    (pid, row["id"]),
+                ).fetchall()
+                values.append("; ".join(item["filename"] for item in attachments))
+                output_rows.append(values)
+            filename = "Defect_Log_Report.csv"
+        elif module == "test-cases":
+            rows = db.execute(
+                """SELECT tc.case_key,tc.title,tc.scenario,tc.description,tc.steps,
+                tc.expected_result,tc.preconditions,tc.test_data,tc.assumptions,
+                tc.source_reference,tc.priority,tc.test_type,tc.test_category,
+                tc.classification,COALESCE(e.status,'Not Executed') status,
+                COALESCE(e.actual_result,'') actual_result,
+                COALESCE(e.comments,'') comments
+                FROM test_cases tc
+                LEFT JOIN executions e ON e.id=(
+                    SELECT id FROM executions WHERE test_case_id=tc.id ORDER BY id DESC LIMIT 1
+                )
+                WHERE tc.project_id=? ORDER BY tc.id""",
+                (pid,),
+            ).fetchall()
+            headers = [
+                "Test Case ID", "Title", "Scenario", "Description", "Steps",
+                "Expected Result", "Preconditions", "Test Data",
+                "Assumptions / Dependencies", "Source Reference", "Priority",
+                "Type", "Category", "Classification", "Status", "Actual Result",
+                "Comments",
+            ]
+            output_rows = [
+                [row[key] for key in row.keys()]
+                for row in rows
+                if not search or search in " ".join(
+                    str(row[key] or "").casefold()
+                    for key in ("case_key", "title", "scenario")
+                )
+            ]
+            filename = "Test_Case_Report.csv"
+        elif module == "requirements":
+            rows = db.execute(
+                """SELECT requirement_key,title,description,acceptance_criteria,
+                business_rules,validation_rules,dependencies,source_section,priority,
+                requirement_type,scope_classification,ai_confidence_status,module_type,
+                module_category,review_status
+                FROM requirements WHERE project_id=? ORDER BY id""",
+                (pid,),
+            ).fetchall()
+            headers = [
+                "Requirement ID", "Title", "Description", "Acceptance Criteria",
+                "Business Rules", "Validation Rules", "Dependencies", "Source",
+                "Priority", "Type", "Scope", "Confidence", "Module Type",
+                "Category", "Review Status",
+            ]
+            output_rows = [
+                [row[key] for key in row.keys()]
+                for row in rows
+                if not search or search in " ".join(
+                    str(row[key] or "").casefold()
+                    for key in ("requirement_key", "title")
+                )
+            ]
+            filename = "Requirement_Report.csv"
+        else:
+            self.send_json({"error": "Unsupported report module."}, 404)
+            return
+
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        writer.writerows(
+            [self.csv_cell(value) for value in row] for row in output_rows
+        )
+        content = output.getvalue().encode("utf-8-sig")
+        export_dir = project_storage_dir(self.server.storage_root, pid) / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        (export_dir / filename).write_bytes(content)
+        self.send_bytes(
+            content,
+            "text/csv; charset=utf-8",
+            extra={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     @staticmethod
     def csv_cell(value):
         value = "" if value is None else str(value)
@@ -3277,26 +5675,19 @@ class QAHandler(BaseHTTPRequestHandler):
 def create_server(host="127.0.0.1", port=8001, db_path: Path | str = DB_PATH):
     initialize(db_path)
     server = ThreadingHTTPServer((host, port), QAHandler)
-    server.db_path = Path(db_path)
-    server.storage_root = Path(db_path).resolve().parent / "storage"
+    server.cors_origins = cors_origins()
+    if isinstance(db_path, str) and db_path.startswith(("postgres://", "postgresql://")):
+        server.db_path = db_path
+        server.storage_root = DATA_ROOT / "storage"
+    else:
+        server.db_path = Path(db_path)
+        server.storage_root = Path(db_path).resolve().parent / "storage"
     server.admin_sessions = {}
+    server.user_sessions = {}
     server.admin_session_lock = threading.Lock()
     with database(server.db_path) as db:
         for row in db.execute("SELECT id FROM projects"):
             ensure_project_storage(server.storage_root, row["id"])
-    server.rea_runtime = lambda: rea_runtime(server)
-    server.rea_runner = execute_rea_cli
-
-    def schedule_analysis(analysis_id):
-        worker = threading.Thread(
-            target=run_saved_analysis,
-            args=(server, analysis_id),
-            daemon=True,
-            name=f"rea-analysis-{analysis_id}",
-        )
-        worker.start()
-
-    server.schedule_analysis = schedule_analysis
     return server
 
 

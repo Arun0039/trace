@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from qa_platform.core.config import ROOT
+from qa_platform.core.config import BACKEND_ROOT
 
 ENCRYPTION_KEY_ENV = "QA_AI_ENCRYPTION_KEY"
 MAX_AI_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -283,7 +283,7 @@ def generate_text(
     if not node:
         raise ValueError(
             "AI analysis requires Node.js 22 or later. Install Node.js, then run "
-            "`npm ci` in the qa-platform folder."
+            "`npm ci` in the backend folder."
         )
 
     request = {
@@ -298,13 +298,13 @@ def generate_text(
     }
     try:
         result = subprocess.run(
-            [node, str(ROOT / "ai_provider.mjs")],
+            [node, str(BACKEND_ROOT / "ai_provider.mjs")],
             input=json.dumps(request, ensure_ascii=False),
             capture_output=True,
             text=True,
             encoding="utf-8",
             timeout=AI_TIMEOUT_SECONDS,
-            cwd=ROOT,
+            cwd=BACKEND_ROOT,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
