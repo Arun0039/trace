@@ -1935,13 +1935,18 @@ class QAHandler(BaseHTTPRequestHandler):
         return None
 
     def authorize_request(self, method, path, db=None):
-        if path.strip("/").split("/")[:2] == ["api", "auth"]:
+        parsed = urlparse(path)
+        path_clean = unquote(parsed.path)
+        parts_clean = path_clean.strip("/").split("/")
+        if parts_clean == ["health"] or parts_clean == ["healthz"] or parts_clean == ["api", "health"] or parts_clean == ["api", "healthz"]:
+            return True
+        if parts_clean[:2] == ["api", "auth"]:
             return True
         user = self.current_user(db)
         if user is None:
             self.send_json({"error": "Sign in is required."}, 401)
             return False
-        permission = self.request_permission(method, path)
+        permission = self.request_permission(method, path_clean)
         parts = path.strip("/").split("/")
         tenant_admin_area = parts[:2] in (
             ["api", "users"], ["api", "teams"], ["api", "roles"],
@@ -2137,13 +2142,16 @@ class QAHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
-        if path in ("/health", "/healthz"):
+        if path.rstrip("/") in ("/health", "/healthz"):
             self.send_json({"status": "ok"}, 200)
             return
         if not path.startswith("/api/"):
+            if path.rstrip("/") in ("/health", "/healthz"):
+                self.send_json({"status": "ok"}, 200)
+                return
             self.static(path)
             return
-        if path in ("/api/health", "/api/healthz"):
+        if path.rstrip("/") in ("/api/health", "/api/healthz"):
             self.send_json({"status": "ok"}, 200)
             return
         try:
@@ -2312,6 +2320,9 @@ class QAHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "Unexpected server error while deleting the record. Check the server console."}, 500)
 
     def static(self, path):
+        if path.rstrip("/") in ("/health", "/healthz"):
+            self.send_json({"status": "ok"}, 200)
+            return
         if (path.rstrip("/") or "/") in (
             "/", "/index.html", "/about", "/privacy", "/terms",
             "/login", "/signup", "/workspace",
