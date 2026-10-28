@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: qa-tracker
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+      - key: QA_HOST
+        value: 0.0.0.0
+      - key: QA_PORT
+        value: 10000
+      - key: DATABASE_URL
+        sync: false
+      - key: QA_AI_ENCRYPTION_KEY
+        generateValue: true
+      - key: QA_ALLOW_PUBLIC_AUTH
+        value: true
+      - key: FILE_STORAGE
+        value: local
