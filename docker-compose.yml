@@ -1,0 +1,22 @@
+services:
+  qa-tracker:
+    build: .
+    container_name: qa-tracker
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8001}:8001"
+    env_file:
+      - .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8001
+      - QA_HOST=0.0.0.0
+      - QA_PORT=8001
+    volumes:
+      - ./qa-platform:/app/qa-platform
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
