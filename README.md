@@ -93,6 +93,11 @@ The root [render.yaml](./render.yaml) defines the `qa-tracker` web service and a
 `{"status":"ok"}` and does not access the database or modify application data.
 Health probes are excluded from the backend's routine access log.
 
+The Blueprint uses the root Dockerfile, which installs
+`backend/requirements.txt` directly. A root `requirements.txt` is also provided as
+a compatibility entry point for deployment platforms configured to run
+`pip install -r requirements.txt`; it includes the backend's dependency list.
+
 The Cron Job uses the schedule `*/10 * * * *` (every 10 minutes, UTC) and
 requests the URL in `QA_HEALTH_CHECK_URL`. Supply that URL when configuring the
 Blueprint; with the default web-service name it is
