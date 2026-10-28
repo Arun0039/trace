@@ -10,6 +10,7 @@ node_modules
 .playwright-mcp
 **/.env
 **/.env.*
+**/OllamaSetup.exe
 **/*.sqlite
 **/*.sqlite3*
 **/*.db
