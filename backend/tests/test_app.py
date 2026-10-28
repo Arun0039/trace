@@ -40,6 +40,34 @@ import ai_provider
 
 
 class ServerStartupTests(unittest.TestCase):
+    def test_health_endpoint_is_public_side_effect_free_and_quiet(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = app.create_server(
+                host="127.0.0.1",
+                port=0,
+                db_path=Path(temporary) / "qa.sqlite3",
+            )
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                with patch("builtins.print") as print_mock, patch(
+                    "app.database"
+                ) as database_mock:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/health"
+                    ) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(
+                            json.loads(response.read()),
+                            {"status": "ok"},
+                        )
+                print_mock.assert_not_called()
+                database_mock.assert_not_called()
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+
     def test_public_and_auth_routes_serve_the_single_page_application(self):
         with tempfile.TemporaryDirectory() as temporary:
             server = app.create_server(
@@ -1682,6 +1710,11 @@ class PlatformApiTests(unittest.TestCase):
         status, error = self.request("/api/projects", authenticated=False)
         self.assertEqual(status, 401)
 
+        _, protected_project = self.request("/api/projects", "POST", {
+            "name": "Existing workspace data",
+            "project_key": "EXISTING",
+            "qa_owner": "QA",
+        })
         signup = urllib.request.Request(
             self.base + "/api/auth/signup",
             data=json.dumps({
@@ -1701,14 +1734,26 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(created["user"]["role_name"], "User")
         self.assertNotEqual(created["user"]["role_name"], "Global Admin")
         self.assertEqual(self.request("/api/auth/status")[1]["user"]["email"], "first.admin@example.test")
+        self.assertNotEqual(created["user"]["tenant_id"], 1)
+        self.assertEqual(self.request("/api/projects")[1], [])
+        self.assertEqual(
+            self.request(f"/api/projects/{protected_project['id']}")[0],
+            404,
+        )
         user_cookie = self.auth_cookie
         with app.database(self.db_path) as db:
             stored = db.execute(
                 "SELECT password_hash FROM users WHERE email=?",
                 ("first.admin@example.test",),
             ).fetchone()["password_hash"]
+            membership = db.execute(
+                """SELECT tenant_id FROM tenant_memberships
+                WHERE user_id=?""",
+                (created["user"]["id"],),
+            ).fetchone()
         self.assertTrue(stored.startswith("pbkdf2_sha256$"))
         self.assertNotIn("SecurePassword123", stored)
+        self.assertEqual(membership["tenant_id"], created["user"]["tenant_id"])
         self.assertEqual(
             self.request("/api/auth/signup", "POST", {
                 "first_name": "Other", "last_name": "User",
@@ -2013,6 +2058,11 @@ class PlatformApiTests(unittest.TestCase):
             "password": "TeamMemberPassword123",
             "role_id": qa_role["id"],
         })
+        _, owner = self.request("/api/users", "POST", {
+            "first_name": "Team", "last_name": "Owner",
+            "email": "team.owner@example.test",
+            "password": "TeamOwnerPassword123",
+        })
         _, team = self.request("/api/teams", "POST", {
             "name": "Regression QA", "description": "Release regression testing",
             "owner_user_id": member["id"],
@@ -2024,10 +2074,10 @@ class PlatformApiTests(unittest.TestCase):
             self.request(f"/api/teams/{team['id']}/members/{member['id']}", "DELETE")[0],
             409,
         )
-        self.request(f"/api/teams/{team['id']}", "PATCH", {
+        self.assertEqual(self.request(f"/api/teams/{team['id']}", "PATCH", {
             "name": team["name"], "description": team["description"],
-            "owner_user_id": profile["id"], "status": team["status"],
-        })
+            "owner_user_id": owner["id"], "status": team["status"],
+        })[0], 200)
         self.assertEqual(
             self.request(f"/api/teams/{team['id']}/members/{member['id']}", "DELETE")[0],
             200,
@@ -2585,7 +2635,7 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(self.request("/api/projects")[1], [])
         self.assertEqual(
             self.request(f"/api/projects/{project['id']}/requirements"),
-            (404, {"error": "Project not found"}),
+            (404, {"error": "Project not found."}),
         )
         with app.database(self.db_path) as db:
             self.assertIsNone(db.execute(

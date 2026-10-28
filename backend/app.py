@@ -1723,6 +1723,10 @@ class QAHandler(BaseHTTPRequestHandler):
     server_version = "QATracker/1.0"
 
     def log_message(self, fmt, *args):
+        if urlparse(self.path).path.rstrip("/") in (
+            "/health", "/healthz", "/api/health", "/api/healthz",
+        ):
+            return
         print("%s - %s" % (self.log_date_time_string(), fmt % args))
 
     def send_bytes(self, data: bytes, content_type: str, status=200, extra=None):
@@ -2923,6 +2927,14 @@ class QAHandler(BaseHTTPRequestHandler):
             ).fetchone()
             if not role:
                 raise ValueError("The default account role is not available.")
+            tenant_name = f"{first_name} {last_name} Workspace"
+            tenant_slug = f"workspace-{secrets.token_hex(16)}"
+            tenant_cursor = db.execute(
+                """INSERT INTO tenants(name,slug,status,created_at,updated_at)
+                VALUES(?,?,'Active',?,?)""",
+                (tenant_name, tenant_slug, now, now),
+            )
+            tenant_id = tenant_cursor.lastrowid
             cursor = db.execute(
                 """INSERT INTO users
                 (first_name,last_name,email,password_hash,role_id,status,created_at,updated_at)
@@ -2933,8 +2945,8 @@ class QAHandler(BaseHTTPRequestHandler):
             db.execute(
                 """INSERT INTO tenant_memberships
                 (tenant_id,user_id,role_id,status,created_at,updated_at)
-                VALUES(1,?,?,'Active',?,?)""",
-                (user_id, role["id"], now, now),
+                VALUES(?,?,?,'Active',?,?)""",
+                (tenant_id, user_id, role["id"], now, now),
             )
             audit_event(
                 db, user_id, "user.created", "user", user_id,
@@ -2945,10 +2957,10 @@ class QAHandler(BaseHTTPRequestHandler):
                     },
                     "source": "signup",
                 },
-                tenant_id=1,
+                tenant_id=tenant_id,
             )
             token = self.issue_user_session(user_id)
-            user = user_public_dict(db, user_id, 1)
+            user = user_public_dict(db, user_id, tenant_id)
             self.send_json(
                 {
                     "authenticated": True,

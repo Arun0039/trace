@@ -54,15 +54,16 @@ def database_connection() -> Path | str:
         return database_path()
     if not url.startswith(("postgres://", "postgresql://")):
         raise ValueError(
-            "Database URL must use the postgres:// or postgresql:// scheme."
+            "DATABASE_URL, QA_PLATFORM_DATABASE_URL, or POSTGRES_URL must use "
+            "the postgres:// or postgresql:// scheme."
         )
     parsed = urlsplit(url)
     if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
         sslmode = parse_qs(parsed.query).get("sslmode", [""])[0].lower()
-        if sslmode not in {"require", "verify-ca", "verify-full", "disable"}:
-            # For cloud providers like Render, accept if no sslmode specified but will be handled by driver
-            # Be permissive for cloud deployments while still warning is not needed
-            pass
+        if sslmode not in {"require", "verify-ca", "verify-full"}:
+            raise ValueError(
+                "Remote PostgreSQL URLs must set sslmode=require or stronger."
+            )
     # Fix postgres:// to postgresql:// if needed for compatibility
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
@@ -86,9 +87,13 @@ def server_address() -> tuple[str, int]:
     try:
         port = int(port_str)
     except ValueError as exc:
-        raise ValueError("PORT must be an integer between 0 and 65535.") from exc
+        raise ValueError(
+            "PORT, QA_PORT, or APP_PORT must be an integer between 0 and 65535."
+        ) from exc
     if not 0 <= port <= 65535:
-        raise ValueError("PORT must be an integer between 0 and 65535.")
+        raise ValueError(
+            "PORT, QA_PORT, or APP_PORT must be an integer between 0 and 65535."
+        )
     return host, port
 
 

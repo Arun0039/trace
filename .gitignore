@@ -12,6 +12,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage*
+*.log
+*.tmp
+*.temp
 
 # JavaScript dependencies
 node_modules/
@@ -19,12 +22,18 @@ node_modules/
 # Browser automation artifacts
 .playwright-mcp/
 
-# Existing local runtime data remains under qa-platform/
-/qa-platform/qa_platform.sqlite3
-/qa-platform/qa_platform.sqlite3-shm
-/qa-platform/qa_platform.sqlite3-wal
-/qa-platform/storage/projects/
-/qa-platform/storage/archived-projects/
+# Machine-specific editor tasks
+/.vscode/tasks.json
+
+# Runtime databases and SQLite journal files
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local runtime data remains under qa-platform/
+/qa-platform/storage/
 
 # Self-hosting
 .env

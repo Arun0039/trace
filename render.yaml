@@ -21,3 +21,13 @@ services:
         value: true
       - key: FILE_STORAGE
         value: local
+  - type: cron
+    name: qa-tracker-health-check
+    env: docker
+    plan: starter
+    schedule: "*/10 * * * *"
+    dockerfilePath: ./Dockerfile
+    dockerCommand: sh /app/deploy/render-health-check.sh
+    envVars:
+      - key: QA_HEALTH_CHECK_URL
+        sync: false

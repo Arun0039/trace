@@ -1042,6 +1042,34 @@ async function render() {
     renderPublicPage();
     return;
   }
+  const viewTitles = {
+    login: "Sign in",
+    signup: "Create account",
+    dashboard: "Dashboard",
+    projects: "Projects",
+    overview: "Overview",
+    brd: "BRD Documents",
+    requirements: "Requirements",
+    cases: "Test Cases",
+    defects: "Defects",
+    reports: "Reports & Analytics",
+    "project-settings": "Project Settings",
+    "api-docs": "API Docs",
+    applications: "Applications",
+    "application-analysis": "App Analysis",
+    files: "Project Files",
+    settings: "Settings",
+    archive: "Archive",
+    "settings-ai": "AI Module",
+  };
+  const viewTitle = viewTitles[S.auth.authenticated ? S.view : S.authMode] || "Workspace";
+  const projectWorkspace = [
+    "overview", "brd", "requirements", "cases", "defects", "reports",
+    "project-settings", "api-docs", "applications", "application-analysis", "files",
+  ].includes(S.view);
+  document.title = S.auth.authenticated && S.project && projectWorkspace
+    ? `${S.project.name} | ${viewTitle} | TRACE`
+    : `${viewTitle} | TRACE`;
   $("#publicRoot").hidden = true;
   document.body.classList.remove("public-site");
   syncNav();
