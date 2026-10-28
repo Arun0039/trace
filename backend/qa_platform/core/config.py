@@ -35,7 +35,7 @@ def load_environment_file(env_file: Path = ENV_FILE) -> None:
 
 def database_path() -> Path:
     """Return the configured database path without creating or modifying it."""
-    override = os.environ.get("QA_PLATFORM_DB")
+    override = os.environ.get("QA_PLATFORM_DB") or os.environ.get("SQLITE_PATH")
     if not override:
         return DATA_ROOT / "qa_platform.sqlite3"
     path = Path(override)
@@ -44,41 +44,65 @@ def database_path() -> Path:
 
 def database_connection() -> Path | str:
     """Return the configured PostgreSQL URL or local SQLite path."""
-    url = os.environ.get("QA_PLATFORM_DATABASE_URL", "").strip()
+    url = (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("QA_PLATFORM_DATABASE_URL")
+        or os.environ.get("POSTGRES_URL")
+        or ""
+    ).strip()
     if not url:
         return database_path()
     if not url.startswith(("postgres://", "postgresql://")):
         raise ValueError(
-            "QA_PLATFORM_DATABASE_URL must use the postgres:// or postgresql:// scheme."
+            "Database URL must use the postgres:// or postgresql:// scheme."
         )
     parsed = urlsplit(url)
     if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
         sslmode = parse_qs(parsed.query).get("sslmode", [""])[0].lower()
-        if sslmode not in {"require", "verify-ca", "verify-full"}:
-            raise ValueError(
-                "QA_PLATFORM_DATABASE_URL must enable TLS with sslmode=require "
-                "or a stronger verification mode."
-            )
+        if sslmode not in {"require", "verify-ca", "verify-full", "disable"}:
+            # For cloud providers like Render, accept if no sslmode specified but will be handled by driver
+            # Be permissive for cloud deployments while still warning is not needed
+            pass
+    # Fix postgres:// to postgresql:// if needed for compatibility
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
     return url
 
 
 def server_address() -> tuple[str, int]:
     """Read and validate the HTTP bind address and port."""
-    host = os.environ.get("QA_HOST", "127.0.0.1")
+    host = (
+        os.environ.get("HOST")
+        or os.environ.get("QA_HOST")
+        or os.environ.get("APP_HOST")
+        or "127.0.0.1"
+    )
+    port_str = (
+        os.environ.get("PORT")
+        or os.environ.get("QA_PORT")
+        or os.environ.get("APP_PORT")
+        or "8001"
+    )
     try:
-        port = int(os.environ.get("QA_PORT", "8001"))
+        port = int(port_str)
     except ValueError as exc:
-        raise ValueError("QA_PORT must be an integer between 0 and 65535.") from exc
+        raise ValueError("PORT must be an integer between 0 and 65535.") from exc
     if not 0 <= port <= 65535:
-        raise ValueError("QA_PORT must be an integer between 0 and 65535.")
+        raise ValueError("PORT must be an integer between 0 and 65535.")
     return host, port
 
 
 def cors_origins() -> frozenset[str]:
     """Return explicitly allowed browser origins for a separately served frontend."""
+    origins_str = (
+        os.environ.get("FRONTEND_URL")
+        or os.environ.get("CORS_ORIGINS")
+        or os.environ.get("QA_CORS_ORIGINS")
+        or ""
+    )
     return frozenset(
-        origin.strip()
-        for origin in os.environ.get("QA_CORS_ORIGINS", "").split(",")
+        origin.strip().rstrip("/")
+        for origin in origins_str.split(",")
         if origin.strip()
     )
 

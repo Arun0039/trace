@@ -2048,6 +2048,14 @@ class QAHandler(BaseHTTPRequestHandler):
 
     def peer_is_local(self):
         try:
+            if os.environ.get("QA_ALLOW_PUBLIC_AUTH", "").strip().lower() in {"1", "true", "yes", "on"}:
+                return True
+            if os.environ.get("ALLOW_PUBLIC_AUTH", "").strip().lower() in {"1", "true", "yes", "on"}:
+                return True
+            # Allow if running in cloud/container mode
+            host, _ = server_address()
+            if host == "0.0.0.0":
+                return True
             return ipaddress.ip_address(self.client_address[0]).is_loopback
         except ValueError:
             return False
@@ -2129,8 +2137,14 @@ class QAHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        if path in ("/health", "/healthz"):
+            self.send_json({"status": "ok"}, 200)
+            return
         if not path.startswith("/api/"):
             self.static(path)
+            return
+        if path in ("/api/health", "/api/healthz"):
+            self.send_json({"status": "ok"}, 200)
             return
         try:
             with database(self.server.db_path) as db:

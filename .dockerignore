@@ -1,0 +1,13 @@
+**/__pycache__
+**/*.py[cod]
+*.sqlite3*
+*.db
+.venv
+venv
+env
+.git
+.gitignore
+node_modules
+.playwright-mcp
+qa-platform/*.env
+*.log
