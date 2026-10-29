@@ -1,15 +1,19 @@
 services:
   - type: web
     name: qa-tracker
-    runtime: docker
+    runtime: python
+    rootDir: backend
     plan: starter
-    dockerfilePath: ./Dockerfile
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
     healthCheckPath: /ready
     disk:
       name: qa-tracker-storage
-      mountPath: /app/qa-platform/storage
+      mountPath: /opt/render/project/src/qa-platform/storage
       sizeGB: 1
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: HOST
         value: 0.0.0.0
       - key: QA_ENVIRONMENT
@@ -30,12 +34,15 @@ services:
         value: "true"
   - type: cron
     name: qa-tracker-trial-expiry
-    runtime: docker
+    runtime: python
+    rootDir: backend
     plan: starter
     schedule: "*/10 * * * *"
-    dockerfilePath: ./Dockerfile
-    dockerCommand: python /app/backend/expire_trials.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: python expire_trials.py
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: DATABASE_URL
         sync: false
       - key: QA_TRIAL_DURATION_DAYS
