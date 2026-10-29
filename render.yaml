@@ -1,7 +1,7 @@
 services:
   - type: web
     name: qa-tracker
-    env: docker
+    runtime: docker
     plan: starter
     dockerfilePath: ./Dockerfile
     healthCheckPath: /ready
@@ -21,16 +21,16 @@ services:
       - key: QA_ADMIN_PASSWORD
         sync: false
       - key: QA_TRIAL_DURATION_DAYS
-        value: 14
+        value: "14"
       - key: QA_AI_ENCRYPTION_KEY
         generateValue: true
       - key: QA_ALLOW_PUBLIC_AUTH
-        value: true
+        value: "true"
       - key: QA_COOKIE_SECURE
-        value: true
+        value: "true"
   - type: cron
     name: qa-tracker-trial-expiry
-    env: docker
+    runtime: docker
     plan: starter
     schedule: "*/10 * * * *"
     dockerfilePath: ./Dockerfile
@@ -39,4 +39,4 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: QA_TRIAL_DURATION_DAYS
-        value: 14
+        value: "14"
