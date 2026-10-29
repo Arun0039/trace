@@ -2,32 +2,41 @@ services:
   - type: web
     name: qa-tracker
     env: docker
-    plan: free
+    plan: starter
     dockerfilePath: ./Dockerfile
+    healthCheckPath: /ready
+    disk:
+      name: qa-tracker-storage
+      mountPath: /app/qa-platform/storage
+      sizeGB: 1
     envVars:
       - key: HOST
         value: 0.0.0.0
-      - key: PORT
-        value: 10000
-      - key: QA_HOST
-        value: 0.0.0.0
-      - key: QA_PORT
-        value: 10000
+      - key: QA_ENVIRONMENT
+        value: production
       - key: DATABASE_URL
         sync: false
+      - key: QA_CORS_ORIGINS
+        sync: false
+      - key: QA_ADMIN_PASSWORD
+        sync: false
+      - key: QA_TRIAL_DURATION_DAYS
+        value: 14
       - key: QA_AI_ENCRYPTION_KEY
         generateValue: true
       - key: QA_ALLOW_PUBLIC_AUTH
         value: true
-      - key: FILE_STORAGE
-        value: local
+      - key: QA_COOKIE_SECURE
+        value: true
   - type: cron
-    name: qa-tracker-health-check
+    name: qa-tracker-trial-expiry
     env: docker
     plan: starter
     schedule: "*/10 * * * *"
     dockerfilePath: ./Dockerfile
-    dockerCommand: sh /app/deploy/render-health-check.sh
+    dockerCommand: python /app/backend/expire_trials.py
     envVars:
-      - key: QA_HEALTH_CHECK_URL
+      - key: DATABASE_URL
         sync: false
+      - key: QA_TRIAL_DURATION_DAYS
+        value: 14

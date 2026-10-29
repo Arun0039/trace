@@ -21,6 +21,7 @@ from qa_platform.core.config import BACKEND_ROOT
 ENCRYPTION_KEY_ENV = "QA_AI_ENCRYPTION_KEY"
 MAX_AI_RESPONSE_BYTES = 4 * 1024 * 1024
 AI_TIMEOUT_SECONDS = 600
+DEFAULT_WORKSPACE_ID = 1
 PROVIDERS = {
     "local": {
         "name": "Local deterministic",
@@ -41,6 +42,20 @@ PROVIDERS = {
         "requires_api_key": True,
         "requires_base_url": False,
         "default_model": "gemini-2.5-flash",
+        "default_base_url": "",
+    },
+    "openai": {
+        "name": "OpenAI",
+        "requires_api_key": True,
+        "requires_base_url": False,
+        "default_model": "gpt-4o-mini",
+        "default_base_url": "",
+    },
+    "anthropic": {
+        "name": "Anthropic Claude",
+        "requires_api_key": True,
+        "requires_base_url": False,
+        "default_model": "claude-3-5-sonnet-latest",
         "default_base_url": "",
     },
     "openai-compatible": {
@@ -90,9 +105,28 @@ def decrypt_api_key(value: bytes | None) -> str:
         raise ValueError("Stored provider credentials are not valid text.") from exc
 
 
-def validate_provider(value: Any) -> str:
-    if not isinstance(value, str) or value not in PROVIDERS:
-        raise ValueError("Choose Local deterministic, Ollama, Google Gemini, or OpenAI-compatible.")
+def ollama_supported(tenant_id: int) -> bool:
+    return tenant_id == DEFAULT_WORKSPACE_ID
+
+
+def allowed_providers(tenant_id: int) -> set[str]:
+    providers = set(PROVIDERS)
+    if not ollama_supported(tenant_id):
+        providers.discard("ollama")
+    return providers
+
+
+def validate_provider(value: Any, tenant_id: int = DEFAULT_WORKSPACE_ID) -> str:
+    if not isinstance(value, str) or value not in allowed_providers(tenant_id):
+        if value == "ollama":
+            raise ValueError(
+                "Ollama is only available in the Default Workspace. "
+                "Choose Google Gemini, OpenAI, Anthropic Claude, or an OpenAI-compatible provider."
+            )
+        raise ValueError(
+            "Choose Local deterministic, Google Gemini, OpenAI, Anthropic Claude, "
+            "or OpenAI-compatible."
+        )
     return value
 
 
@@ -100,7 +134,7 @@ def validate_model(value: Any, provider: str) -> str:
     if not isinstance(value, str):
         raise ValueError("Model name must be text.")
     model = value.strip()
-    if not model and provider in {"google", "ollama", "openai-compatible"}:
+    if not model and provider in {"google", "ollama", "openai", "anthropic", "openai-compatible"}:
         raise ValueError("Enter a model name for the selected provider.")
     if len(model) > 200 or (model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]*", model)):
         raise ValueError("Model name contains unsupported characters.")
@@ -142,21 +176,66 @@ def validate_base_url(value: Any, provider: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
-def provider_settings(db: sqlite3.Connection, authenticated: bool = False) -> dict[str, Any]:
+def _normalize_tenant_id(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("Workspace is invalid.")
+    return value
+
+
+def ai_module_enabled(db: sqlite3.Connection, tenant_id: int = 1) -> bool:
+    tenant_id = _normalize_tenant_id(tenant_id)
+    row = db.execute(
+        "SELECT enabled FROM tenant_ai_settings WHERE tenant_id=?", (tenant_id,)
+    ).fetchone()
+    if row is None:
+        return tenant_id == DEFAULT_WORKSPACE_ID
+    return bool(row["enabled"])
+
+
+def set_ai_module_enabled(
+    db: sqlite3.Connection, tenant_id: int = 1, enabled: bool = False
+) -> dict[str, Any]:
+    tenant_id = _normalize_tenant_id(tenant_id)
+    if not isinstance(enabled, bool):
+        raise ValueError("Choose whether to enable the AI module.")
     selected = db.execute(
-        "SELECT provider FROM ai_settings WHERE id=1"
+        "SELECT provider FROM tenant_ai_settings WHERE tenant_id=?", (tenant_id,)
     ).fetchone()
     provider = selected["provider"] if selected and selected["provider"] else "google"
-    if provider not in PROVIDERS:
+    if provider not in allowed_providers(tenant_id):
+        provider = "google"
+    db.execute(
+        """INSERT INTO tenant_ai_settings(tenant_id,provider,enabled,updated_at)
+        VALUES(?,?,?,?)
+        ON CONFLICT(tenant_id) DO UPDATE SET enabled=excluded.enabled,
+        updated_at=excluded.updated_at""",
+        (tenant_id, provider, 1 if enabled else 0, timestamp()),
+    )
+    return provider_settings(db, authenticated=True, tenant_id=tenant_id)
+
+
+def provider_settings(
+    db: sqlite3.Connection, authenticated: bool = False, tenant_id: int = 1
+) -> dict[str, Any]:
+    tenant_id = _normalize_tenant_id(tenant_id)
+    selected = db.execute(
+        "SELECT provider FROM tenant_ai_settings WHERE tenant_id=?", (tenant_id,)
+    ).fetchone()
+    provider = selected["provider"] if selected and selected["provider"] else "google"
+    if provider not in allowed_providers(tenant_id):
         provider = "google"
     rows = {
         row["provider"]: dict(row)
         for row in db.execute(
-            "SELECT provider,model,base_url,api_key_ciphertext FROM ai_provider_configs"
+            """SELECT provider,model,base_url,api_key_ciphertext
+            FROM tenant_ai_provider_configs WHERE tenant_id=?""",
+            (tenant_id,),
         )
     }
     options = []
     for provider_id, definition in PROVIDERS.items():
+        if provider_id not in allowed_providers(tenant_id):
+            continue
         row = rows.get(provider_id, {})
         model = row.get("model") or definition["default_model"]
         base_url = row.get("base_url") or definition["default_base_url"]
@@ -190,6 +269,9 @@ def provider_settings(db: sqlite3.Connection, authenticated: bool = False) -> di
         encryption_error = str(exc)
     return {
         **current,
+        "tenant_id": tenant_id,
+        "enabled": ai_module_enabled(db, tenant_id),
+        "ollama_supported": ollama_supported(tenant_id),
         "provider": provider,
         "configured": current["configured"] and (encryption_configured or not needs_encryption),
         "authenticated": authenticated,
@@ -200,8 +282,16 @@ def provider_settings(db: sqlite3.Connection, authenticated: bool = False) -> di
     }
 
 
-def save_provider_settings(db: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
-    provider = validate_provider(data.get("provider"))
+def save_provider_settings(
+    db: sqlite3.Connection, data: dict[str, Any], tenant_id: int = 1
+) -> dict[str, Any]:
+    tenant_id = _normalize_tenant_id(tenant_id)
+    if not ai_module_enabled(db, tenant_id):
+        raise ValueError(
+            "The AI module is disabled for this workspace. "
+            "Ask a workspace administrator to enable it."
+        )
+    provider = validate_provider(data.get("provider"), tenant_id)
     model = validate_model(data.get("model", ""), provider)
     base_url = validate_base_url(data.get("base_url", ""), provider)
     api_key = data.get("api_key", "")
@@ -214,8 +304,9 @@ def save_provider_settings(db: sqlite3.Connection, data: dict[str, Any]) -> dict
         raise ValueError("Provider API key is invalid.")
 
     previous = db.execute(
-        "SELECT api_key_ciphertext FROM ai_provider_configs WHERE provider=?",
-        (provider,),
+        """SELECT api_key_ciphertext FROM tenant_ai_provider_configs
+        WHERE tenant_id=? AND provider=?""",
+        (tenant_id, provider),
     ).fetchone()
     encrypted_key = previous["api_key_ciphertext"] if previous else None
     if clear_api_key:
@@ -224,22 +315,33 @@ def save_provider_settings(db: sqlite3.Connection, data: dict[str, Any]) -> dict
         encrypted_key = encrypt_api_key(api_key)
 
     db.execute(
-        """INSERT INTO ai_provider_configs(provider,model,base_url,api_key_ciphertext,updated_at)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(provider) DO UPDATE SET model=excluded.model,base_url=excluded.base_url,
-        api_key_ciphertext=excluded.api_key_ciphertext,updated_at=excluded.updated_at""",
-        (provider, model, base_url, encrypted_key, timestamp()),
+        """INSERT INTO tenant_ai_provider_configs
+        (tenant_id,provider,model,base_url,api_key_ciphertext,updated_at)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(tenant_id,provider) DO UPDATE SET model=excluded.model,
+        base_url=excluded.base_url,api_key_ciphertext=excluded.api_key_ciphertext,
+        updated_at=excluded.updated_at""",
+        (tenant_id, provider, model, base_url, encrypted_key, timestamp()),
     )
     db.execute(
-        "UPDATE ai_settings SET provider=?,updated_at=? WHERE id=1",
-        (provider, timestamp()),
+        """INSERT INTO tenant_ai_settings(tenant_id,provider,enabled,updated_at)
+        VALUES(?,?,1,?)
+        ON CONFLICT(tenant_id) DO UPDATE SET provider=excluded.provider,
+        updated_at=excluded.updated_at""",
+        (tenant_id, provider, timestamp()),
     )
-    return provider_settings(db, authenticated=True)
+    return provider_settings(db, authenticated=True, tenant_id=tenant_id)
 
 
-def active_provider_config(db: sqlite3.Connection) -> dict[str, str]:
-    settings = provider_settings(db)
-    provider = settings["provider"]
+def active_provider_config(db: sqlite3.Connection, tenant_id: int = 1) -> dict[str, str]:
+    tenant_id = _normalize_tenant_id(tenant_id)
+    if not ai_module_enabled(db, tenant_id):
+        raise ValueError(
+            "The AI module is disabled for this workspace. "
+            "Ask a workspace administrator to enable it."
+        )
+    settings = provider_settings(db, tenant_id=tenant_id)
+    provider = validate_provider(settings["provider"], tenant_id)
     definition = PROVIDERS[provider]
     if (
         (definition["requires_api_key"] or settings["api_key_configured"])
@@ -249,8 +351,9 @@ def active_provider_config(db: sqlite3.Connection) -> dict[str, str]:
     model = validate_model(settings["model"], provider)
     base_url = validate_base_url(settings["base_url"], provider)
     row = db.execute(
-        "SELECT api_key_ciphertext FROM ai_provider_configs WHERE provider=?",
-        (provider,),
+        """SELECT api_key_ciphertext FROM tenant_ai_provider_configs
+        WHERE tenant_id=? AND provider=?""",
+        (tenant_id, provider),
     ).fetchone()
     api_key = decrypt_api_key(row["api_key_ciphertext"] if row else None)
     if definition["requires_api_key"] and not api_key:

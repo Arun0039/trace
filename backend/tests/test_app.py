@@ -5,6 +5,7 @@ import io
 import json
 import os
 import secrets
+import sqlite3
 import stat
 import struct
 import tempfile
@@ -16,6 +17,7 @@ import urllib.request
 import zipfile
 import zlib
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,7 +37,13 @@ from ollama_integration import (
 from requirement_documents import extract_requirement_document
 from test_case_generator import generate_requirement_cases
 from ollama_integration import generate_ad_hoc_test_cases
-from ai_provider import active_provider_config, provider_settings, save_provider_settings
+from qa_platform.core.trials import expire_trials
+from ai_provider import (
+    active_provider_config,
+    provider_settings,
+    save_provider_settings,
+    set_ai_module_enabled,
+)
 import ai_provider
 
 
@@ -68,6 +76,36 @@ class ServerStartupTests(unittest.TestCase):
                 thread.join()
                 server.server_close()
 
+    def test_readiness_endpoint_checks_database_and_hides_connection_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = app.create_server(
+                host="127.0.0.1",
+                port=0,
+                db_path=Path(temporary) / "qa.sqlite3",
+            )
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/ready"
+            try:
+                with urllib.request.urlopen(url) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.loads(response.read()), {"status": "ready"})
+
+                with patch(
+                    "app.database",
+                    side_effect=sqlite3.OperationalError("sensitive connection detail"),
+                ):
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(url)
+                self.assertEqual(raised.exception.code, 503)
+                body = raised.exception.read().decode("utf-8")
+                self.assertEqual(json.loads(body), {"status": "not_ready"})
+                self.assertNotIn("sensitive connection detail", body)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+
     def test_public_and_auth_routes_serve_the_single_page_application(self):
         with tempfile.TemporaryDirectory() as temporary:
             server = app.create_server(
@@ -84,6 +122,26 @@ class ServerStartupTests(unittest.TestCase):
                         with urllib.request.urlopen(f"{base_url}{path}") as response:
                             self.assertEqual(response.status, 200)
                             self.assertIn(b'id="publicRoot"', response.read())
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+
+    def test_developer_monitoring_has_a_separate_static_application(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = app.create_server(
+                host="127.0.0.1",
+                port=0,
+                db_path=Path(temporary) / "qa.sqlite3",
+            )
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/developer"
+                ) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIn(b'id="devRoot"', response.read())
             finally:
                 server.shutdown()
                 thread.join()
@@ -224,7 +282,7 @@ class AiProviderTests(unittest.TestCase):
         self.assertFalse(settings["configured"])
         self.assertEqual(
             [provider["id"] for provider in settings["providers"]],
-            ["local", "ollama", "google", "openai-compatible"],
+            ["local", "ollama", "google", "openai", "anthropic", "openai-compatible"],
         )
         configured = save_provider_settings(self.db, {
             "provider": "google",
@@ -234,10 +292,80 @@ class AiProviderTests(unittest.TestCase):
         self.assertTrue(configured["configured"])
         self.assertNotIn("test-secret-key", json.dumps(configured))
         stored = self.db.execute(
-            "SELECT api_key_ciphertext FROM ai_provider_configs WHERE provider='google'"
+            """SELECT api_key_ciphertext FROM tenant_ai_provider_configs
+            WHERE tenant_id=1 AND provider='google'"""
         ).fetchone()["api_key_ciphertext"]
         self.assertNotIn(b"test-secret-key", stored)
         self.assertEqual(active_provider_config(self.db)["api_key"], "test-secret-key")
+
+    def test_provider_settings_are_scoped_to_each_workspace(self):
+        now = app.timestamp()
+        self.db.execute(
+            """INSERT INTO tenants(id,name,slug,status,created_at,updated_at)
+            VALUES(2,'Second Workspace','second','Active',?,?)""",
+            (now, now),
+        )
+        set_ai_module_enabled(self.db, 2, True)
+        save_provider_settings(self.db, {
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "api_key": "workspace-one-key",
+        }, tenant_id=1)
+        save_provider_settings(self.db, {
+            "provider": "anthropic",
+            "model": "claude-3-5-sonnet-latest",
+            "api_key": "workspace-two-key",
+        }, tenant_id=2)
+
+        first = provider_settings(self.db, tenant_id=1)
+        second = provider_settings(self.db, tenant_id=2)
+        self.assertEqual(first["provider"], "openai")
+        self.assertEqual(second["provider"], "anthropic")
+        self.assertEqual(active_provider_config(self.db, 1)["api_key"], "workspace-one-key")
+        self.assertEqual(active_provider_config(self.db, 2)["api_key"], "workspace-two-key")
+
+    def test_ollama_is_restricted_to_the_default_workspace(self):
+        default = provider_settings(self.db)
+        self.assertTrue(default["enabled"])
+        self.assertTrue(default["ollama_supported"])
+        self.assertIn("ollama", [item["id"] for item in default["providers"]])
+
+        now = app.timestamp()
+        tenant_id, _ = app.create_workspace(self.db, "Second Workspace", now)
+        disabled = provider_settings(self.db, tenant_id=tenant_id)
+        self.assertFalse(disabled["enabled"])
+        self.assertFalse(disabled["ollama_supported"])
+        self.assertNotIn("ollama", [item["id"] for item in disabled["providers"]])
+        with self.assertRaisesRegex(ValueError, "disabled for this workspace"):
+            active_provider_config(self.db, tenant_id)
+        with self.assertRaisesRegex(ValueError, "disabled for this workspace"):
+            save_provider_settings(self.db, {
+                "provider": "google",
+                "model": "gemini-2.5-flash",
+                "api_key": "second-key",
+            }, tenant_id=tenant_id)
+
+        enabled = set_ai_module_enabled(self.db, tenant_id, True)
+        self.assertTrue(enabled["enabled"])
+        self.assertNotIn("ollama", [item["id"] for item in enabled["providers"]])
+        with self.assertRaisesRegex(ValueError, "Ollama is only available"):
+            save_provider_settings(self.db, {
+                "provider": "ollama",
+                "model": "llama3.1",
+                "base_url": "http://127.0.0.1:11434/v1",
+            }, tenant_id=tenant_id)
+        saved = save_provider_settings(self.db, {
+            "provider": "anthropic",
+            "model": "claude-3-5-sonnet-latest",
+            "api_key": "second-key",
+        }, tenant_id=tenant_id)
+        self.assertEqual(saved["provider"], "anthropic")
+
+        set_ai_module_enabled(self.db, 1, False)
+        with self.assertRaisesRegex(ValueError, "disabled for this workspace"):
+            active_provider_config(self.db)
+        restored = set_ai_module_enabled(self.db, 1, True)
+        self.assertTrue(restored["enabled"])
 
     def test_provider_validation_and_encryption_key_rotation_errors(self):
         with self.assertRaisesRegex(ValueError, "Choose Local deterministic"):
@@ -1389,6 +1517,7 @@ class PlatformApiTests(unittest.TestCase):
             db.execute("DELETE FROM custom_fields")
             db.execute("DELETE FROM teams")
             db.execute("DELETE FROM users")
+            db.execute("DELETE FROM developer_errors")
             db.execute("DELETE FROM audit_events")
             db.execute(
                 """UPDATE global_admin_profile SET first_name='Global',
@@ -1401,6 +1530,223 @@ class PlatformApiTests(unittest.TestCase):
                 "UPDATE ai_settings SET provider='local',updated_at=? WHERE id=1",
                 (app.timestamp(),),
             )
+            db.execute(
+                "DELETE FROM tenant_ai_provider_configs WHERE tenant_id=1 AND provider != 'local'"
+            )
+            db.execute(
+                """INSERT INTO tenant_ai_settings(tenant_id,provider,enabled,updated_at)
+                VALUES(1,'local',1,?)
+                ON CONFLICT(tenant_id) DO UPDATE SET provider='local',enabled=1,
+                updated_at=excluded.updated_at""",
+                (app.timestamp(),),
+            )
+            db.execute("DELETE FROM auth_sessions")
+            db.execute(
+                """INSERT INTO auth_sessions
+                (token_hash,user_id,kind,expires_at,created_at)
+                VALUES(?,NULL,'admin',?,?)""",
+                (app.session_token_hash(token), time.time() + 3600, app.timestamp()),
+            )
+        with self.server.api_metrics_lock:
+            self.server.api_metrics.clear()
+        with self.server.auth_rate_lock:
+            self.server.auth_rate_windows.clear()
+
+    def test_workspace_storage_reports_scoped_records_estimates_and_deletes_groups(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Storage inventory",
+            "project_key": "STORINV",
+            "qa_owner": "QA",
+        })
+        now = app.timestamp()
+        with app.database(self.db_path) as db:
+            requirement_id = db.execute(
+                """INSERT INTO requirements
+                (project_id,requirement_key,title,created_at)
+                VALUES(?,?,?,?)""",
+                (project["id"], "REQ-STOR-1", "Storage requirement", now),
+            ).lastrowid
+            case_id = db.execute(
+                """INSERT INTO test_cases
+                (project_id,case_key,scenario,created_at,updated_at)
+                VALUES(?,?,?,?,?)""",
+                (project["id"], "TC-STOR-1", "Storage test", now, now),
+            ).lastrowid
+            db.execute(
+                "INSERT INTO executions(test_case_id,status,executed_at) VALUES(?,?,?)",
+                (case_id, "Pass", now),
+            )
+            db.execute(
+                """INSERT INTO bugs(project_id,bug_key,title,created_at,updated_at)
+                VALUES(?,?,?,?,?)""",
+                (project["id"], "BUG-STOR-1", "Storage defect", now, now),
+            )
+        requirement_file = (
+            self.server.storage_root / "projects" / str(project["id"])
+            / "requirements" / "storage.txt"
+        )
+        requirement_file.parent.mkdir(parents=True, exist_ok=True)
+        requirement_file.write_bytes(b"exact file content")
+
+        status, inventory = self.request("/api/workspace/storage")
+        self.assertEqual(status, 200)
+        summary = inventory["summary"]
+        self.assertEqual(summary["record_count"], 5)
+        self.assertGreater(summary["database_record_estimate_bytes"], 0)
+        self.assertGreaterEqual(
+            summary["filesystem_bytes"], len(b"exact file content")
+        )
+        exact_file = next(
+            item for item in inventory["items"]
+            if item["name"] == "storage.txt"
+        )
+        self.assertEqual(exact_file["size"], len(b"exact file content"))
+        self.assertIn("64 bytes per row", summary["database_estimate_method"])
+        cached_summary = self.request(
+            "/api/workspace/storage/summary"
+        )[1]["summary"]
+        self.assertEqual(cached_summary["record_count"], 5)
+        self.assertEqual(
+            cached_summary["database_record_estimate_bytes"],
+            summary["database_record_estimate_bytes"],
+        )
+        self.assertTrue(any(
+            item["kind"] == "requirements" and item.get("records_count") == 1
+            and item["deletable"]
+            for item in inventory["items"]
+        ))
+        self.assertEqual(
+            self.request("/api/workspace/storage?date_from=not-a-date")[0], 400
+        )
+        self.assertEqual(
+            self.request("/api/workspace/storage?date_from=2026-10-30&date_to=2026-10-01")[0],
+            400,
+        )
+        old_date_inventory = self.request(
+            "/api/workspace/storage?date_from=2099-01-01"
+        )[1]
+        self.assertEqual(old_date_inventory["items"], [])
+
+        requirement_group = next(
+            item for item in inventory["items"]
+            if item["kind"] == "requirements" and item.get("records_count") == 1
+        )
+        status, deleted = self.request(
+            "/api/workspace/storage/bulk-delete",
+            "POST",
+            {"item_ids": [requirement_group["id"], "unknown-storage-item"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(deleted["deleted_count"], 1)
+        self.assertEqual(len(deleted["skipped"]), 1)
+        self.assertEqual(deleted["estimated_bytes_removed"] > 0, True)
+        with app.database(self.db_path) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM requirements WHERE id=?",
+                    (requirement_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                db.execute(
+                    """SELECT COUNT(*) FROM audit_events
+                    WHERE action='storage.record_group_deleted'"""
+                ).fetchone()[0],
+                1,
+            )
+
+        with app.database(self.db_path) as db:
+            foreign_tenant_id, _ = app.create_workspace(
+                db, f"Storage isolation {secrets.token_hex(4)}", app.timestamp()
+            )
+            foreign_project_id = db.execute(
+                """INSERT INTO projects
+                (project_key,name,qa_owner,created_at,updated_at,tenant_id)
+                VALUES(?,?,?,?,?,?)""",
+                (
+                    f"FOREIGN-{secrets.token_hex(4)}",
+                    "Foreign storage project",
+                    "QA",
+                    now,
+                    now,
+                    foreign_tenant_id,
+                ),
+            ).lastrowid
+        foreign_project_item_id = app.storage_item_identifier(
+            "records", foreign_tenant_id, foreign_project_id, "projects"
+        )
+        self.assertEqual(
+            self.request(
+                f"/api/workspace/storage/items/{foreign_project_item_id}",
+                "DELETE",
+            )[0],
+            404,
+        )
+
+    def test_developer_error_ingestion_redacts_and_summary_reports_api_metrics(self):
+        self.assertEqual(
+            self.request(
+                "/api/developer/errors",
+                authenticated=False,
+            )[0],
+            401,
+        )
+        with self.server.api_metrics_lock:
+            self.server.api_metrics.clear()
+        with patch("builtins.print") as log_print:
+            self.assertEqual(
+                self.request("/api/not-a-route?token=private-query")[0], 404
+            )
+        self.assertNotIn("private-query", log_print.call_args.args[0])
+        status, submitted = self.request(
+            "/api/developer/errors/report",
+            "POST",
+            {
+                "source": "frontend",
+                "severity": "error",
+                "message": "failed token=private-value for qa@example.test",
+                "stack_trace": "Authorization: Bearer private-token",
+                "route": "/workspace",
+                "request_id": "storage-monitor-test",
+                "metadata": {
+                    "authorization": "Bearer metadata-secret",
+                    "environment": "test",
+                },
+            },
+        )
+        self.assertEqual(status, 202)
+        with app.database(self.db_path) as db:
+            row = db.execute(
+                "SELECT * FROM developer_errors WHERE id=?",
+                (submitted["id"],),
+            ).fetchone()
+        self.assertNotIn("private-value", row["message"])
+        self.assertNotIn("private-token", row["stack_trace"])
+        self.assertEqual(row["user_email"], "")
+        self.assertIsNone(row["user_id"])
+        self.assertNotIn("metadata-secret", row["metadata_json"])
+        status, summary = self.request("/api/developer/summary?period=7d")
+        self.assertEqual(status, 200)
+        self.assertEqual(summary["period"], "7d")
+        self.assertGreaterEqual(summary["totals"]["period_errors"], 1)
+        self.assertEqual(summary["api_requests"]["http_4xx"], 1)
+        self.assertEqual(summary["api_requests"]["failure_rate_percent"], 100)
+        self.assertIn("frequency", summary)
+        self.assertIn("top_endpoints", summary)
+        old_errors = self.request(
+            "/api/developer/errors?date_from=2099-01-01"
+        )[1]["errors"]
+        self.assertEqual(old_errors, [])
+        self.assertEqual(
+            self.request("/api/developer/errors?date_from=not-a-date")[0], 400
+        )
+        self.assertEqual(
+            self.request("/api/developer/summary?period=invalid")[0], 400
+        )
+        self.assertEqual(
+            self.request("/api/developer/errors?severity=invalid")[0], 400
+        )
 
     def test_custom_fields_are_module_scoped_validated_and_persisted(self):
         status, _ = self.request("/api/custom-fields", "POST", {
@@ -1653,7 +1999,7 @@ class PlatformApiTests(unittest.TestCase):
         self.assertTrue(settings["configured"])
         self.assertEqual(
             [item["id"] for item in settings["providers"]],
-            ["local", "ollama", "google", "openai-compatible"],
+            ["local", "ollama", "google", "openai", "anthropic", "openai-compatible"],
         )
         self.assertNotIn("api_key", settings)
         status, error = self.request("/api/ai/settings", "POST", {
@@ -1706,6 +2052,193 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(self.request("/api/auth/status")[1]["authenticated"], False)
         self.assertEqual(self.request("/api/ai/test", "POST", {}, authenticated=False)[0], 401)
 
+    def test_regular_workspace_member_can_configure_ai_for_the_workspace(self):
+        roles = self.request("/api/roles")[1]["roles"]
+        user_role = next(item for item in roles if item["name"] == "User")
+        status, user = self.request("/api/users", "POST", {
+            "first_name": "AI",
+            "last_name": "Member",
+            "email": "ai.member@example.test",
+            "password": "AIMemberPassword123",
+            "role_id": user_role["id"],
+        })
+        self.assertEqual(status, 201)
+
+        login_request = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "ai.member@example.test",
+                "password": "AIMemberPassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(login_request) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+
+        status, settings = self.request("/api/ai/settings", "POST", {
+            "provider": "anthropic",
+            "model": "claude-3-5-sonnet-latest",
+            "api_key": "member-secret-key",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(settings["provider"], "anthropic")
+        self.assertEqual(settings["tenant_id"], 1)
+        self.assertNotIn("member-secret-key", json.dumps(settings))
+
+        with app.database(self.db_path) as db:
+            row = db.execute(
+                """SELECT model FROM tenant_ai_provider_configs
+                WHERE tenant_id=1 AND provider='anthropic'"""
+            ).fetchone()
+        self.assertEqual(row["model"], "claude-3-5-sonnet-latest")
+        self.auth_cookie = self.admin_cookie
+
+    def test_ai_module_toggle_requires_workspace_admin(self):
+        roles = self.request("/api/roles")[1]["roles"]
+        user_role = next(item for item in roles if item["name"] == "User")
+        status, _ = self.request("/api/users", "POST", {
+            "first_name": "AI",
+            "last_name": "Toggle",
+            "email": "ai.toggle@example.test",
+            "password": "AITogglePassword123",
+            "role_id": user_role["id"],
+        })
+        self.assertEqual(status, 201)
+        login_request = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "ai.toggle@example.test",
+                "password": "AITogglePassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(login_request) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(
+            self.request("/api/ai/module", "POST", {"enabled": False})[0], 403
+        )
+
+        self.auth_cookie = self.admin_cookie
+        status, settings = self.request("/api/ai/module", "POST", {"enabled": False})
+        self.assertEqual(status, 200)
+        self.assertFalse(settings["enabled"])
+        self.assertTrue(settings["can_manage"])
+        status, _ = self.request("/api/ai/settings", "POST", {
+            "provider": "local",
+            "model": "deterministic",
+        })
+        self.assertEqual(status, 400)
+
+        status, settings = self.request("/api/ai/module", "POST", {"enabled": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(settings["enabled"])
+
+    def test_login_rate_limit_blocks_repeated_failures(self):
+        for _ in range(app.AUTH_RATE_LIMIT_ATTEMPTS):
+            status, _ = self.request(
+                "/api/auth/login", "POST",
+                {"email": "missing@example.test", "password": "WrongPassword123"},
+                authenticated=False,
+            )
+            self.assertEqual(status, 401)
+        status, body = self.request(
+            "/api/auth/login", "POST",
+            {"email": "missing@example.test", "password": "WrongPassword123"},
+            authenticated=False,
+        )
+        self.assertEqual(status, 429)
+        self.assertIn("Too many", body["error"])
+
+    def test_security_headers_and_secure_session_cookie(self):
+        with urllib.request.urlopen(f"{self.base}/api/auth/status") as response:
+            self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+            self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+            self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        with patch.dict(os.environ, {"QA_COOKIE_SECURE": "true"}):
+            login = urllib.request.Request(
+                self.base + "/api/auth/login",
+                data=json.dumps({"password": "test-admin-password-123"}).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(login) as response:
+                self.assertIn("Secure", response.headers["Set-Cookie"])
+
+    def test_sessions_survive_in_memory_reset_and_logout_persists(self):
+        with self.server.admin_session_lock:
+            self.server.admin_sessions.clear()
+            self.server.user_sessions.clear()
+        status, body = self.request("/api/auth/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["authenticated"])
+        status, _ = self.request("/api/auth/logout", "POST", {})
+        self.assertEqual(status, 200)
+        with app.database(self.db_path) as db:
+            rows = db.execute(
+                "SELECT token_hash,kind,expires_at FROM auth_sessions"
+            ).fetchall()
+        self.assertEqual([dict(row) for row in rows], [])
+        with self.server.admin_session_lock:
+            self.server.admin_sessions.clear()
+            self.server.user_sessions.clear()
+        status, body = self.request("/api/auth/status")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["authenticated"])
+
+    def test_tenant_admin_cannot_assign_another_tenants_role(self):
+        _, role = self.request("/api/roles", "POST", {
+            "name": "Cross tenant role",
+            "permissions": ["projects.view"],
+        })
+        signup = urllib.request.Request(
+            self.base + "/api/auth/signup",
+            data=json.dumps({
+                "first_name": "Other", "last_name": "Owner",
+                "email": "other.owner@example.test",
+                "password": "SecurePassword123",
+                "confirm_password": "SecurePassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(signup) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        status, body = self.request("/api/users", "POST", {
+            "first_name": "Scoped", "last_name": "User",
+            "email": "scoped.user@example.test",
+            "password": "ScopedPassword123",
+            "role_id": role["id"],
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "Choose an active role.")
+
+    def test_requirement_document_download_rejects_paths_outside_project_storage(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Path guard",
+            "project_key": "PATHGUARD",
+            "qa_owner": "QA",
+        })
+        outside = Path(self.db_path).parent / "outside-document.txt"
+        outside.write_text("not project storage", encoding="utf-8")
+        with app.database(self.db_path) as db:
+            cursor = db.execute(
+                """INSERT INTO requirement_documents
+                (project_id,filename,storage_path,content_type,file_size_bytes,
+                requirement_count,version,uploaded_at,analysis_json)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    project["id"], "outside.txt", str(outside), "text/plain",
+                    outside.stat().st_size, 0, 1, app.timestamp(), "{}",
+                ),
+            )
+            document_id = cursor.lastrowid
+        status, _ = self.request(
+            f"/api/projects/{project['id']}/requirements/documents/{document_id}"
+        )
+        self.assertEqual(status, 404)
+
     def test_signup_login_password_storage_and_server_side_permissions(self):
         status, error = self.request("/api/projects", authenticated=False)
         self.assertEqual(status, 401)
@@ -1731,9 +2264,16 @@ class PlatformApiTests(unittest.TestCase):
             self.assertEqual(response.status, 201)
             self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
             created = json.loads(response.read())
-        self.assertEqual(created["user"]["role_name"], "User")
+        self.assertEqual(created["user"]["role_name"], "Workspace Owner")
         self.assertNotEqual(created["user"]["role_name"], "Global Admin")
+        self.assertEqual(created["workspace"]["name"], "First Admin Workspace")
+        self.assertEqual(created["subscription"]["status"], "trialing")
+        self.assertEqual(created["subscription"]["plan"], "free_trial")
+        trial_started = datetime.fromisoformat(created["subscription"]["trial_started_at"])
+        trial_ends = datetime.fromisoformat(created["subscription"]["trial_ends_at"])
+        self.assertEqual(trial_ends - trial_started, timedelta(days=14))
         self.assertEqual(self.request("/api/auth/status")[1]["user"]["email"], "first.admin@example.test")
+        self.assertEqual(self.request("/api/developer/errors")[0], 403)
         self.assertNotEqual(created["user"]["tenant_id"], 1)
         self.assertEqual(self.request("/api/projects")[1], [])
         self.assertEqual(
@@ -1751,9 +2291,19 @@ class PlatformApiTests(unittest.TestCase):
                 WHERE user_id=?""",
                 (created["user"]["id"],),
             ).fetchone()
+            workspace = db.execute(
+                "SELECT owner_user_id FROM tenants WHERE id=?",
+                (created["user"]["tenant_id"],),
+            ).fetchone()
+            subscription_count = db.execute(
+                "SELECT COUNT(*) FROM tenant_subscriptions WHERE tenant_id=?",
+                (created["user"]["tenant_id"],),
+            ).fetchone()[0]
         self.assertTrue(stored.startswith("pbkdf2_sha256$"))
         self.assertNotIn("SecurePassword123", stored)
         self.assertEqual(membership["tenant_id"], created["user"]["tenant_id"])
+        self.assertEqual(workspace["owner_user_id"], created["user"]["id"])
+        self.assertEqual(subscription_count, 1)
         self.assertEqual(
             self.request("/api/auth/signup", "POST", {
                 "first_name": "Other", "last_name": "User",
@@ -1763,7 +2313,6 @@ class PlatformApiTests(unittest.TestCase):
             }, authenticated=False)[0],
             409,
         )
-
         self.auth_cookie = self.admin_cookie
         _, role = self.request("/api/roles", "POST", {
             "name": "Read only project access",
@@ -1834,10 +2383,311 @@ class PlatformApiTests(unittest.TestCase):
             "status": role["status"], "permissions": ["projects.view", "users.edit"],
         })[0], 403)
         self.auth_cookie = user_cookie
-        self.assertEqual(self.request("/api/users", "POST", {
+        status, owner_created_user = self.request("/api/users", "POST", {
             "first_name": "Self", "last_name": "Promoted",
             "email": "self.promoted@example.test", "password": "SelfPromoted123",
-        })[0], 403)
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(owner_created_user["role_name"], "User")
+
+    def test_trial_signup_expiry_blocks_workspace_but_preserves_authentication(self):
+        payload = {
+            "first_name": "Trial",
+            "last_name": "Owner",
+            "workspace_name": "  Acme   QA  ",
+            "email": "trial.owner@example.test",
+            "password": "TrialOwnerPassword123",
+            "confirm_password": "TrialOwnerPassword123",
+        }
+        signup = urllib.request.Request(
+            self.base + "/api/auth/signup",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(signup) as response:
+            self.assertEqual(response.status, 201)
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+            created = json.loads(response.read())
+
+        self.assertEqual(created["workspace"]["name"], "Acme QA")
+        self.assertEqual(created["workspace"]["slug"], "acme-qa")
+        self.assertEqual(created["user"]["role_name"], "Workspace Owner")
+        self.assertTrue(created["workspace_access"])
+        self.assertEqual(created["subscription"]["days_remaining"], 14)
+        _, collision = self.request("/api/auth/signup", "POST", {
+            **payload,
+            "email": "trial.owner.two@example.test",
+        }, authenticated=False)
+        self.assertEqual(collision["workspace"]["slug"], "acme-qa-2")
+        tenant_id = created["user"]["tenant_id"]
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Trial data", "project_key": "TRIALDATA", "qa_owner": "QA",
+        })
+        self.assertEqual(project["name"], "Trial data")
+        with app.database(self.db_path) as db:
+            expired_at = app.timestamp()
+            db.execute(
+                """UPDATE tenant_subscriptions SET trial_ends_at=?,updated_at=?
+                WHERE tenant_id=?""",
+                (expired_at, expired_at, tenant_id),
+            )
+
+        status, auth_status = self.request("/api/auth/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(auth_status["authenticated"])
+        self.assertFalse(auth_status["workspace_access"])
+        self.assertEqual(auth_status["workspace_access_code"], "TRIAL_EXPIRED")
+        self.assertEqual(
+            self.request("/api/projects")[1]["code"],
+            "TRIAL_EXPIRED",
+        )
+        self.assertEqual(self.request("/api/projects")[0], 403)
+        status, denied = self.request(
+            f"/api/workspaces/{tenant_id}/subscription/reactivate",
+            "POST",
+            {},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(denied["code"], "WORKSPACE_REACTIVATION_DENIED")
+        with app.database(self.db_path) as db:
+            self.assertEqual(
+                expire_trials(db, datetime.fromisoformat(expired_at)),
+                1,
+            )
+        status, suspended_auth = self.request("/api/auth/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(suspended_auth["authenticated"])
+        self.assertEqual(suspended_auth["workspace_access_code"], "TRIAL_EXPIRED")
+
+        login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": payload["email"],
+                "password": payload["password"],
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(login) as response:
+            self.assertEqual(response.status, 200)
+            self.assertTrue(json.loads(response.read())["authenticated"])
+        self.assertEqual(self.request("/api/auth/logout", "POST", {})[0], 200)
+        self.assertFalse(self.request("/api/auth/status")[1]["authenticated"])
+        self.auth_cookie = self.admin_cookie
+        status, reactivated = self.request(
+            f"/api/workspaces/{tenant_id}/subscription/reactivate",
+            "POST",
+            {},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(reactivated["reactivated"])
+        self.assertEqual(reactivated["subscription"]["status"], "trialing")
+        with app.database(self.db_path) as db:
+            restored = db.execute(
+                """SELECT t.status,s.status subscription_status
+                FROM tenants t JOIN tenant_subscriptions s ON s.tenant_id=t.id
+                WHERE t.id=?""",
+                (tenant_id,),
+            ).fetchone()
+        self.assertEqual(restored["status"], "Active")
+        self.assertEqual(restored["subscription_status"], "trialing")
+
+    def test_concurrent_signup_creates_one_workspace_and_trial(self):
+        payload = {
+            "first_name": "Concurrent",
+            "last_name": "Owner",
+            "workspace_name": "Concurrent Workspace",
+            "email": "concurrent.owner@example.test",
+            "password": "ConcurrentOwnerPassword123",
+            "confirm_password": "ConcurrentOwnerPassword123",
+        }
+        barrier = threading.Barrier(4)
+        statuses = []
+        statuses_lock = threading.Lock()
+
+        def submit_signup():
+            barrier.wait()
+            request = urllib.request.Request(
+                self.base + "/api/auth/signup",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    status = response.status
+            except urllib.error.HTTPError as error:
+                status = error.code
+            with statuses_lock:
+                statuses.append(status)
+
+        threads = [threading.Thread(target=submit_signup) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(statuses.count(201), 1)
+        self.assertEqual(statuses.count(409), 3)
+        with app.database(self.db_path) as db:
+            user = db.execute(
+                "SELECT id FROM users WHERE email=?",
+                (payload["email"],),
+            ).fetchone()
+            self.assertIsNotNone(user)
+            self.assertEqual(db.execute(
+                """SELECT COUNT(*) FROM tenants WHERE owner_user_id=?""",
+                (user["id"],),
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                """SELECT COUNT(*) FROM tenant_subscriptions
+                WHERE tenant_id IN (SELECT id FROM tenants WHERE owner_user_id=?)""",
+                (user["id"],),
+            ).fetchone()[0], 1)
+
+    def test_workspace_owner_can_transfer_ownership_but_members_cannot(self):
+        signup = urllib.request.Request(
+            self.base + "/api/auth/signup",
+            data=json.dumps({
+                "first_name": "Current", "last_name": "Owner",
+                "workspace_name": "Ownership Transfer",
+                "email": "current.owner@example.test",
+                "password": "CurrentOwnerPassword123",
+                "confirm_password": "CurrentOwnerPassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(signup) as response:
+            owner_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+            created = json.loads(response.read())
+        self.auth_cookie = owner_cookie
+        owner_id = created["user"]["id"]
+        tenant_id = created["user"]["tenant_id"]
+        self.assertEqual(self.request(
+            f"/api/users/{owner_id}", method="DELETE"
+        )[0], 409)
+
+        _, member = self.request("/api/users", "POST", {
+            "first_name": "New", "last_name": "Owner",
+            "email": "new.owner@example.test",
+            "password": "NewOwnerPassword123",
+        })
+        member_login = urllib.request.Request(
+            self.base + "/api/auth/login",
+            data=json.dumps({
+                "email": "new.owner@example.test",
+                "password": "NewOwnerPassword123",
+            }).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(member_login) as response:
+            self.auth_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        status, denied = self.request(
+            f"/api/workspaces/{tenant_id}/owner",
+            "POST",
+            {"user_id": member["id"]},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(denied["code"], "WORKSPACE_OWNER_TRANSFER_DENIED")
+
+        self.auth_cookie = owner_cookie
+        status, transfer = self.request(
+            f"/api/workspaces/{tenant_id}/owner",
+            "POST",
+            {"user_id": member["id"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(transfer["owner"]["id"], member["id"])
+        self.assertEqual(transfer["owner"]["role_name"], "Workspace Owner")
+        with app.database(self.db_path) as db:
+            tenant = db.execute(
+                "SELECT owner_user_id FROM tenants WHERE id=?",
+                (tenant_id,),
+            ).fetchone()
+            former_owner_role = db.execute(
+                """SELECT r.name FROM tenant_memberships m
+                JOIN roles r ON r.id=m.role_id
+                WHERE m.tenant_id=? AND m.user_id=?""",
+                (tenant_id, owner_id),
+            ).fetchone()["name"]
+        self.assertEqual(tenant["owner_user_id"], member["id"])
+        self.assertEqual(former_owner_role, "User")
+
+    def test_signup_failure_rolls_back_workspace_membership_and_trial(self):
+        payload = {
+            "first_name": "Rollback",
+            "last_name": "Owner",
+            "workspace_name": "Rollback Trial Workspace",
+            "email": "rollback.owner@example.test",
+            "password": "RollbackOwnerPassword123",
+            "confirm_password": "RollbackOwnerPassword123",
+        }
+        with patch(
+            "app.audit_event",
+            side_effect=sqlite3.IntegrityError("forced audit failure"),
+        ):
+            status, _ = self.request(
+                "/api/auth/signup",
+                "POST",
+                payload,
+                authenticated=False,
+            )
+        self.assertEqual(status, 409)
+        with app.database(self.db_path) as db:
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM users WHERE email=?",
+                (payload["email"],),
+            ).fetchone())
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM tenants WHERE slug='rollback-trial-workspace'"
+            ).fetchone())
+            self.assertIsNone(db.execute(
+                """SELECT 1 FROM tenant_subscriptions
+                WHERE tenant_id IN (SELECT id FROM tenants WHERE slug='rollback-trial-workspace')"""
+            ).fetchone())
+
+    def test_workspace_001_migration_restores_permanent_access_and_preserves_data(self):
+        _, project = self.request("/api/projects", "POST", {
+            "name": "Legacy workspace data",
+            "project_key": "LEGACYDATA",
+            "qa_owner": "QA",
+        })
+        suspended_at = app.timestamp()
+        with app.database(self.db_path) as db:
+            db.execute(
+                """UPDATE tenants SET status='Inactive',suspended_at=?,
+                suspension_reason='Expired trial',updated_at=? WHERE id=1""",
+                (suspended_at, suspended_at),
+            )
+            db.execute(
+                """UPDATE tenant_subscriptions SET status='expired',plan='free_trial',
+                trial_started_at=?,trial_ends_at=?,updated_at=? WHERE tenant_id=1""",
+                (suspended_at, suspended_at, suspended_at),
+            )
+
+        app.initialize(self.db_path)
+
+        with app.database(self.db_path) as db:
+            subscription = db.execute(
+                "SELECT status,plan FROM tenant_subscriptions WHERE tenant_id=1"
+            ).fetchone()
+            workspace = db.execute(
+                "SELECT status,suspended_at,suspension_reason FROM tenants WHERE id=1"
+            ).fetchone()
+            preserved = db.execute(
+                "SELECT name FROM projects WHERE id=?",
+                (project["id"],),
+            ).fetchone()
+            self.assertTrue(app.workspace_access(db, 1)["access_allowed"])
+        self.assertEqual(subscription["status"], "active")
+        self.assertEqual(subscription["plan"], "legacy")
+        self.assertEqual(workspace["status"], "Active")
+        self.assertIsNone(workspace["suspended_at"])
+        self.assertEqual(workspace["suspension_reason"], "")
+        self.assertEqual(preserved["name"], "Legacy workspace data")
 
     def test_reserved_tenant_admin_account_is_promoted_and_scoped(self):
         self.assertEqual(self.request("/api/auth/signup", "POST", {
@@ -2316,6 +3166,31 @@ class PlatformApiTests(unittest.TestCase):
             "new_password": "ChangedPassword456",
             "confirm_password": "ChangedPassword456",
         })[0], 401)
+
+    def test_system_global_admin_can_access_platform_when_workspace_is_suspended(self):
+        suspended_at = app.timestamp()
+        with app.database(self.db_path) as db:
+            db.execute(
+                """UPDATE tenants SET status='Inactive',suspended_at=?,
+                suspension_reason='Test suspension',updated_at=? WHERE id=1""",
+                (suspended_at, suspended_at),
+            )
+        try:
+            status, auth = self.request("/api/auth/status")
+            self.assertEqual(status, 200)
+            self.assertTrue(auth["authenticated"])
+            self.assertTrue(auth["user"]["global_admin"])
+            self.assertTrue(auth["workspace_access"])
+            self.assertIsNone(auth["workspace"])
+            self.assertIsNone(auth["workspace_access_code"])
+            self.assertEqual(self.request("/api/roles")[0], 200)
+        finally:
+            with app.database(self.db_path) as db:
+                db.execute(
+                    """UPDATE tenants SET status='Active',suspended_at=NULL,
+                    suspension_reason='',updated_at=? WHERE id=1""",
+                    (app.timestamp(),),
+                )
 
     def test_project_isolation_and_required_validation(self):
         status, one = self.request("/api/projects", "POST", {
@@ -3419,7 +4294,7 @@ class PlatformApiTests(unittest.TestCase):
         status, error = self.request(
             f"/api/projects/{project['id']}/test-cases/generate", "POST", {}
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 200, error)
         self.assertEqual(error["count"], 4)
         self.assertEqual(error["coverage"]["reviewed_requirements"], 1)
         self.assertEqual(error["coverage"]["covered_requirements"], 1)

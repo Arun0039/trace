@@ -143,6 +143,8 @@ test("routes Ollama without an API key through the same SDK boundary", async () 
 test("constructs models for every SDK-backed provider without a network call", async () => {
   const requests = [
     { provider: "google", model: "gemini-2.5-flash", apiKey: "google-test-key", base_url: "" },
+    { provider: "openai", model: "gpt-4o-mini", apiKey: "openai-test-key", base_url: "" },
+    { provider: "anthropic", model: "claude-3-5-sonnet-latest", apiKey: "anthropic-test-key", base_url: "" },
     { provider: "ollama", model: "llama3.1", apiKey: "", base_url: "http://127.0.0.1:11434/v1" },
     {
       provider: "openai-compatible",
@@ -171,13 +173,13 @@ test("constructs models for every SDK-backed provider without a network call", a
 test("rejects providers that are not enabled", async () => {
   await assert.rejects(
     generateWithProvider({
-      provider: "anthropic",
+      provider: "mistral",
       model: "unknown",
       system: "",
       prompt: "test",
       temperature: 0,
     }),
-    /Unsupported AI provider: anthropic/,
+    /Unsupported AI provider: mistral/,
   );
 });
 

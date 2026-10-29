@@ -115,8 +115,10 @@ active membership in that tenant.
 
 The configured `QA_ADMIN_PASSWORD` session remains the local bootstrap Global Admin.
 The `Global Admin` role is also available for explicitly provisioned user memberships.
-Public signup and administrative account creation default to `User`; signup cannot
-claim the reserved `global-admin@local.qa` address. A one-time migration promotes an
+Public signup creates a dedicated workspace and grants its registering user the
+tenant-scoped `Workspace Owner` role; the role is not a platform administrator.
+Administrative account creation defaults to `User`, and signup cannot claim the
+reserved `global-admin@local.qa` address. A one-time migration promotes an
 existing account with that address to the `Global Admin` role in the default workspace
 only. This account receives full permissions within its active tenant membership, but
 does not become a system-wide administrator. Its project, user, team, role, custom
@@ -126,6 +128,46 @@ account and other memberships remain. The configured bootstrap Global Admin rema
 the system-wide administrator and retains system-only archive and provider settings.
 Administrative endpoints enforce role permissions and tenant context in the API; the
 UI uses the same permission keys but is not the security boundary.
+
+## Workspace storage and developer monitoring
+
+The workspace Storage page is served by the existing vanilla JavaScript app at
+`/workspace/storage`. The backend scopes project files and supported records to the
+authenticated tenant before generating inventory identifiers, downloads, or deletion
+operations. Files on disk and binary attachment/evidence payloads are measured in
+exact bytes. For project, requirement, test-case, execution, defect, and analysis
+rows, the estimate sums the character lengths of selected text fields plus a fixed
+64-byte row allowance. It deliberately excludes encoding expansion, indexes,
+database pages, and engine-specific overhead. The UI distinguishes exact data from
+estimates; totals and quota include both.
+
+File deletion and deletion of eligible project/type groups are tenant checked and
+audited. Record-group deletion uses the database transaction and removes linked form
+data and execution evidence along with its parent rows. Projects and analysis-job
+rows are protected in the Storage page: the project-management delete action retains
+its existing archive behavior, and running/operational analysis state is not exposed
+as a destructive storage target. `workspace_storage_snapshots` caches summary values
+per tenant; snapshots are invalidated after deletion and refreshed by recalculation.
+Its additive startup migration removes stale snapshots when the estimation fields are
+added.
+
+Developer monitoring is a separate static application at `/developer`, with access
+provided by the existing sign-in flow. The API checks `developer.view`, `.manage`,
+or `.delete` for every protected operation and scopes error data to the developer's
+tenant unless the authenticated user is the system Global Admin. Workspace business
+records are not made available through these endpoints. Sanitized error details are
+stored in the independent `developer_errors` table; resolved and ignored records are
+pruned using `QA_DEVELOPER_ERROR_RETENTION_DAYS` (default 90 days). The public,
+rate-limited reporting endpoint accepts only bounded frontend/API diagnostics and
+redacts secrets, emails, IPs, and local user paths. HTTP and exception logs are
+structured and omit request query strings.
+
+The dashboard's API failure rates are derived from a bounded process-local buffer
+of the latest 20,000 authenticated non-developer API responses, split by status and
+tenant. These counts reset on restart and are explicitly not durable logs. Database,
+filesystem, and analysis-job checks are exposed only through the developer health
+API. `QA_STORAGE_QUOTA_MB` configures the optional workspace quota; `QA_ENVIRONMENT`
+labels structured logs and error metadata.
 
 Project requests are scoped to the authenticated tenant before record handlers run.
 Project-owned requirements, test cases, defects, attachments, and related records
@@ -137,10 +179,64 @@ before/after values in `audit_events`. Account deletion removes memberships and 
 memberships but preserves QA history, team ownership is nulled, and audit actor
 references are retained with `ON DELETE SET NULL`.
 
-The current deployment exposes one default workspace and does not add tenant switching
-or a separate Tenant Admin role. A `Global Admin` role assigned through a tenant
-membership is intentionally scoped to that tenant; only the configured bootstrap
-administrator receives system-wide access.
+The existing local installation retains its default workspace and does not add tenant
+switching. New signup provisions a separate tenant. A `Global Admin` role assigned
+through a tenant membership is intentionally scoped to that tenant; only the configured
+bootstrap administrator receives system-wide access.
+
+## Trial lifecycle and data preservation
+
+`tenant_subscriptions` stores a workspace's plan, lifecycle status, trial start, and
+exclusive UTC expiry. The startup migration is additive: it adds `owner_user_id`,
+suspension metadata, and the subscription table, then seeds any pre-existing tenant
+without a subscription as an active `legacy` plan. This preserves current local
+projects and does not assign records to a different tenant.
+
+Workspace 001 (tenant ID 1) is the permanent no-payment workspace. Startup repairs
+an earlier trial/suspension state to active `legacy`, and access checks and the
+expiry worker exclude it; newly created signup workspaces receive the trial.
+
+Signup creates the tenant, owner account, owner membership, trial subscription, and
+audit event in one transaction. Tenant-scoped API requests pass through the shared
+request authorizer, which denies suspended workspaces and expired trials even when
+the scheduled worker has not run. Auth status, login/logout, and self-service profile
+routes remain available after suspension. `backend/expire_trials.py` runs idempotent
+conditional updates in bounded batches, records a suspension audit event, and never
+deletes tenant data or files. Render schedules this command separately from the public
+health check. A system Global Admin can reactivate an expired trial through the
+authorized workspace subscription route; the operation starts a new configured-length
+trial and is audited. `QA_TRIAL_DURATION_DAYS` defaults to 14 days.
+
+Before deploying, back up the local SQLite database and `qa-platform/storage/`, or
+take a PostgreSQL snapshot. The schema is additive and can remain after application
+rollback. If the expiry worker has already suspended tenants, restore the backup or
+use the authorized reactivation route before reverting. Billing and paid-plan
+checkout are not part of this implementation.
+
+## Product Owner Operations
+
+The separate `/product-owner` static application uses the existing bootstrap
+administrator's HttpOnly session. All `/api/product-owner/*` routes independently
+require the system Global Admin; a workspace membership with a Global Admin role is
+not sufficient. The UI offers an overview, tenant directory/detail, trial and plan
+operations, storage inventory/cleanup, usage analytics, error/health monitoring, and
+administrative audit history.
+
+Migration `0001_product_owner_dashboard` assigns immutable unique public UUIDs to
+users, tenants, and workspaces while preserving existing numeric IDs and foreign
+keys. Since `tenants` is the established workspace entity, tenant and workspace
+public IDs are separate UUID columns on that row rather than a new workspace table.
+The migration adds a plan catalog, coarse usage events, storage snapshots, and
+Product Owner audit rows. Plan catalog configuration, subscription lifecycle, and
+workspace access status remain separate concerns; billing is not implemented.
+
+Storage inventory reuses the established tenant-scoped scanner and safe deletion
+service. Deletion requires inventoried identifiers, a tenant-specific confirmation,
+a reason, and audit history. Database record sizes remain estimates; filesystem and
+binary storage are measured separately. Usage events retain only normalized API
+routes/statuses and login/signup events; request counts in the existing developer
+monitor are still process-local. `QA_TRIAL_DURATION_DAYS` configures the trial
+duration, defaulting to 14 days.
 
 ## Target architecture
 
@@ -201,6 +297,10 @@ moved.
   database/storage paths and same-origin application behavior.
 - Added opt-in CORS for an independently served frontend and kept the default same-origin
   configuration restricted.
+- Made AI provider settings and encrypted credentials workspace-scoped, with any signed-in
+  workspace member able to configure Google Gemini, OpenAI, Anthropic Claude, or an
+  OpenAI-compatible endpoint once a workspace administrator enables the module. Ollama is
+  restricted to the Default Workspace.
 - Replaced the `.env.example` admin password value with a placeholder and extended
   `.gitignore` for local runtime output.
 - Added a GitHub Actions workflow for Python/Node tests and dependency vulnerability

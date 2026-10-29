@@ -28,13 +28,34 @@ def _tables(sqlite_db: sqlite3.Connection) -> list[str]:
     ]
 
 
+def _nullable_foreign_keys(
+    sqlite_db: sqlite3.Connection, tables: list[str]
+) -> dict[str, set[str]]:
+    table_set = set(tables)
+    deferred = {table: set() for table in tables}
+    for table in tables:
+        nullable_columns = {
+            row[1]
+            for row in sqlite_db.execute(f'PRAGMA table_info("{table}")')
+            if not row[3] and not row[5]
+        }
+        for foreign_key in sqlite_db.execute(f'PRAGMA foreign_key_list("{table}")'):
+            if foreign_key[2] in table_set and foreign_key[3] in nullable_columns:
+                deferred[table].add(foreign_key[3])
+    return deferred
+
+
 def dependency_order(sqlite_db: sqlite3.Connection, tables: list[str]) -> list[str]:
     table_set = set(tables)
     dependencies = {table: set() for table in tables}
+    deferred = _nullable_foreign_keys(sqlite_db, tables)
     for table in tables:
         for foreign_key in sqlite_db.execute(f'PRAGMA foreign_key_list("{table}")'):
             referenced_table = foreign_key[2]
-            if referenced_table in table_set and referenced_table != table:
+            if (
+                referenced_table in table_set
+                and foreign_key[3] not in deferred[table]
+            ):
                 dependencies[table].add(referenced_table)
 
     ordered = []
@@ -85,7 +106,14 @@ def _target_columns(db, table: str) -> set[str]:
     }
 
 
-def _copy_table(source, target, table: str, columns: list[str]) -> int:
+def _copy_table(
+    source,
+    target,
+    table: str,
+    columns: list[str],
+    deferred_foreign_keys: set[str] | None = None,
+) -> int:
+    deferred_foreign_keys = deferred_foreign_keys or set()
     quoted_table = _quote_identifier(table)
     quoted_columns = ", ".join(_quote_identifier(column) for column in columns)
     placeholders = ", ".join("?" for _ in columns)
@@ -98,10 +126,54 @@ def _copy_table(source, target, table: str, columns: list[str]) -> int:
         for row in rows:
             target.execute(
                 f"INSERT INTO {quoted_table} ({quoted_columns}) VALUES ({placeholders})",
-                tuple(row[column] for column in columns),
+                tuple(
+                    None if column in deferred_foreign_keys else row[column]
+                    for column in columns
+                ),
             )
         copied += len(rows)
     return copied
+
+
+def _restore_deferred_foreign_keys(
+    source, target, table: str, foreign_key_columns: set[str]
+) -> None:
+    if not foreign_key_columns:
+        return
+    primary_key = [
+        row["name"]
+        for row in sorted(
+            source.execute(f'PRAGMA table_info("{table}")'),
+            key=lambda row: row[5],
+        )
+        if row[5]
+    ]
+    if not primary_key:
+        raise ValueError(
+            f"Cannot restore deferred foreign keys for keyless table {table!r}."
+        )
+
+    selected_columns = list(dict.fromkeys([*primary_key, *sorted(foreign_key_columns)]))
+    quoted_table = _quote_identifier(table)
+    quoted_columns = ", ".join(
+        _quote_identifier(column) for column in selected_columns
+    )
+    assignments = ", ".join(
+        f"{_quote_identifier(column)}=?"
+        for column in sorted(foreign_key_columns)
+    )
+    predicate = " AND ".join(
+        f"{_quote_identifier(column)}=?" for column in primary_key
+    )
+    rows = source.execute(
+        f"SELECT {quoted_columns} FROM {quoted_table}"
+    ).fetchall()
+    for row in rows:
+        target.execute(
+            f"UPDATE {quoted_table} SET {assignments} WHERE {predicate}",
+            tuple(row[column] for column in sorted(foreign_key_columns))
+            + tuple(row[column] for column in primary_key),
+        )
 
 
 def _reset_sequence(target, table: str) -> None:
@@ -157,6 +229,7 @@ def migrate(source_path: Path | str, target_url: str) -> dict[str, int]:
         try:
             tables = _tables(source)
             ordered_tables = dependency_order(source, tables)
+            deferred_foreign_keys = _nullable_foreign_keys(source, tables)
             with app.database(target_url) as target:
                 target_tables = _postgres_tables(target)
                 for table in sorted(set(tables) & target_tables):
@@ -195,7 +268,21 @@ def migrate(source_path: Path | str, target_url: str) -> dict[str, int]:
                                 f"PostgreSQL table {table!r} cannot store source columns: "
                                 + ", ".join(unavailable)
                             )
-                        counts[table] = _copy_table(source, target, table, source_columns)
+                        counts[table] = _copy_table(
+                            source,
+                            target,
+                            table,
+                            source_columns,
+                            deferred_foreign_keys[table],
+                        )
+
+                    for table in ordered_tables:
+                        _restore_deferred_foreign_keys(
+                            source,
+                            target,
+                            table,
+                            deferred_foreign_keys[table],
+                        )
 
                     for table in ordered_tables:
                         expected = source.execute(

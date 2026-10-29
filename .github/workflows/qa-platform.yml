@@ -7,6 +7,10 @@ on:
       - "frontend/**"
       - "docs/**"
       - "qa-platform/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "render.yaml"
+      - ".dockerignore"
       - ".gitignore"
       - "README.md"
       - ".github/workflows/qa-platform.yml"
@@ -16,14 +20,37 @@ on:
       - "frontend/**"
       - "docs/**"
       - "qa-platform/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "render.yaml"
+      - ".dockerignore"
       - ".gitignore"
       - "README.md"
       - ".github/workflows/qa-platform.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test-and-audit:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: qa_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d qa_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      QA_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/qa_test
     defaults:
       run:
         working-directory: backend
@@ -47,7 +74,39 @@ jobs:
           pip-audit -r requirements.txt
       - name: Install Node dependencies
         run: npm ci
+      - name: Build Cloudflare Pages frontend
+        working-directory: frontend
+        env:
+          QA_API_BASE_URL: https://api.example.com
+        run: node build_pages.mjs
+      - name: Check frontend JavaScript syntax
+        working-directory: frontend
+        run: |
+          node --check app.js
+          node --check product-owner.js
+          node --check developer.js
       - name: Run Node tests
         run: npm test
       - name: Audit Node dependencies
         run: npm audit --audit-level=high
+      - name: Static security analysis (high severity)
+        run: |
+          python -m pip install bandit
+          bandit -r . -x ./tests -lll
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  container-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container image
+        run: docker build -t qa-tracker:ci .

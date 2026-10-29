@@ -25,6 +25,9 @@ WORKDIR /app/backend
 # Expose port - Render will override via PORT
 EXPOSE 8001
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl --fail --silent --show-error http://127.0.0.1:${PORT}/health || exit 1
+
 # Default env (can be overridden)
 ENV HOST=0.0.0.0
 ENV PORT=8001

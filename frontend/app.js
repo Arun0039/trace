@@ -44,6 +44,9 @@ const S = {
     provider: "local",
     model: "deterministic",
     configured: true,
+    enabled: true,
+    ollama_supported: true,
+    can_manage: false,
     providers: [],
   },
   auth: { authenticated: false, admin_configured: false, user: null, permissions: [] },
@@ -62,6 +65,22 @@ const S = {
   assistedCategories: ["Functional", "Non-Functional", "Sanity", "Smoke"],
   assistedAnalysis: null,
   inventoryVisible: {},
+  storage: {
+    data: null,
+    loading: false,
+    selected: [],
+    message: "",
+    filters: {
+      kind: "",
+      project_id: "",
+      q: "",
+      date_from: "",
+      date_to: "",
+      sort: "size_desc",
+      page: 1,
+      page_size: 25,
+    },
+  },
 };
 
 function currentPath() {
@@ -205,7 +224,7 @@ function homePage() {
         </div>
         <p class="how-note">AI proposals are not confirmed source facts. Review the source and approve requirements before relying on generated drafts.</p>
       </section>
-      <section class="public-cta"><div><div class="section-kicker">READY TO TRACE THE DETAILS?</div><h2>Bring your requirements and testing closer together.</h2><p>Start in the existing TRACE workspace. Local deployment and sign-up constraints apply.</p></div><a class="public-button" href="/signup" data-public-nav>Get Started <span aria-hidden="true">↗</span></a></section>
+      <section class="public-cta"><div><div class="section-kicker">READY TO TRACE THE DETAILS?</div><h2>Bring your requirements and testing closer together.</h2><p>Start in an available TRACE workspace. Registration availability depends on deployment settings.</p></div><a class="public-button" href="/signup" data-public-nav>Get Started <span aria-hidden="true">↗</span></a></section>
     </main>`, "home");
 }
 
@@ -217,7 +236,7 @@ function aboutPage() {
         <article><span class="section-kicker">PURPOSE</span><h2>Turn scattered handoffs into a reviewable workflow.</h2><p>Business requirements describe intended outcomes; software testing checks whether those outcomes are supported by the product. TRACE brings source documents, extracted requirements, reviewer decisions, and linked test cases into a shared project workspace.</p></article>
         <article><span class="section-kicker">VISION</span><h2>Clarity first. Traceability throughout.</h2><p>The goal is to help teams identify unclear source material, make review decisions explicit, and prepare structured tests without losing the connection to the requirement that informed them.</p></article>
         <article><span class="section-kicker">WHO IT’S FOR</span><h2>Designed around cross-functional QA work.</h2><p>QA engineers, test leads, business analysts, and development teams can use TRACE to collaborate on requirement review, test preparation, execution tracking, and project-level visibility.</p></article>
-        <article class="about-callout"><span class="section-kicker">CURRENT PRODUCT</span><p>TRACE is currently a local-first application. Deterministic workflows run locally; optional AI integrations use a provider configured by the workspace administrator. AI output is a suggestion and needs human review.</p></article>
+        <article class="about-callout"><span class="section-kicker">CURRENT PRODUCT</span><p>TRACE is currently a local-first application. Deterministic workflows run locally; optional AI integrations use a provider configured by a signed-in member of the workspace. AI output is a suggestion and needs human review.</p></article>
       </section>
       <div class="subpage-action"><a class="public-button" href="/signup" data-public-nav>Explore the workspace <span aria-hidden="true">↗</span></a></div>
     </main>`, "about");
@@ -231,7 +250,7 @@ function legalPage(kind) {
     ["scope", "1. Scope and draft status", "<p>This draft describes the current local-first TRACE application, not a separately hosted cloud service. It is a working product document, not legal advice; have qualified counsel review it before production use. Operator identity, governing law, and the final contact process remain to be supplied.</p>"],
     ["data", "2. Information handled", "<p>Depending on use, TRACE stores account names and email addresses, profile and role information, project details, requirements, test cases, execution and defect records, audit history, and files or attachments uploaded by users. Account passwords are stored as salted PBKDF2 hashes rather than plaintext.</p>"],
     ["documents", "3. Uploaded requirements and files", "<p>Uploaded BRDs and other project files are stored in the workspace’s configured storage directory; structured records are stored in the configured database. The default setup uses SQLite and local storage. PostgreSQL can be configured for database records, but project files still require persistent shared storage. Operators should secure and back up both locations.</p><p>Deleting a project removes its database records but archives its project folder rather than erasing its files. Account deactivation preserves related records and audit history. TRACE does not currently define an automatic retention period; archived files and backups may remain until separately removed by the operator.</p>"],
-    ["ai", "4. AI and model processing", "<p>Local deterministic processing is available. If an administrator configures Ollama, Google Gemini, or an OpenAI-compatible provider, document-derived content, requirements, or prompts submitted for AI-assisted analysis or generation may be sent to that provider for processing. The provider’s own terms, retention, and privacy practices apply to that processing.</p><p>Review provider settings and applicable agreements before sending confidential, personal, regulated, or otherwise restricted information. Provider API credentials are stored encrypted in the database when configured with the required encryption key. Do not treat AI output as verified source content.</p>"],
+    ["ai", "4. AI and model processing", "<p>Local deterministic processing is available. If a workspace member configures Ollama, Google Gemini, OpenAI, Anthropic Claude, or an OpenAI-compatible provider, document-derived content, requirements, or prompts submitted for AI-assisted analysis or generation may be sent to that provider for processing. The provider’s own terms, retention, and privacy practices apply to that processing.</p><p>Review provider settings and applicable agreements before sending confidential, personal, regulated, or otherwise restricted information. Provider API credentials are stored encrypted in the database when configured with the required encryption key. Do not treat AI output as verified source content.</p>"],
     ["services", "5. Storage, third parties, and deployment", "<p>TRACE does not currently provide cloud sync or a hosted account service. The default backend listens on the local loopback interface; deployment settings can change this. The operator is responsible for deployment, network transport, server/database/filesystem access, backups, and any third-party model service they configure. The current stylesheet requests Geist font assets from Google Fonts, so a browser may contact Google when loading the interface. Optional model providers also receive the content submitted for processing. No analytics or advertising integration is described by the current application; verify deployment-specific integrations before use.</p>"],
     ["retention", "6. Retention and deletion", "<p>Workspace data remains in the configured database and storage until an operator or authorized user removes it. Project deletion archives files as described above, so it is not complete erasure. No automatic expiry or backup-purge schedule is currently provided. Define and document a deletion and backup-retention process before production use.</p>"],
     ["rights", "7. User requests and choices", "<p>Users should contact the workspace operator to ask about access, correction, export, or deletion of their account information. TRACE does not include an email-based recovery or centralized privacy-request service. The operator must define applicable rights, identity verification, response timelines, and deletion handling for the deployment.</p>"],
@@ -239,7 +258,7 @@ function legalPage(kind) {
     ["contact", "9. Contact and unresolved details", "<p>Workspace operator / legal entity: <strong>[OPERATOR NAME TO BE PROVIDED]</strong><br>Privacy contact: <strong>[CONTACT EMAIL OR PROCESS TO BE PROVIDED]</strong><br>Jurisdiction and applicable privacy law: <strong>[TO BE DETERMINED]</strong></p><p>Replace these placeholders and confirm the policy against the actual deployment and applicable law before publication.</p>"]
   ] : [
     ["draft", "1. Draft and operator", "<p>These draft terms describe the current TRACE application and require review by qualified counsel before production use. They do not identify a contracting entity or governing law. Operator: <strong>[OPERATOR NAME TO BE PROVIDED]</strong>. Governing law and venue: <strong>[TO BE DETERMINED]</strong>.</p>"],
-    ["account", "2. Accounts and responsibilities", "<p>Provide accurate account details, protect passwords and administrator credentials, and use only accounts and permissions assigned to you. Workspace administrators control accounts and roles. The current application is local-first and account creation and authentication are restricted to local requests; it is not a public hosted signup service.</p>"],
+    ["account", "2. Accounts and responsibilities", "<p>Provide accurate account details, protect passwords and administrator credentials, and use only accounts and permissions assigned to you. Workspace administrators control accounts and roles. TRACE can run locally or on a hosted deployment; public registration is available only when the deployment operator explicitly enables it. A new signup creates a separate workspace and begins a 14-day trial.</p>"],
     ["content", "3. Uploaded content and acceptable use", "<p>You retain responsibility for the content you upload or enter, including having the rights and authority to use it. Do not upload material unlawfully or in violation of another party’s rights, or content you are not authorized to process. You are responsible for choosing appropriate storage, access, and configured model providers for your information.</p>"],
     ["ai", "4. AI-generated output and review", "<p>AI-assisted results can be incomplete, inaccurate, or inconsistent with the source. They are suggestions, not professional advice or verified facts. Review the original requirements and all extracted content, gap findings, and generated test cases before using them. TRACE does not guarantee defect prevention, complete coverage, or suitability for a particular purpose.</p>"],
     ["service", "5. Service limitations and availability", "<p>TRACE is provided as a local-first QA workspace. Availability depends on the operator’s machine, configuration, database, storage, and any optional AI provider. The application does not currently provide cloud synchronization, subscription billing, or a service-level guarantee. Features may change; the operator should maintain independent backups.</p>"],
@@ -335,6 +354,8 @@ function handleRouteChange() {
   else S.authMode = "login";
   $("#publicRoot").hidden = true;
   document.body.classList.remove("public-site");
+  if (path === "/workspace/storage") S.view = "storage";
+  else if (path === "/workspace" && S.view === "storage") S.view = "projects";
   render();
   loadProjects().catch(error => toast(error.message));
 }
@@ -381,6 +402,63 @@ const modalForm = $("#modalForm");
 
 /* ── API helper ───────────────────────────────────────────────────── */
 const API_BASE_URL = String(window.QA_API_BASE_URL || "").replace(/\/+$/, "");
+const REPORTED_ERRORS = new Map();
+
+function reportClientError(details = {}) {
+  const message = String(details.message || "Unknown client error").slice(0, 4000);
+  const route = String(details.route || currentPath()).slice(0, 500);
+  const fingerprint = `${details.source || "frontend"}|${details.error_type || ""}|${message}|${route}`;
+  const now = Date.now();
+  for (const [key, seen] of REPORTED_ERRORS) {
+    if (now - seen > 60000) REPORTED_ERRORS.delete(key);
+  }
+  if (REPORTED_ERRORS.has(fingerprint)) return;
+  REPORTED_ERRORS.set(fingerprint, now);
+  const payload = {
+    source: details.source || "frontend",
+    severity: details.severity || "error",
+    error_type: String(details.error_type || "ClientError").slice(0, 200),
+    message,
+    stack_trace: String(details.stack_trace || "").slice(0, 20000),
+    route,
+    method: details.method || "",
+    status_code: details.status_code ?? null,
+    request_id: details.request_id || "",
+    correlation_id: details.correlation_id || "",
+    project_id: S.project?.id || null,
+    metadata: details.metadata || {},
+  };
+  fetch(`${API_BASE_URL}/api/developer/errors/report`, {
+    method: "POST",
+    credentials: "same-origin",
+    keepalive: true,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+}
+
+window.addEventListener("error", event => {
+  if (!event.error) return;
+  reportClientError({
+    source: "frontend",
+    error_type: event.error.name || "Error",
+    message: event.error.message || String(event.message || "Unhandled error"),
+    stack_trace: event.error.stack || "",
+    route: currentPath(),
+  });
+});
+
+window.addEventListener("unhandledrejection", event => {
+  const reason = event.reason;
+  if (!reason) return;
+  reportClientError({
+    source: "frontend",
+    error_type: reason.name || "UnhandledRejection",
+    message: reason.message || String(reason),
+    stack_trace: reason.stack || "",
+    route: currentPath(),
+  });
+});
 
 async function api(path, opts = {}) {
   let res;
@@ -395,6 +473,17 @@ async function api(path, opts = {}) {
       },
     });
   } catch (e) {
+    reportClientError({
+      source: "api",
+      error_type: e.name || "NetworkError",
+      message: e instanceof TypeError
+        ? "Cannot reach the QA server."
+        : e.message || String(e),
+      stack_trace: e.stack || "",
+      route: path,
+      method: opts.method || "GET",
+      metadata: { network_failure: true },
+    });
     if (e instanceof TypeError) throw new Error("Cannot reach the QA server. Make sure app.py is running.");
     throw e;
   }
@@ -402,6 +491,18 @@ async function api(path, opts = {}) {
   const ct = res.headers.get("content-type") || "";
   const data = ct.includes("application/json") ? await res.json() : null;
   if (!res.ok) {
+    if (res.status >= 500 && !path.startsWith("/api/developer/")) {
+      reportClientError({
+        source: "api",
+        error_type: "ApiRequestError",
+        message: data?.error || `Request failed (${res.status})`,
+        route: path,
+        method: opts.method || "GET",
+        status_code: res.status,
+        request_id: res.headers.get("x-request-id") || "",
+        correlation_id: res.headers.get("x-correlation-id") || "",
+      });
+    }
     const error = new Error(data?.error || `Request failed (${res.status})`);
     error.status = res.status;
     if (res.status === 401 && !path.startsWith("/api/auth/")) {
@@ -428,10 +529,19 @@ function toast(msg) {
 function navigate(view) {
   if (S.view !== view) S.viewHistory.push(S.view);
   S.view = view;
+  const path = currentPath();
+  if (view === "storage" && path !== "/workspace/storage") {
+    window.history.pushState({}, "", "/workspace/storage");
+  } else if (view !== "storage" && path === "/workspace/storage") {
+    window.history.pushState({}, "", "/workspace");
+  }
 }
 function goBack() {
   const prev = S.viewHistory.pop();
-  if (prev) { S.view = prev; render(); }
+  if (prev) {
+    navigate(prev);
+    render();
+  }
 }
 
 function profileInitials(user) {
@@ -628,9 +738,16 @@ async function loadProjects(preferred) {
     await render();
     return;
   }
+  if (S.auth.workspace_access === false) {
+    S.project = null;
+    S.projects = [];
+    await render();
+    return;
+  }
   if (["/login", "/signup"].includes(currentPath())) {
     window.history.replaceState({}, "", "/workspace");
   }
+  const wantsStorage = S.view === "storage";
   [S.projects, S.aiSettings] = await Promise.all([
     api("/api/projects"),
     api("/api/ai/settings"),
@@ -642,6 +759,13 @@ async function loadProjects(preferred) {
     const id = preferred ?? S.project?.id;
     S.project = S.projects.find(p => String(p.id) === String(id)) || null;
     sel.value = S.project?.id || "";
+  }
+  if (wantsStorage) {
+    if (hasPermission("storage.view")) {
+      await loadStorage(false).catch(error => toast(error.message));
+    }
+    await render();
+    return;
   }
   if (S.project) await refresh();
   else await render();
@@ -682,6 +806,7 @@ async function refresh() {
 /* ── Sidebar state sync ───────────────────────────────────────────── */
 function syncNav() {
   const settingsArea = S.view.startsWith("settings") || S.view === "archive";
+  const storageArea = S.view === "storage";
   const projectArea = [
     "overview", "brd", "requirements", "cases",
     "defects", "reports", "project-settings",
@@ -699,8 +824,11 @@ function syncNav() {
       : false;
     btn.classList.toggle("active", active);
   });
-  $$("#bottomNav .nav-item").forEach(btn =>
-    btn.classList.toggle("active", settingsArea));
+  $$("#bottomNav .nav-item").forEach(btn => {
+    const isStorage = btn.dataset.view === "storage";
+    btn.hidden = isStorage && !hasPermission("storage.view");
+    btn.classList.toggle("active", isStorage ? storageArea : settingsArea);
+  });
 
   // Project section
   const ps = $("#projectSection");
@@ -732,7 +860,7 @@ function syncNav() {
     "api-docs": "API Docs", applications: "Applications",
     "application-analysis": "App Analysis", files: "Project Files",
     settings: "Settings", archive: "Archive",
-    "settings-ai": "AI Module",
+    "settings-ai": "AI Module", storage: "Storage",
   };
   const crumb = $("#crumb");
   if (crumb) crumb.textContent = crumbs[S.view] || S.view;
@@ -797,6 +925,10 @@ function authView() {
                 <input id="signupFullName" name="full_name" autocomplete="name" maxlength="161" required aria-invalid="false" aria-describedby="signupFullNameError">
                 <span class="auth-field-error" id="signupFullNameError" hidden></span>
               </label>
+              <label for="signupWorkspaceName">Workspace name
+                <input id="signupWorkspaceName" name="workspace_name" autocomplete="organization" maxlength="80" placeholder="Defaults to your name + Workspace" aria-invalid="false" aria-describedby="signupWorkspaceNameError">
+                <span class="auth-field-error" id="signupWorkspaceNameError" hidden></span>
+              </label>
               <label for="signupEmail">Email
                 <input id="signupEmail" name="email" type="email" autocomplete="email" maxlength="254" required aria-invalid="false" aria-describedby="signupEmailError">
                 <span class="auth-field-error" id="signupEmailError" hidden></span>
@@ -818,7 +950,7 @@ function authView() {
                   <li data-password-rule="number"><span aria-hidden="true">○</span> One number</li>
                 </ul>
               </div>
-              <p class="auth-hint">New accounts receive the User role. A Global Admin can assign additional permissions.</p>
+              <p class="auth-hint">Your account becomes this workspace’s owner and starts a 14-day free trial.</p>
               <div class="form-error" id="authError" role="alert" aria-live="assertive"></div>
               <button class="btn btn-primary auth-submit" type="submit">Create account</button>
             </form>
@@ -887,6 +1019,7 @@ function bindAuthActions() {
     const payload = {
       first_name: firstName,
       last_name: nameParts.join(" ") || firstName,
+      workspace_name: String(values.get("workspace_name") || "").trim(),
       email: String(values.get("email")).trim(),
       password: values.get("password"),
       confirm_password: values.get("confirm_password"),
@@ -894,10 +1027,11 @@ function bindAuthActions() {
     const submit = setAuthLoading(form, "Creating account…");
     $("#authError").textContent = "";
     try {
-      await api("/api/auth/signup", { method: "POST", body: JSON.stringify(payload) });
+      const created = await api("/api/auth/signup", { method: "POST", body: JSON.stringify(payload) });
       window.history.replaceState({}, "", "/workspace");
       await loadProjects();
-      toast("Account created");
+      const duration = created.subscription?.trial_duration_days || 14;
+      toast(`Workspace ${created.workspace?.name || ""} created with a ${duration}-day trial`);
     } catch (reason) {
       if (reason.status === 409) {
         showAuthFieldError(form, "email", reason.message);
@@ -941,6 +1075,9 @@ function authFieldError(form, name) {
   const input = form.elements[name];
   if (!input) return "";
   const value = input.value.trim();
+  if (name === "workspace_name") {
+    return value.length > 80 ? "Workspace names must be 80 characters or fewer." : "";
+  }
   if (name === "full_name") {
     if (!value) return "Enter your full name.";
     const [first, ...rest] = value.split(/\s+/);
@@ -982,7 +1119,7 @@ function showAuthFieldError(form, name, message) {
 
 function validateAuthForm(form, isSignup) {
   const fields = isSignup
-    ? ["full_name", "email", "password", "confirm_password"]
+    ? ["full_name", "workspace_name", "email", "password", "confirm_password"]
     : [...(form.elements.email ? ["email"] : []), "password"];
   let firstInvalid = null;
   fields.forEach(name => {
@@ -1039,6 +1176,9 @@ function bindPasswordToggles() {
 ════════════════════════════════════════════════════════════════════ */
 async function render() {
   if (isPublicPath()) {
+    const notice = $("#workspaceTrialNotice");
+    if (notice) notice.hidden = true;
+    document.body.classList.remove("workspace-suspended");
     renderPublicPage();
     return;
   }
@@ -1061,6 +1201,7 @@ async function render() {
     settings: "Settings",
     archive: "Archive",
     "settings-ai": "AI Module",
+    storage: "Storage",
   };
   const viewTitle = viewTitles[S.auth.authenticated ? S.view : S.authMode] || "Workspace";
   const projectWorkspace = [
@@ -1076,7 +1217,13 @@ async function render() {
   syncProfileMenu();
   const pg = $("#page");
   if (!pg) return;
+  syncWorkspaceTrialNotice();
+  document.body.classList.toggle(
+    "workspace-suspended",
+    S.auth.authenticated && S.auth.workspace_access === false,
+  );
   if (!S.auth.authenticated) {
+    document.body.classList.remove("workspace-suspended");
     document.body.classList.add("auth-required");
     pg.innerHTML = authView();
     applyBrandTheme(S.themePreference);
@@ -1084,11 +1231,26 @@ async function render() {
     return;
   }
   document.body.classList.remove("auth-required");
+  if (S.auth.workspace_access === false) {
+    pg.innerHTML = suspendedWorkspaceView();
+    $("#suspendedSignOut")?.addEventListener("click", () => {
+      signOut().catch(error => toast(error.message));
+    });
+    return;
+  }
 
   /* ── Global Dashboard ── */
   if (S.view === "dashboard") {
     pg.innerHTML = globalDashboardView();
     bindGlobalDash();
+    return;
+  }
+
+  /* ── Workspace storage ── */
+  if (S.view === "storage") {
+    pg.innerHTML = storageView();
+    bindStorageActions();
+    renderBack();
     return;
   }
 
@@ -1110,7 +1272,8 @@ async function render() {
   /* ── Project workspace ── */
   const p = S.project;
   const genReady = S.requirements.some(r => r.review_status === "Reviewed");
-  const genOk = S.caseGenerator === "deterministic" || Boolean(S.aiSettings.configured);
+  const genOk = S.caseGenerator === "deterministic"
+    || Boolean(S.aiSettings.enabled !== false && S.aiSettings.configured);
 
   const extraActions =
     S.view === "requirements"
@@ -1171,6 +1334,46 @@ async function render() {
 
   renderBack();
   bindWorkspaceActions();
+}
+
+function syncWorkspaceTrialNotice() {
+  const notice = $("#workspaceTrialNotice");
+  if (!notice) return;
+  const subscription = S.auth.subscription;
+  if (
+    !S.auth.authenticated
+    || S.auth.workspace_access === false
+    || subscription?.plan !== "free_trial"
+  ) {
+    notice.hidden = true;
+    notice.classList.remove("warning");
+    notice.textContent = "";
+    return;
+  }
+
+  const days = Number(subscription.days_remaining);
+  const workspaceName = S.auth.workspace?.name || "Your workspace";
+  const remaining = `${days} ${days === 1 ? "day" : "days"} remaining`;
+  notice.classList.toggle("warning", days <= 3);
+  const duration = Number(subscription.trial_duration_days) || 14;
+  notice.innerHTML = `<strong>${esc(workspaceName)}</strong> · ${duration}-day free trial ends ${esc(fmtDate(subscription.trial_ends_at))} · ${esc(remaining)}${days <= 3 ? " · Trial ending soon" : ""}`;
+  notice.hidden = false;
+}
+
+function suspendedWorkspaceView() {
+  const subscription = S.auth.subscription;
+  const expired = S.auth.workspace_access_code === "TRIAL_EXPIRED";
+  const endDate = subscription?.trial_ends_at
+    ? ` The trial ended on ${esc(fmtDate(subscription.trial_ends_at))}.`
+    : "";
+  return `
+    <section class="workspace-suspended" role="alert" aria-labelledby="workspaceSuspendedHeading">
+      <div class="eyebrow">WORKSPACE ACCESS</div>
+      <h1 id="workspaceSuspendedHeading">${expired ? "Your free trial has ended" : "This workspace is suspended"}</h1>
+      <p>${esc(S.auth.workspace?.name || "This workspace")} is not currently available.${endDate} Your projects, test records, reports, and uploaded files are preserved.</p>
+      <p>Contact your workspace administrator or TRACE support to restore access. Your account remains active.</p>
+      <button class="btn btn-primary" id="suspendedSignOut" type="button">Sign out</button>
+    </section>`;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -1504,13 +1707,16 @@ function requirementsView() {
 
 /* ── Test Cases ───────────────────────────────────────────────────── */
 function casesView() {
-  const genOk = S.caseGenerator === "deterministic" || Boolean(S.aiSettings.configured);
+  const aiReady = S.aiSettings.enabled !== false && Boolean(S.aiSettings.configured);
+  const genOk = S.caseGenerator === "deterministic" || aiReady;
   const provider = S.aiSettings.providers?.find(item => item.id === S.aiSettings.provider);
-  const assistedGenOk = Boolean(S.aiSettings.configured && provider?.id !== "local");
+  const assistedGenOk = Boolean(aiReady && provider?.id !== "local");
   const reviewedRequirementCount = S.requirements.filter(r => r.review_status === "Reviewed").length;
   const unreviewedRequirementCount = S.requirements.length - reviewedRequirementCount;
-  const aiMsg = S.caseGenerator !== "deterministic" && !S.aiSettings.configured
-    ? `<div class="info-box warn-box" style="margin-top:8px">Configure ${esc(provider?.name || "the selected AI provider")} in <button class="act-btn" id="goAiSettings">Settings → AI Module</button> to enable AI generation.</div>` : "";
+  const aiMsg = S.caseGenerator !== "deterministic" && !aiReady
+    ? `<div class="info-box warn-box" style="margin-top:8px">${S.aiSettings.enabled === false
+      ? `The AI module is disabled for this workspace. Ask a workspace administrator to enable it in <button class="act-btn" id="goAiSettings">Settings → AI Module</button>.`
+      : `Configure ${esc(provider?.name || "the selected AI provider")} in <button class="act-btn" id="goAiSettings">Settings → AI Module</button> to enable AI generation.`}</div>` : "";
   const assistedAnalysis = S.assistedAnalysis
     ? `<div class="info-box" style="margin-top:12px">
         <strong>AI analysis · review before approval</strong>
@@ -1603,7 +1809,7 @@ function casesView() {
         </fieldset>
       </div>
       ${!assistedGenOk
-        ? `<div class="info-box warn-box" style="margin-top:8px">Configure a model-based provider (Ollama, Google Gemini, or OpenAI-compatible) in <button class="act-btn" id="goAiSettings">Settings → AI Module</button> to use AI-assisted generation.</div>`
+        ? `<div class="info-box warn-box" style="margin-top:8px">Configure a model-based provider (Ollama, Google Gemini, OpenAI, Anthropic Claude, or OpenAI-compatible) in <button class="act-btn" id="goAiSettings">Settings → AI Module</button> to use AI-assisted generation.</div>`
         : ""}
       ${hasPermission("test-cases.create") ? `<button class="btn btn-primary" id="assistedGenerateBtn" style="margin-top:12px" ${assistedGenOk ? "" : "disabled"}>✦ Analyze and generate</button>` : ""}
       ${assistedAnalysis}
@@ -1797,6 +2003,264 @@ function appAnalysisView() {
     </div>`;
 }
 
+/* ── Workspace storage ────────────────────────────────────────────── */
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = bytes / 1024;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount >= 10 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
+}
+
+function storageKindLabel(kind) {
+  return {
+    projects: "Project record",
+    requirements: "Requirement",
+    "test-cases": "Test case",
+    "test-runs": "Test run",
+    defects: "Defect",
+    analyses: "Analysis",
+    applications: "Application",
+    exports: "Export",
+    attachments: "Attachment",
+    evidence: "Evidence",
+    other: "Other",
+  }[kind] || kind || "Other";
+}
+
+function storageDeleteDescription(item) {
+  const kind = storageKindLabel(item.kind).toLowerCase();
+  if (item.records_count != null) {
+    const count = Number(item.records_count) || 0;
+    return `${count} ${kind} record${count === 1 ? "" : "s"}`;
+  }
+  const count = Number(item.file_count) || 1;
+  return `${count} ${kind} file${count === 1 ? "" : "s"}`;
+}
+
+function storageQuery() {
+  const filters = S.storage.filters;
+  return new URLSearchParams({
+    kind: filters.kind,
+    project_id: filters.project_id,
+    q: filters.q,
+    date_from: filters.date_from,
+    date_to: filters.date_to,
+    sort: filters.sort,
+    page: String(filters.page),
+    page_size: String(filters.page_size),
+  }).toString();
+}
+
+async function loadStorage(renderAfter = true) {
+  if (!hasPermission("storage.view")) return;
+  S.storage.loading = true;
+  if (renderAfter) render();
+  try {
+    S.storage.data = await api(`/api/workspace/storage?${storageQuery()}`);
+    S.storage.selected = S.storage.selected.filter(id =>
+      S.storage.data.items.some(item => item.id === id));
+  } finally {
+    S.storage.loading = false;
+    if (renderAfter) render();
+  }
+}
+
+async function recalculateStorage() {
+  try {
+    S.storage.data = await api("/api/workspace/storage/recalculate", {
+      method: "POST",
+      body: "{}",
+      headers: { "Content-Type": "application/json" },
+    });
+    S.storage.selected = [];
+    toast("Storage usage recalculated");
+    render();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function storageView() {
+  if (!hasPermission("storage.view")) {
+    return `<div class="panel"><div class="panel-head"><div class="panel-title">Storage</div></div>
+      <div class="info-box">Your role does not include storage access.</div></div>`;
+  }
+  const data = S.storage.data;
+  if (!data) {
+    return `<div class="panel"><div class="panel-head"><div class="panel-title">Storage</div></div>
+      <div class="pane-sub">Loading workspace storage…</div></div>`;
+  }
+  const summary = data.summary || {};
+  const filters = S.storage.filters;
+  const kinds = ["", "projects", "requirements", "test-cases", "test-runs", "defects", "analyses", "applications", "exports", "attachments", "evidence", "other"];
+  const projectOptions = (data.projects || []).map(project =>
+    `<option value="${project.id}" ${String(filters.project_id) === String(project.id) ? "selected" : ""}>${esc(project.name)}</option>`).join("");
+  const quota = summary.quota_bytes
+    ? `<div class="info-box ${summary.warning ? "warn-box" : ""}">
+        <strong>${esc(summary.warning || "Storage quota")}</strong>
+        <div>${formatBytes(summary.total_bytes)} of ${formatBytes(summary.quota_bytes)} used (${summary.usage_percent ?? 0}%).</div>
+      </div>`
+    : "";
+  const rows = (data.items || []).map(item => {
+    const checked = item.deletable && S.storage.selected.includes(item.id) ? "checked" : "";
+    return `<tr>
+      <td>${item.deletable ? `<input class="storage-check" type="checkbox" data-storage-id="${esc(item.id)}" ${checked} aria-label="Select ${esc(item.name)}">` : ""}</td>
+      <td><div class="storage-name"><strong>${esc(item.name)}</strong><span class="mono">${esc(item.path)}</span></div></td>
+      <td>${esc(item.project_name || "—")}</td>
+      <td>${esc(storageKindLabel(item.kind))}</td>
+      <td>${item.records_count ?? item.file_count ?? "—"}</td>
+      <td><span class="badge badge-muted">${item.source === "database estimate" ? "Estimated" : item.source === "filesystem" ? "Exact file" : "Exact blob"}</span></td>
+      <td class="mono">${formatBytes(item.size)}${item.source === "database estimate" ? '<small class="storage-size-note"> approx.</small>' : ""}</td>
+      <td>${item.created_at ? fmtDate(item.created_at) : "—"}</td>
+      <td>${item.modified_at ? fmtDate(item.modified_at) : "—"}</td>
+      <td class="storage-actions">
+        ${item.downloadable ? `<a class="act-btn" href="${API_BASE_URL}/api/workspace/storage/items/${esc(item.id)}/download">Download</a>` : ""}
+        ${hasPermission("storage.delete") && item.deletable ? `<button class="act-btn storage-delete" data-storage-id="${esc(item.id)}" data-storage-name="${esc(item.name)}" data-storage-kind="${esc(item.kind)}" data-storage-record-count="${esc(item.records_count ?? "")}" data-storage-file-count="${esc(item.file_count ?? "")}">Delete</button>` : ""}
+      </td>
+    </tr>`;
+  }).join("");
+  const pagination = data.pagination || {};
+  const selectedCount = S.storage.selected.length;
+  return `
+    <div class="page-head">
+      <div class="page-head-text">
+        <div class="eyebrow">WORKSPACE · STORAGE</div>
+        <h1>Storage</h1>
+        <p>Review workspace files and scoped project records, with exact file sizes and documented database estimates.</p>
+      </div>
+      <div class="page-head-actions">
+        <button class="btn btn-ghost" id="storageRefreshBtn" ${S.storage.loading ? "disabled" : ""}>${S.storage.loading ? "Scanning…" : "Recalculate usage"}</button>
+        ${hasPermission("storage.delete") ? `<button class="btn btn-danger" id="storageBulkDelete" ${selectedCount ? "" : "disabled"}>Delete selected${selectedCount ? ` (${selectedCount})` : ""}</button>` : ""}
+      </div>
+    </div>
+    <div class="metric-grid">
+      <div class="metric"><div class="metric-label">Total storage</div><div class="metric-icon">▤</div><div class="metric-value">${formatBytes(summary.total_bytes)}</div><div class="metric-note">${summary.item_count || 0} items</div></div>
+      <div class="metric m-green"><div class="metric-label">Stored files</div><div class="metric-icon">⌑</div><div class="metric-value">${formatBytes(summary.filesystem_bytes)}</div><div class="metric-note">exact filesystem bytes</div></div>
+      <div class="metric m-blue"><div class="metric-label">Database blobs</div><div class="metric-icon">⊞</div><div class="metric-value">${formatBytes(summary.database_blob_bytes)}</div><div class="metric-note">exact attachment & evidence bytes</div></div>
+      <div class="metric m-amber"><div class="metric-label">Database records</div><div class="metric-icon">▦</div><div class="metric-value">${formatBytes(summary.database_record_estimate_bytes)}</div><div class="metric-note">${summary.record_count || 0} records · estimated</div></div>
+    </div>
+    <div class="info-box storage-breakdown"><strong>Usage by category</strong><span>${Object.entries(summary.breakdown || {}).map(([kind, size]) => `${esc(storageKindLabel(kind))}: ${formatBytes(size)}`).join(" · ") || "No stored data"}</span></div>
+    <div class="pane-sub storage-estimate-note">${esc(summary.database_estimate_method || "")}</div>
+    ${quota}
+    <div class="panel">
+      <div class="panel-head"><div class="panel-title">Workspace data</div><div class="panel-sub">Record groups delete all eligible records of that type in the project; projects and active analyses are protected.</div></div>
+      <div class="proj-tools storage-filters">
+        <select class="status-filter" id="storageKind">
+          ${kinds.map(kind => `<option value="${kind}" ${filters.kind === kind ? "selected" : ""}>${kind ? storageKindLabel(kind) : "All types"}</option>`).join("")}
+        </select>
+        <select class="status-filter" id="storageProject">
+          <option value="">All projects</option>
+          ${projectOptions}
+        </select>
+        <input class="search-input" id="storageSearch" type="search" placeholder="Search files or projects…" value="${esc(filters.q || "")}">
+        <label class="storage-date-filter">From <input id="storageDateFrom" type="date" value="${esc(filters.date_from || "")}"></label>
+        <label class="storage-date-filter">To <input id="storageDateTo" type="date" value="${esc(filters.date_to || "")}"></label>
+        <select class="status-filter" id="storageSort">
+          <option value="size_desc" ${filters.sort === "size_desc" ? "selected" : ""}>Largest first</option>
+          <option value="size_asc" ${filters.sort === "size_asc" ? "selected" : ""}>Smallest first</option>
+          <option value="name_asc" ${filters.sort === "name_asc" ? "selected" : ""}>Name A–Z</option>
+          <option value="recent_desc" ${filters.sort === "recent_desc" ? "selected" : ""}>Most recent</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table storage-table">
+          <thead><tr><th></th><th>Item</th><th>Project</th><th>Type</th><th>Records / files</th><th>Size basis</th><th>Storage size</th><th>Created</th><th>Last updated</th><th></th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="10" class="empty-row"><strong>No matching storage data</strong>Try changing the filters or add workspace content.</td></tr>'}</tbody>
+        </table>
+      </div>
+      <div class="storage-pagination">
+        <span class="pane-sub">${pagination.total || 0} item${pagination.total === 1 ? "" : "s"} · page ${pagination.page || 1} of ${pagination.pages || 1}</span>
+        <span>
+          <button class="btn btn-ghost" data-storage-page="${Math.max(1, (pagination.page || 1) - 1)}" ${pagination.page <= 1 ? "disabled" : ""}>Previous</button>
+          <button class="btn btn-ghost" data-storage-page="${Math.min(pagination.pages || 1, (pagination.page || 1) + 1)}" ${pagination.page >= pagination.pages ? "disabled" : ""}>Next</button>
+        </span>
+      </div>
+    </div>`;
+}
+
+function bindStorageActions() {
+  $("#storageRefreshBtn")?.addEventListener("click", recalculateStorage);
+  for (const id of ["storageKind", "storageProject", "storageSort", "storageDateFrom", "storageDateTo"]) {
+    $(`#${id}`)?.addEventListener("change", event => {
+      const key = id === "storageKind" ? "kind"
+        : id === "storageProject" ? "project_id"
+          : id === "storageDateFrom" ? "date_from"
+            : id === "storageDateTo" ? "date_to" : "sort";
+      S.storage.filters[key] = event.target.value;
+      S.storage.filters.page = 1;
+      S.storage.selected = [];
+      loadStorage().catch(error => toast(error.message));
+    });
+  }
+  $("#storageSearch")?.addEventListener("change", event => {
+    S.storage.filters.q = event.target.value.trim();
+    S.storage.filters.page = 1;
+    loadStorage().catch(error => toast(error.message));
+  });
+  $$(".storage-check").forEach(input => input.addEventListener("change", () => {
+    const id = input.dataset.storageId;
+    if (input.checked && !S.storage.selected.includes(id)) S.storage.selected.push(id);
+    if (!input.checked) S.storage.selected = S.storage.selected.filter(item => item !== id);
+    const bulk = $("#storageBulkDelete");
+    if (bulk) {
+      bulk.disabled = !S.storage.selected.length;
+      bulk.textContent = `Delete selected${S.storage.selected.length ? ` (${S.storage.selected.length})` : ""}`;
+    }
+  }));
+  $$(".storage-delete").forEach(button => button.addEventListener("click", async () => {
+    const name = button.dataset.storageName || "this item";
+    const kind = storageKindLabel(button.dataset.storageKind);
+    const recordsCount = button.dataset.storageRecordCount === ""
+      ? null : Number(button.dataset.storageRecordCount);
+    const fileCount = Number(button.dataset.storageFileCount) || 1;
+    const countLabel = recordsCount === null
+      ? `${fileCount} ${kind.toLowerCase()} file${fileCount === 1 ? "" : "s"}`
+      : `${recordsCount} ${kind.toLowerCase()} record${recordsCount === 1 ? "" : "s"}`;
+    if (!confirm(`Delete ${countLabel} (${name})? This action cannot be undone.`)) return;
+    try {
+      const result = await api(`/api/workspace/storage/items/${encodeURIComponent(button.dataset.storageId)}`, { method: "DELETE" });
+      S.storage.selected = [];
+      toast(result.skipped?.length
+        ? `Deletion incomplete: ${result.skipped.length} item(s) remain. ${result.skipped[0].reason}`
+        : "Storage item deleted");
+      await loadStorage();
+    } catch (error) {
+      toast(error.message);
+    }
+  }));
+  $("#storageBulkDelete")?.addEventListener("click", async () => {
+    if (!S.storage.selected.length) return;
+    const selectedItems = (S.storage.data?.items || [])
+      .filter(item => S.storage.selected.includes(item.id));
+    const itemSummary = selectedItems.map(storageDeleteDescription).join(", ");
+    if (!confirm(`Delete selected workspace data: ${itemSummary}? This action cannot be undone.`)) return;
+    try {
+      const result = await api("/api/workspace/storage/bulk-delete", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: S.storage.selected }),
+      });
+      toast(result.skipped?.length
+        ? `Deleted ${result.deleted_count}; ${result.skipped.length} item(s) remain. ${result.skipped[0].reason}`
+        : `Deleted ${result.deleted_count} item${result.deleted_count === 1 ? "" : "s"}`);
+      S.storage.selected = [];
+      await loadStorage();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  $$("[data-storage-page]").forEach(button => button.addEventListener("click", () => {
+    S.storage.filters.page = Number(button.dataset.storagePage) || 1;
+    S.storage.selected = [];
+    loadStorage().catch(error => toast(error.message));
+  }));
+}
+
 /* ── Project files ────────────────────────────────────────────────── */
 function filesView(result) {
   const rows = result.files.map(f => `
@@ -1987,6 +2451,8 @@ function settingsView() {
   let pane = "";
   if (tab === "ai") {
     const providerRows = S.aiSettings.providers || [];
+    const aiEnabled = S.aiSettings.enabled !== false;
+    const canManage = Boolean(S.aiSettings.can_manage);
     const draft = S.aiDraft || {
       provider: S.aiSettings.provider || "local",
       model: S.aiSettings.model || "deterministic",
@@ -2012,7 +2478,16 @@ function settingsView() {
         <button class="btn btn-primary" type="submit" ${S.auth.admin_configured ? "" : "disabled"}>Sign in</button>
         <div class="ai-status" id="loginStatus" role="status"></div>
       </form>` : "";
-    const settingsForm = hasPermission("*") ? `
+    const enableControl = S.auth.authenticated && canManage ? `
+      <label class="ai-enable-toggle">
+        <input id="aiModuleEnabled" type="checkbox" ${aiEnabled ? "checked" : ""}>
+        <span>Enable the AI module for this workspace</span>
+      </label>` : "";
+    const disabledNote = !aiEnabled ? `
+      <div class="info-box">${canManage
+        ? "The AI module is disabled for this workspace. Enable it above to configure a provider."
+        : "The AI module is disabled for this workspace. Contact a workspace administrator to enable it."}</div>` : "";
+    const settingsForm = S.auth.authenticated && aiEnabled ? `
       <div class="ai-fields">
         <label for="aiProvider">Provider
           <select id="aiProvider">
@@ -2040,12 +2515,17 @@ function settingsView() {
       <div class="ai-status" id="aiStatus" role="status">${esc(S.aiStatus || setupStatus)}</div>
       <div class="info-box" style="margin-top:14px">
         API keys are encrypted in the local database using <code>QA_AI_ENCRYPTION_KEY</code> and are never returned to the browser.
-        Local mode stays on this machine. Ollama uses its local server. Gemini and Other send analysis text to the selected provider.
-      </div>` : `<div class="info-box">Only an Administrator can change the AI provider, credentials, or workspace-level AI settings.</div>`;
+        Any signed-in workspace member can configure a provider. Local mode stays on this machine.
+        ${S.aiSettings.ollama_supported
+          ? "Ollama uses its local server and is available only in the Default Workspace."
+          : "Ollama is only available in the Default Workspace; use a cloud provider here."}
+        Google Gemini, OpenAI, Anthropic Claude, and Other send analysis text to the selected provider.
+      </div>` : S.auth.authenticated ? disabledNote : `<div class="info-box">Sign in to configure the AI provider, credentials, and workspace AI settings.</div>`;
     pane = `
       <h2>AI Module</h2>
-      <div class="pane-sub">Configure Local deterministic, Ollama, Google Gemini, or an OpenAI-compatible model.</div>
+      <div class="pane-sub">Configure ${S.aiSettings.ollama_supported ? "Local deterministic, Ollama, " : "Local deterministic, "}Google Gemini, OpenAI, Anthropic Claude, or an OpenAI-compatible model for this workspace.</div>
       ${adminForm}
+      ${enableControl}
       ${settingsForm}`;
   } else if (tab === "custom-fields") {
     pane = hasPermission("*")
@@ -2599,6 +3079,26 @@ function bindSettingsActions() {
     } finally {
       const input = $("#adminPassword");
       if (input) input.value = "";
+    }
+  });
+
+  $("#aiModuleEnabled")?.addEventListener("change", async event => {
+    const enabled = Boolean(event.target.checked);
+    try {
+      S.aiSettings = await api("/api/ai/module", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      S.aiDraft = null;
+      S.aiStatus = enabled
+        ? "AI module enabled for this workspace."
+        : "AI module disabled for this workspace.";
+      render();
+    } catch (error) {
+      event.target.checked = !enabled;
+      S.aiStatus = error.message;
+      toast(error.message);
+      render();
     }
   });
 
@@ -3750,10 +4250,17 @@ $("#projectNav").addEventListener("click", e => {
   render();
 });
 
-/* Bottom nav (Settings) */
+/* Bottom nav (Storage / Settings) */
 $("#bottomNav").addEventListener("click", e => {
   const btn = e.target.closest(".nav-item");
   if (!btn) return;
+  if (btn.dataset.view === "storage") {
+    navigate("storage");
+    S.storage.filters.page = 1;
+    S.storage.selected = [];
+    loadStorage().catch(error => toast(error.message));
+    return;
+  }
   S.settingsTab = "ai";
   navigate("settings");
   render();

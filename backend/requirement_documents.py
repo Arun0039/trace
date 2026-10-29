@@ -8,6 +8,9 @@ import re
 import zipfile
 import xml.etree.ElementTree as ET
 import zlib
+
+from defusedxml import ElementTree as SafeET
+from defusedxml.common import DefusedXmlException
 from pathlib import Path
 from typing import Any
 
@@ -163,10 +166,11 @@ def _extract_docx(data: bytes) -> list[tuple[str, bool]]:
                         raise ValueError("Requirement DOCX document content is too large.")
                     chunks.append(chunk)
             xml = b"".join(chunks)
-            root = ET.fromstring(xml)
+            root = SafeET.fromstring(xml)
         except (
             zipfile.BadZipFile, OSError, EOFError, RuntimeError,
             NotImplementedError, RecursionError, zlib.error, ET.ParseError,
+            DefusedXmlException,
         ) as exc:
             raise ValueError("Requirement DOCX contains unreadable document content.") from exc
 

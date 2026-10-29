@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0c0e0d">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Developer Monitoring | TRACE</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/Icon.svg">
+  <link rel="stylesheet" href="/developer.css">
+</head>
+<body>
+  <header class="dev-header">
+    <a class="dev-brand" href="/workspace">
+      <img src="/assets/Logo.png" alt="TRACE">
+      <span>Developer monitoring</span>
+    </a>
+    <nav class="dev-header-actions">
+      <a href="/workspace">Workspace</a>
+      <button type="button" id="devRefresh">Refresh</button>
+      <button type="button" id="devSignOut">Sign out</button>
+    </nav>
+  </header>
+  <main class="dev-main" id="devRoot">
+    <div class="dev-loading">Loading developer monitoring…</div>
+  </main>
+  <div class="dev-drawer" id="devDrawer" hidden>
+    <div class="dev-drawer-backdrop" data-dev-close></div>
+    <aside class="dev-drawer-panel" role="dialog" aria-modal="true" aria-labelledby="devDetailTitle">
+      <header class="dev-drawer-head">
+        <h2 id="devDetailTitle">Error details</h2>
+        <button type="button" class="dev-icon-btn" data-dev-close aria-label="Close">×</button>
+      </header>
+      <div id="devDetailBody"></div>
+    </aside>
+  </div>
+  <div class="dev-toast" id="devToast" role="status" aria-live="polite"></div>
+  <script src="/config.js"></script>
+  <script src="/developer.js"></script>
+</body>
+</html>

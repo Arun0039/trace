@@ -7,6 +7,7 @@ from unittest.mock import patch
 from qa_platform.core.config import (
     BACKEND_ROOT,
     DATA_ROOT,
+    DEFAULT_DEV_ORIGINS,
     FRONTEND_ROOT,
     cors_origins,
     database_connection,
@@ -35,6 +36,13 @@ class ConfigurationTests(unittest.TestCase):
                 cors_origins(),
                 frozenset({"http://127.0.0.1:3000", "https://qa.example.test"}),
             )
+
+    def test_cors_origins_default_to_local_development_frontends(self):
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ("FRONTEND_URL", "CORS_ORIGINS", "QA_CORS_ORIGINS"):
+                os.environ.pop(key, None)
+            self.assertEqual(cors_origins(), DEFAULT_DEV_ORIGINS)
+            self.assertIn("http://127.0.0.1:3000", cors_origins())
 
     def test_environment_file_preserves_existing_values_and_reads_quoted_values(self):
         with tempfile.TemporaryDirectory() as temporary:

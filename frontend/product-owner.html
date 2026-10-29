@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="theme-color" content="#0c0e0d">
+  <title>Product Owner Operations | TRACE</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/Icon.svg">
+  <link rel="stylesheet" href="/developer.css">
+  <link rel="stylesheet" href="/product-owner.css">
+</head>
+<body>
+  <header class="dev-header">
+    <a class="dev-brand" href="/product-owner">
+      <img src="/assets/Logo.png" alt="TRACE">
+      <span>Product Owner Operations</span>
+    </a>
+    <nav class="dev-header-actions">
+      <span id="poIdentity" aria-live="polite"></span>
+      <button type="button" id="poRefresh">Refresh</button>
+      <button type="button" id="poSignOut">Sign out</button>
+    </nav>
+  </header>
+  <main class="dev-main">
+    <nav class="po-nav" id="poNav" aria-label="Product Owner pages" hidden>
+      <button type="button" data-page="overview">Overview</button>
+      <button type="button" data-page="tenants">Users &amp; tenants</button>
+      <button type="button" data-page="plans">Trials &amp; plans</button>
+      <button type="button" data-page="storage">Storage</button>
+      <button type="button" data-page="usage">Product usage</button>
+      <button type="button" data-page="errors">Errors &amp; health</button>
+      <button type="button" data-page="audit">Audit history</button>
+    </nav>
+    <section id="poRoot" aria-live="polite">
+      <div class="dev-loading">Checking administrator access…</div>
+    </section>
+  </main>
+  <div class="dev-toast" id="poToast" role="status" aria-live="polite"></div>
+  <script src="/config.js"></script>
+  <script src="/product-owner.js"></script>
+</body>
+</html>

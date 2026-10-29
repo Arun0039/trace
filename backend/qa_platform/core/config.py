@@ -14,6 +14,13 @@ DATA_ROOT = REPOSITORY_ROOT / "qa-platform"
 FRONTEND_ROOT = REPOSITORY_ROOT / "frontend"
 ENV_FILE = DATA_ROOT / ".env"
 
+DEFAULT_DEV_ORIGINS = frozenset({
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+})
+
 
 def load_environment_file(env_file: Path = ENV_FILE) -> None:
     """Load missing environment values from the local .env file."""
@@ -70,6 +77,20 @@ def database_connection() -> Path | str:
     return url
 
 
+def workspace_storage_quota_bytes() -> int | None:
+    """Return the optional per-workspace storage quota in bytes."""
+    raw = os.environ.get("QA_STORAGE_QUOTA_MB", "").strip()
+    if not raw:
+        return None
+    try:
+        megabytes = int(raw)
+    except ValueError as exc:
+        raise ValueError("QA_STORAGE_QUOTA_MB must be a positive integer.") from exc
+    if megabytes <= 0:
+        raise ValueError("QA_STORAGE_QUOTA_MB must be a positive integer.")
+    return megabytes * 1024 * 1024
+
+
 def server_address() -> tuple[str, int]:
     """Read and validate the HTTP bind address and port."""
     host = (
@@ -98,18 +119,25 @@ def server_address() -> tuple[str, int]:
 
 
 def cors_origins() -> frozenset[str]:
-    """Return explicitly allowed browser origins for a separately served frontend."""
+    """Return allowed browser origins for a separately served frontend.
+
+    When no allowlist is configured, the local frontend development origins are
+    allowed so the bundled backend and frontend dev server work together without
+    extra setup. Credentialed cookies remain SameSite=Strict, so production
+    deployments are unaffected by this local-only default.
+    """
     origins_str = (
         os.environ.get("FRONTEND_URL")
         or os.environ.get("CORS_ORIGINS")
         or os.environ.get("QA_CORS_ORIGINS")
         or ""
     )
-    return frozenset(
+    origins = frozenset(
         origin.strip().rstrip("/")
         for origin in origins_str.split(",")
         if origin.strip()
     )
+    return origins or DEFAULT_DEV_ORIGINS
 
 
 load_environment_file()

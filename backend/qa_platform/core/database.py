@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +16,31 @@ except ImportError:
     psycopg = None
     tuple_row = None
 
+try:
+    from psycopg_pool import ConnectionPool, PoolTimeout
+except ImportError:
+    ConnectionPool = None
+    PoolTimeout = None
 
-DATABASE_ERRORS = (sqlite3.Error,) + ((psycopg.Error,) if psycopg else ())
+
+DATABASE_ERRORS = (
+    (sqlite3.Error,)
+    + ((psycopg.Error,) if psycopg else ())
+    + ((PoolTimeout,) if PoolTimeout else ())
+)
 DATABASE_INTEGRITY_ERRORS = (sqlite3.IntegrityError,) + (
     (psycopg.IntegrityError,) if psycopg else ()
 )
+
+_DATABASE_POOLS: dict[str, Any] = {}
+_DATABASE_POOLS_LOCK = threading.Lock()
+_DATABASE_POOL_MAX_SIZE = 10
 
 _INSERT_ID_TABLES = {
     "application_analyses",
     "bugs",
     "custom_fields",
+    "developer_errors",
     "executions",
     "form_attachments",
     "projects",
@@ -88,8 +104,10 @@ class PostgresCursor:
 
 
 class PostgresConnection:
-    def __init__(self, connection):
+    def __init__(self, connection, release_connection=None):
         self._connection = connection
+        self._release_connection = release_connection
+        self._closed = False
 
     def __enter__(self):
         return self
@@ -102,7 +120,13 @@ class PostgresConnection:
         return False
 
     def close(self):
-        self._connection.close()
+        if self._closed:
+            return
+        self._closed = True
+        if self._release_connection is None:
+            self._connection.close()
+        else:
+            self._release_connection(self._connection)
 
     def executescript(self, script: str):
         script = re.sub(
@@ -127,7 +151,10 @@ class PostgresConnection:
             sql, flags=re.IGNORECASE,
         )
         statement = re.sub(
-            r"\bGROUP_CONCAT\s*\(", "STRING_AGG(", statement, flags=re.IGNORECASE
+            r"\bGROUP_CONCAT\s*\(\s*([^,()]+?)(?:\s*,\s*([^()]+?))?\s*\)",
+            self._translate_group_concat,
+            statement,
+            flags=re.IGNORECASE,
         )
         if re.match(r"\s*CREATE\s+TABLE\b", statement, re.IGNORECASE):
             statement = re.sub(
@@ -191,6 +218,14 @@ class PostgresConnection:
                 buffered_row = DatabaseRow(["id"], returned)
         return PostgresCursor(cursor, lastrowid, buffered_row)
 
+    @staticmethod
+    def _translate_group_concat(match):
+        expression = match.group(1).strip()
+        separator = match.group(2)
+        if separator is None:
+            separator = "','"
+        return f"STRING_AGG(CAST({expression} AS TEXT), {separator.strip()})"
+
     def _table_info(self, table_name: str):
         cursor = self._connection.execute(
             """SELECT ordinal_position - 1 AS cid, column_name AS name,
@@ -206,15 +241,43 @@ class PostgresConnection:
         return PostgresCursor(cursor)
 
 
+def _postgres_pool(database: str):
+    if ConnectionPool is None:
+        raise RuntimeError(
+            "PostgreSQL connection pooling requires psycopg-pool. "
+            "Install the project requirements."
+        )
+    with _DATABASE_POOLS_LOCK:
+        pool = _DATABASE_POOLS.get(database)
+        if pool is None:
+            pool = ConnectionPool(
+                conninfo=database,
+                min_size=1,
+                max_size=_DATABASE_POOL_MAX_SIZE,
+                timeout=10,
+                kwargs={"row_factory": tuple_row, "connect_timeout": 10},
+                open=True,
+            )
+            _DATABASE_POOLS[database] = pool
+        return pool
+
+
+def close_database_pools() -> None:
+    with _DATABASE_POOLS_LOCK:
+        pools = tuple(_DATABASE_POOLS.values())
+        _DATABASE_POOLS.clear()
+    for pool in pools:
+        pool.close()
+
+
 def connect_database(database: Path | str):
     if isinstance(database, str) and database.startswith(("postgres://", "postgresql://")):
         if psycopg is None:
             raise RuntimeError(
                 "PostgreSQL support requires psycopg. Install the project requirements."
             )
-        return PostgresConnection(
-            psycopg.connect(database, row_factory=tuple_row, connect_timeout=10)
-        )
+        pool = _postgres_pool(database)
+        return PostgresConnection(pool.getconn(timeout=10), pool.putconn)
     db = sqlite3.connect(str(database))
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")

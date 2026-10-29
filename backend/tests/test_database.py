@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import Mock, patch
 
+from qa_platform.core import database as database_module
 from qa_platform.core.database import PostgresConnection
 
 
@@ -67,7 +69,17 @@ class PostgresCompatibilityTests(unittest.TestCase):
         self.db.execute("SELECT GROUP_CONCAT(name, ', ') FROM projects")
 
         self.assertIn("id BIGSERIAL PRIMARY KEY", self.raw.statements[-2][0])
-        self.assertIn("STRING_AGG(name, ', ')", self.raw.statements[-1][0])
+        self.assertIn(
+            "STRING_AGG(CAST(name AS TEXT), ', ')", self.raw.statements[-1][0]
+        )
+
+    def test_group_concat_casts_integer_values_and_defaults_separator(self):
+        self.db.execute("SELECT GROUP_CONCAT(tenant_id) FROM projects")
+
+        self.assertIn(
+            "STRING_AGG(CAST(tenant_id AS TEXT), ',')",
+            self.raw.statements[-1][0],
+        )
 
     def test_create_table_removes_sqlite_collation_and_translates_blob(self):
         self.db.execute(
@@ -107,6 +119,55 @@ class PostgresCompatibilityTests(unittest.TestCase):
         self.db.execute("SELECT id FROM users WHERE email=? COLLATE NOCASE", ("A@B.C",))
 
         self.assertIn("LOWER(email) = LOWER(%s)", self.raw.statements[-1][0])
+
+    def test_pooled_connection_is_returned_once_on_close(self):
+        raw_connection = Mock()
+        release_connection = Mock()
+        connection = PostgresConnection(raw_connection, release_connection)
+
+        connection.close()
+        connection.close()
+
+        release_connection.assert_called_once_with(raw_connection)
+        raw_connection.close.assert_not_called()
+
+    def test_postgres_connections_share_a_pool_for_each_url(self):
+        database_module.close_database_pools()
+        self.addCleanup(database_module.close_database_pools)
+        pool = Mock()
+        url = "postgresql://user:example@database.example/test?sslmode=require"
+
+        with patch.object(
+            database_module, "ConnectionPool", return_value=pool
+        ) as factory:
+            first = database_module._postgres_pool(url)
+            second = database_module._postgres_pool(url)
+
+        self.assertIs(first, second)
+        factory.assert_called_once_with(
+            conninfo=url,
+            min_size=1,
+            max_size=10,
+            timeout=10,
+            kwargs={
+                "row_factory": database_module.tuple_row,
+                "connect_timeout": 10,
+            },
+            open=True,
+        )
+    def test_postgres_connection_is_returned_to_its_pool(self):
+        raw_connection = Mock()
+        pool = Mock()
+        pool.getconn.return_value = raw_connection
+        url = "postgresql://user:example@database.example/test?sslmode=require"
+
+        with patch.object(database_module, "psycopg", Mock()):
+            with patch.object(database_module, "_postgres_pool", return_value=pool):
+                connection = database_module.connect_database(url)
+
+        pool.getconn.assert_called_once_with(timeout=10)
+        connection.close()
+        pool.putconn.assert_called_once_with(raw_connection)
 
 
 if __name__ == "__main__":

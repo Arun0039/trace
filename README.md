@@ -85,85 +85,264 @@ Open `http://127.0.0.1:3000/`. `QA_CORS_ORIGINS` is an exact, comma-separated or
 allowlist; do not use `*` when credentials are enabled. The frontend and backend
 remain independently startable, and same-origin serving remains the default.
 
-### Render deployment and scheduled health check
+### Cloudflare Pages deployment
 
-The root [render.yaml](./render.yaml) defines the `qa-tracker` web service and a
-`qa-tracker-health-check` Cron Job. The backend already exposes `GET /health`
-(also `/healthz`) without authentication. It returns HTTP 200 with
-`{"status":"ok"}` and does not access the database or modify application data.
-Health probes are excluded from the backend's routine access log.
+The frontend is static HTML, CSS, and vanilla JavaScript; it does not use a
+framework preset or package install. Create a Cloudflare Pages project with:
+
+| Setting | Value |
+|---|---|
+| Root directory | `frontend` |
+| Framework preset | None |
+| Build command | `node build_pages.mjs` |
+| Build output directory | `dist` |
+| Node.js version | `22` |
+| Build environment variable | `QA_API_BASE_URL=https://api.example.com` |
+
+Use the HTTPS origin of the Render API for `QA_API_BASE_URL` (no path or trailing
+API route). The build validates the origin, generates `config.js`, and copies the
+static app and SPA route rewrites into `dist`. This URL is public configuration,
+not a secret. Do not put credentials or keys in Cloudflare Pages variables.
+
+For authentication, assign custom domains under the same registrable domain to
+both providers, for example `app.example.com` for Pages and `api.example.com` for
+Render. TRACE uses `SameSite=Strict` session cookies; the default `pages.dev` and
+`onrender.com` hostnames are cross-site, so browsers will not send those cookies
+between them. Configure the Render service's `QA_CORS_ORIGINS` to the exact Pages
+origin, such as `https://app.example.com`. Do not use `*` with credentialed
+requests. Cloudflare preview URLs are not allowed by default; add only specific
+trusted preview origins if needed.
+
+The build also generates Cloudflare security headers and a no-store policy for
+`config.js`. Its `_redirects` file maps `/login`, `/signup`, `/workspace`, and
+other single-page routes to the frontend entry point and maps the Product Owner
+and Developer pages to their static HTML files. Test direct navigation and
+refreshes after configuring the Pages custom domain.
+
+### Render deployment
+
+The root [render.yaml](./render.yaml) defines the `qa-tracker` web service and
+the `qa-tracker-trial-expiry` Cron Job. The Blueprint configures a paid
+single-instance service with a 1 GB persistent disk mounted at
+`/app/qa-platform/storage`; increase disk capacity based on measured usage.
+Database records live in Render PostgreSQL, configured through `DATABASE_URL`.
+The blueprint leaves that value unset so the Render PostgreSQL external URL can
+be supplied with TLS enabled.
+
+The backend exposes `GET /health` (also `/healthz`) as a liveness check; it returns
+HTTP 200 with `{"status":"ok"}` without connecting to the database. `GET /ready`
+checks database connectivity and is configured as the Render health check. Both
+are public and do not reveal connection details.
 
 The Blueprint uses the root Dockerfile, which installs
-`backend/requirements.txt` directly. A root `requirements.txt` is also provided as
-a compatibility entry point for deployment platforms configured to run
-`pip install -r requirements.txt`; it includes the backend's dependency list.
+`backend/requirements.txt` directly. For local setup, install dependencies from
+the backend directory with `pip install -r requirements.txt`.
 
-The Cron Job uses the schedule `*/10 * * * *` (every 10 minutes, UTC) and
-requests the URL in `QA_HEALTH_CHECK_URL`. Supply that URL when configuring the
-Blueprint; with the default web-service name it is
-`https://qa-tracker.onrender.com/health` (replace the hostname if you configure a
-custom public domain). The check fails on non-2xx responses or a 90-second timeout and
-does not print response bodies on success; this allows for Render's typical
-roughly one-minute free-service cold start.
-
-The Cron Job requires a paid Render compute plan (`starter` in the Blueprint; check
-Render's current pricing before deploying it). The web service is currently
-configured as `free`. Free web services can spin down after 15 minutes without
-inbound traffic and may take about a minute to start on the next request. The
-10-minute check is intended to keep it active during normal operation, but it
-cannot guarantee uninterrupted availability: a delayed, failed, or suspended
-Cron Job can allow a spin-down, and cold starts can still occur. Free web
-services also have a monthly 750-hour workspace limit and ephemeral local
-storage; this deployment uses PostgreSQL via `DATABASE_URL` for durable
-database data. Use a paid web-service plan when predictable availability and
-persistent-disk options are required.
+The trial-expiry Cron Job runs `python /app/backend/expire_trials.py` every 10 minutes
+and requires the same TLS-enabled `DATABASE_URL` as the web service. It processes
+trials in batches and does not expose a public expiry endpoint. Request-time backend
+authorization denies access at the exact trial-expiry timestamp even if the Cron Job
+is delayed or unavailable. The web service and Cron Job must use the same
+PostgreSQL database and `QA_TRIAL_DURATION_DAYS` setting. Keep the service at one
+instance: rate limits and uploaded files are not shared across instances.
 
 Render environment configuration in the Blueprint:
 
 | Variable | Configured on | Purpose |
 |---|---|---|
-| `QA_HEALTH_CHECK_URL` | Cron Job, required | Full public URL ending in `/health`; set after the web service URL is known |
 | `DATABASE_URL` | Web service, required | PostgreSQL connection URL with TLS (`sslmode=require` or stronger); configure in Render and keep it secret |
+| `DATABASE_URL` | Trial-expiry Cron Job, required | The same PostgreSQL database URL used by the web service |
+| `QA_CORS_ORIGINS` | Web service, required | Exact Cloudflare Pages production origin, e.g. `https://app.example.com` |
 | `QA_AI_ENCRYPTION_KEY` | Web service | Generated by Render; keep it stable to decrypt saved provider credentials |
-| `HOST`, `PORT`, `QA_HOST`, `QA_PORT` | Web service | `HOST`/`PORT` bind to `0.0.0.0` and Render's service port; `QA_HOST`/`QA_PORT` are redundant aliases in the current Blueprint |
+| `QA_ADMIN_PASSWORD` | Web service, required for Product Owner access | Bootstrap administrator password; use a unique secret of at least 12 characters |
+| `QA_TRIAL_DURATION_DAYS` | Web service and expiry job | Trial length in days (1–365; default 14); set consistently on both processes |
+| `HOST` | Web service | Set to `0.0.0.0`; Render supplies `PORT` at runtime |
+| `QA_ENVIRONMENT` | Web service | Set to `production` for structured production logs |
+| `QA_COOKIE_SECURE` | Web service | `true` for HTTPS session cookies |
 | `QA_ALLOW_PUBLIC_AUTH` | Web service | `true` enables public account registration; change it if registration should be restricted |
 
-`QA_HEALTH_CHECK_URL` is intentionally not hard-coded because Render assigns or
-allows custom public hostnames. Local runs need no Cron Job or extra variable:
-the same endpoint is available at `http://127.0.0.1:8001/health` with the
-default backend configuration.
+#### Deployment, migration, smoke test, and rollback
 
-The Blueprint also sets `FILE_STORAGE=local`, but the application currently uses
-local filesystem storage unconditionally; this variable does not configure durable
-storage.
+1. Push the reviewed repository to GitHub, then create the Render services from
+   the root `render.yaml`. Create a Render PostgreSQL database in the same region
+   and set its TLS-enabled external URL as `DATABASE_URL` on both the web service
+   and trial-expiry job.
+2. Set `QA_CORS_ORIGINS`, `QA_ADMIN_PASSWORD`, and `QA_AI_ENCRYPTION_KEY` on the
+   web service. Set `QA_TRIAL_DURATION_DAYS` identically on the web service and
+   Cron Job. Attach the custom API domain, such as `api.example.com`.
+3. Create the Cloudflare Pages project from the same GitHub repository using the
+   settings above. Set `QA_API_BASE_URL` to the Render API origin, attach the
+   Pages domain (such as `app.example.com`), and ensure the two domains share the
+   same registrable domain.
+4. Render starts the Docker image with `python app.py`. `initialize()` applies
+   the existing additive schema upgrades at startup; it does not reset or drop
+   the database. For an existing SQLite installation, migrate a copy to an
+   empty PostgreSQL database with `py -3 migrate_sqlite_to_postgres.py` from
+   `backend/` before pointing production at it.
+5. After both deployments report healthy, verify:
+
+   ```sh
+   curl --fail https://api.example.com/health
+   curl --fail https://api.example.com/ready
+   ```
+
+   Then use the Pages site to create an account, sign in, refresh `/workspace`,
+   and verify a document upload/download. These browser checks confirm cookie,
+   CORS, and persistent-file behavior that the HTTP health probes cannot verify.
+6. To roll back application code, select the previous successful deployment in
+   Render and redeploy the previous Pages commit. The schema upgrades are
+   additive, so leave the database in place during an application rollback.
+   Restore a database or files only from a verified backup and during a planned
+   recovery; see [SELF_HOSTING.md](./SELF_HOSTING.md) for the restore command.
+
+Keep `sslmode=require` or stronger in the PostgreSQL URL. Set the Pages API
+origin and exact Pages CORS origin before testing signup/login. Render's paid
+service and disk incur charges; confirm current plan and disk pricing before
+creating resources. Local runs need no Cron Job: `/health` and `/ready` are
+available on the backend's default port.
 
 The app stores uploaded files and archives on its local filesystem under
-`qa-platform/storage/`. Render's free service filesystem is ephemeral; the
-Blueprint does not configure durable file storage. Do not rely on free-tier
-filesystem data for production. Before storing real uploads, use a paid service
-with a persistent disk mounted at `/app/qa-platform/storage`, and configure backups.
-The current application uses local filesystem storage and is not ready for
-multi-instance deployment without shared durable file storage.
+`qa-platform/storage/`; the Render disk preserves that directory across service
+restarts and deployments. The disk is instance-local and is not shared across
+multiple app instances. Configure backups and test restores before storing
+customer data.
 
 The Blueprint enables public registration. Review access, password recovery
 (which does not send email), session, privacy, and terms requirements before
 exposing a production service. Keep the database URL and any provider credentials
 out of source control; retain the generated `QA_AI_ENCRYPTION_KEY` across deploys.
 
+### Workspace signup, trials, migration, and rollback
+
+Each successful signup creates one named workspace, assigns the registering user
+the tenant-scoped **Workspace Owner** role, and creates a configurable UTC free trial
+(14 days by default) in the same database transaction. Workspace owners can manage members and QA records
+inside their tenant; they are not platform administrators. A trial ends at its
+stored exclusive expiry timestamp. The scheduled job marks it expired and suspends
+the workspace without deleting database records, uploads, or archives. Login,
+logout, and profile access remain available after suspension.
+
+Workspace 001 (tenant ID 1) is the permanent no-payment workspace. It is excluded
+from trial expiry and startup repairs its status to active if an earlier trial
+configuration suspended it. Public signup creates later workspace IDs, which
+receive the configured trial.
+
+The additive startup migration creates `tenant_subscriptions`, adds workspace owner
+and suspension metadata, and creates an active `legacy` subscription for each
+pre-existing tenant that has no subscription row. Existing projects and files remain
+in place; no legacy project is reassigned. Before deploying a new version, stop the
+local app and back up `qa-platform/qa_platform.sqlite3` and `qa-platform/storage/`.
+For hosted PostgreSQL, take a database snapshot/backup and verify it before rollout.
+Keep the backup until signup, migration, trial access, and scheduled expiry are
+verified.
+
+Rollback does not require dropping the additive schema. If expiry has already
+suspended a workspace, use the authorized system-admin reactivation operation
+(`POST /api/workspaces/{workspace_id}/subscription/reactivate`) before reverting
+the application, or restore the pre-deployment database backup. This operation
+starts a new configured-length trial and records an audit event. The current platform has no
+payment processor; paid-subscription billing and conversion remain out of scope.
+For local verification, run `py -3 expire_trials.py` from `backend/`.
+
+### Product Owner Operations
+
+The separate, no-index operations dashboard is served at `/product-owner`. It uses
+the configured bootstrap `QA_ADMIN_PASSWORD` and the existing HttpOnly administrator
+session; ordinary workspace accounts are denied by every `/api/product-owner/*`
+route. Provision access by setting a unique password of at least 12 characters in
+`qa-platform/.env` and restarting the backend. Do not share that credential or grant
+ordinary workspace roles system-wide access.
+
+The versioned `0001_product_owner_dashboard` migration runs from `app.initialize()`.
+It backfills immutable public user, tenant, and workspace UUIDs without changing
+existing internal integer foreign keys, adds manual plan configuration and usage
+events, and stores Product Owner actions in a separate append-only administrative
+audit table. Existing tenant/workspace records and customer files remain in place.
+Startup creates no new background job: the existing `expire_trials.py` scheduled
+job continues to perform idempotent trial suspension, and request-time checks remain
+the access-control boundary.
+
+The dashboard offers tenant search/filter/sort/pagination, lifecycle and storage
+details, manual plan assignment, suspension/reactivation, product usage, application
+errors/health, and merged audit history. Customer API usage events store only a
+tenant ID, normalized route, status, and timestamp; business content and request
+bodies are not recorded. API request-rate analytics are still process-local and
+reset on restart. Database storage is a stated estimate where the underlying engine
+does not expose tenant-level page allocation. Cleanup is tenant-inventoried and
+requires an exact tenant-specific confirmation, a reason, and audit logging; system
+configuration and protected data are not cleanup targets.
+
+`QA_TRIAL_DURATION_DAYS` defaults to 14 and accepts 1–365 days. Configure the same
+value on the web process and trial-expiry job. To roll back the Product Owner schema,
+first stop the service and back up the database (and storage), then run from
+`backend/`:
+
+```powershell
+py -3 rollback_product_owner_migration.py --confirm remove-product-owner-dashboard-data
+```
+
+This explicit rollback preserves customer users, tenants, workspaces, and QA records,
+but removes Product Owner usage events, storage history, plans, public ID columns,
+and administrative audit records. Prefer rolling back the application while leaving the additive schema
+in place when audit retention is required.
+
+### Workspace storage and developer monitoring
+
+The authenticated workspace has a Storage page at `/workspace/storage`. The
+`storage.view` and `storage.delete` permissions are enforced by the API. It lists
+workspace-owned project files and supported project record groups, with type,
+project, keyword, and last-updated date filters. Filesystem files and binary
+attachments/evidence use exact byte sizes. Structured database records use a
+consistent approximation: character counts of selected text fields plus 64 bytes
+per row. This is not a database-page or index-size measurement; the page identifies
+these values as estimates. The total and optional quota combine exact file/blob
+bytes with that record estimate.
+
+Users with `storage.delete` may delete eligible file items and all records in a
+selected project/type group (requirements, test cases, test runs, or defects).
+Related form data and execution evidence are removed with their parent records in
+the database transaction, and each action is audited. Project records and analysis
+job records are protected on this page; delete a project through its project
+management action, which archives its files. The storage estimate is not a
+transactional database page-size measurement.
+
+Developer monitoring is served separately at `/developer`; it uses the existing
+`/login` session and requires the explicit `developer.view` permission for every
+API request. Status changes require `developer.manage`; deleting error entries
+requires `developer.delete`. Error records are stored in the application database,
+separately from workspace storage accounting, and are redacted before persistence
+and display. Frontend/API report ingestion is limited to 64 KB per request and 30
+reports per client IP per minute. Resolved and ignored errors older than the
+retention period are pruned. Configure:
+
+| Variable | Purpose |
+|---|---|
+| `QA_STORAGE_QUOTA_MB` | Optional positive integer workspace quota in MiB |
+| `QA_DEVELOPER_ERROR_RETENTION_DAYS` | Retention for resolved/ignored errors; integer from 1 to 3650, default 90 |
+| `QA_ENVIRONMENT` | Environment label included in structured logs/error metadata; defaults to `development` |
+
+Developer API-response counts are tenant-scoped, in-memory aggregates of up to
+20,000 recent authenticated API responses. They reset when the server restarts and
+are not durable audit or request logs. The developer health page reports database,
+filesystem, and analysis-job status; it is not a substitute for deployment-level
+monitoring or durable log retention.
+
 ### Optional AI provider dependencies
 
-Local deterministic workflows do not require Node.js. For Google Gemini or another
-SDK-backed AI provider, install Node.js 22+ and install the locked dependencies from
-the backend directory:
+Local deterministic workflows do not require Node.js. For Google Gemini, OpenAI,
+Anthropic Claude, or another SDK-backed AI provider, install Node.js 22+ and install
+the locked dependencies from the backend directory:
 
 ```powershell
 cd backend
 npm ci
 ```
 
-Ollama additionally requires its local server and selected model to be running.
-Configure providers after signing in under **Settings → AI Module**. Provider keys
-are encrypted in SQLite using `QA_AI_ENCRYPTION_KEY`.
+Ollama additionally requires its local server and selected model to be running, and is
+available only in the Default Workspace. Each workspace has its own AI settings; a
+workspace administrator enables the AI module, then any signed-in member of that
+workspace can configure a supported provider under **Settings → AI Module**. Provider
+keys are encrypted in SQLite using `QA_AI_ENCRYPTION_KEY`.
 
 ### Tests
 

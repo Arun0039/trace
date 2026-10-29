@@ -1,10 +1,16 @@
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogle } from "@ai-sdk/google";
+import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, Output } from "ai";
 import { pathToFileURL } from "node:url";
 
+const baseUrlProviders = new Set(["ollama", "openai-compatible"]);
+
 const providerFactories = {
   google: (model, request) => createGoogle({ apiKey: request.apiKey })(model),
+  openai: (model, request) => createOpenAI({ apiKey: request.apiKey })(model),
+  anthropic: (model, request) => createAnthropic({ apiKey: request.apiKey })(model),
   ollama: (model, request) => createOpenAICompatible({
     name: "ollama",
     baseURL: request.base_url,
@@ -37,7 +43,7 @@ export async function generateWithProvider(
     !prompt ||
     typeof request.apiKey !== "string" ||
     (provider !== "ollama" && !request.apiKey) ||
-    (provider !== "google" && typeof request.base_url !== "string")
+    (baseUrlProviders.has(provider) && typeof request.base_url !== "string")
   ) {
     throw new Error("The AI provider request is missing its model or prompt.");
   }
@@ -155,6 +161,8 @@ function errorDetail(error, apiKey) {
 function providerLabel(provider) {
   return {
     google: "Google Gemini",
+    openai: "OpenAI",
+    anthropic: "Anthropic Claude",
     ollama: "Ollama",
     "openai-compatible": "OpenAI-compatible provider",
   }[provider] || "AI provider";

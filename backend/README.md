@@ -31,11 +31,80 @@ and `QA_API_BASE_URL` to the backend origin. The local frontend server reads the
 API URL from its process environment; the single-origin backend does not need
 either setting. `QA_AI_ENCRYPTION_KEY` must remain stable while encrypted provider
 credentials are stored. `GET /health` is public and returns `{"status":"ok"}` for
-Render and local health probes.
+Render and local liveness probes. `GET /ready` performs a database connectivity
+check and returns only a generic readiness status. PostgreSQL uses a shared
+`psycopg-pool` pool capped at 10 connections per backend process; keep the Render
+service single-instance unless storage and rate limiting are moved to shared
+services.
 
 Run the backend test suite from this directory with
 `py -3 -m unittest discover -s tests`. The Node AI adapter tests are optional and
 run with `npm ci` followed by `npm test` (Node.js 22+).
+
+### Workspace trial operations
+
+Public signup creates a dedicated tenant, sets `tenants.owner_user_id`, gives the
+registering user the tenant-scoped `Workspace Owner` role, and creates one
+`free_trial` subscription with a configurable UTC expiry (14 days by default). The schema migration runs
+incrementally in `app.initialize()`. Existing tenants without a subscription receive
+an active `legacy` subscription so existing projects and workflows stay available;
+their records and files are not moved or deleted.
+
+Workspace 001 (tenant ID 1) is the permanent no-payment workspace. The startup
+migration restores it to active `legacy` status if it was previously marked as a
+trial, and the request-time access check and expiry worker always exclude it.
+Newly signed-up workspaces use later IDs and receive the configured trial.
+
+The backend checks subscription access on every non-account API request. It denies
+trial access when `now >= trial_ends_at`, independently of the scheduled expiry job.
+Login, logout, and account-profile endpoints remain available while suspended.
+The expiry worker is a private command, not an HTTP endpoint:
+
+```powershell
+py -3 expire_trials.py
+```
+
+It processes up to 100 trials per run by default. Render runs it every 10 minutes
+from the `qa-tracker-trial-expiry` Cron Job; configure the same TLS-protected
+`DATABASE_URL` on both that job and the web service. Run it repeatedly safely; it
+revalidates each trial in its conditional update and writes a workspace audit event.
+
+Before deploying the migration, stop the local service and back up
+`../qa-platform/qa_platform.sqlite3` and `../qa-platform/storage/`. For PostgreSQL,
+take a database snapshot. The migration is additive and can be left in place during
+application rollback. If workspaces were already suspended by the expiry job, the
+system Global Admin can call
+`POST /api/workspaces/{workspace_id}/subscription/reactivate` to start a new
+configured-length trial, or restore the pre-deployment database backup. This operation is
+audited. Billing, paid-plan checkout, and payment-provider integration are not
+implemented.
+
+The primary workspace owner can be transferred to an active member with
+`POST /api/workspaces/{workspace_id}/owner` and a JSON body containing that
+member's `user_id`. Workspace admins or the system Global Admin can perform this
+operation; it is audited, and the former owner returns to the `User` role.
+
+### Product Owner Operations
+
+The independent administration frontend is available at `/product-owner`. It
+authenticates with the bootstrap `QA_ADMIN_PASSWORD`; workspace account sessions
+cannot access any `/api/product-owner/*` endpoint. Set the password to at least 12
+characters in `../qa-platform/.env` before exposing the service. Product Owner
+operations are audited separately from tenant workspace audit events.
+
+The additive, versioned migration `0001_product_owner_dashboard` runs during
+`initialize()`. It adds immutable public user, tenant, and workspace UUIDs while
+retaining existing numeric foreign keys, a plan catalog, coarse usage events, and
+administrative audit history. `QA_TRIAL_DURATION_DAYS` configures the trial duration
+(1–365; default 14) and must match between the web service and expiry worker.
+No additional scheduled process is required.
+
+Back up the database before rollout. To explicitly remove this feature's schema,
+stop the service and run `py -3 rollback_product_owner_migration.py --confirm
+remove-product-owner-dashboard-data`. This preserves existing customer users,
+tenants, workspaces, and QA records, but removes Product Owner usage, configured
+storage history, plans, public identifier columns, and Product Owner audit records.
+Leaving the additive schema in place is preferred if those audit records must be retained.
 
 ### Moving an existing database to PostgreSQL
 
@@ -52,7 +121,7 @@ Uploaded requirement/application files, attachments, archives, and exports remai
 - Each selected project has its own child modules: **Requirement**, **Test Case**, **Application**, **API Documentation**, **App Analysis (Coming soon)**, **Bug Tracker**, and **Project files**. The child modules remain associated with the selected project's SQLite ID and appear in the project navigation while a project workspace is open. **Dashboard (Beta)** and **Settings (Beta)** are workspace modules. Settings contains the **AI module** for provider configuration and connection testing, **App Preferences** for choosing dark, light, or system-matched appearance (saved in the current browser), and **Archive** for browsing retained folders from deleted projects. Project setup records product type, project name, description, version, environment, QA owner, and active/inactive status.
 - Requirement, Test Case, and Defect lists each offer a module-specific CSV report; the export follows the current list search and includes only records from that module. The explicitly labeled full project report remains available from **Reports & Analytics**. Defects provide a read-only View action with custom fields and attachments, and deletion is available only to roles granted **Defect → Delete** in **Roles & Permissions**; the API enforces the same permission.
 - **Custom Fields** are managed by a Global Admin under **Settings → Custom Fields**. Create Text, Number, or Dropdown fields and associate each with Project, Requirement, Test Case, or Defect. Definitions and values are tenant-scoped. Required state, active state, order, help text, and dropdown options are configurable. Fields with saved values must be deactivated rather than deleted.
-- **User management and RBAC** are available under **Settings → User Profile**, **Team & Members**, **Roles & Permissions**, and **Users**. Public signup creates a dedicated tenant-scoped workspace and defaults to `User`; **Add user** defaults to `User` in the current tenant, and only a Global Admin can assign elevated roles. The configured `QA_ADMIN_PASSWORD` session remains the local bootstrap Global Admin, and explicitly provisioned user memberships can receive the `Global Admin` role. The schema contains `tenants`, `tenant_memberships`, `roles`, `permissions`, and `role_permissions`; projects and tenant-owned records carry `tenant_id`, and project APIs enforce tenant scope server-side. User-management APIs independently check Global Admin access and permissions. Account passwords are stored as salted PBKDF2 hashes; account sessions use HttpOnly, SameSite cookies and expire after 12 hours. Deactivation blocks login while retaining the account's data; confirmed deletion removes only the account and memberships, preserving QA history. User, role, team, permission, and membership changes are recorded in the Activity Log. Password recovery is local; the MVP does not send reset email.
+- **User management and RBAC** are available under **Settings → User Profile**, **Team & Members**, **Roles & Permissions**, and **Users**. Public signup creates one dedicated tenant-scoped workspace, assigns the registering user as its `Workspace Owner`, and starts a configurable free trial (14 days by default); the owner is not a platform administrator. **Add user** defaults to `User` in the current tenant, and role permissions are enforced server-side. The configured `QA_ADMIN_PASSWORD` session remains the local bootstrap Global Admin, and explicitly provisioned user memberships can receive the `Global Admin` role. The schema contains `tenants`, `tenant_memberships`, `tenant_subscriptions`, `roles`, `permissions`, and `role_permissions`; projects and tenant-owned records carry `tenant_id`, and project APIs enforce tenant scope server-side. Expired trials are denied at request time and suspended by the scheduled `expire_trials.py` command without deleting QA data or files. Login, logout, and profile access remain available while suspended. Account passwords are stored as salted PBKDF2 hashes; account sessions use HttpOnly, SameSite cookies and expire after 12 hours. Deactivation blocks login while retaining the account's data; confirmed deletion removes only the account and memberships, preserving QA history. User, role, team, permission, and membership changes are recorded in the Activity Log. Password recovery is local; the MVP does not send reset email.
 - Project, Requirement, Test Case, and Defect forms support reusable file attachments. Select multiple PDF, DOCX, XLSX, ZIP, CSV, JSON, Markdown, TXT, PNG, JPEG, GIF, or WebP files (up to 5 MB each), remove queued files before saving, and view or download existing attachments when editing. Execution screenshots continue to use their existing image-evidence workflow.
 - The **Archive** view lists retained project folders and their archive dates. It does not restore deleted SQLite records; files remain in `../qa-platform/storage/archived-projects/`.
 - Follow the project flow: (1) paste text or upload a `.pdf`/`.docx` (maximum 5 MB), `.csv`, `.txt`, or `.md` (maximum 1 MB); (2) review the rule-based `EXTRACTED` records separately from `AI SUGGESTION` content and confirm; (3) review each extracted record and mark it **Reviewed** before test-case generation; (4) explicitly Accept, Edit, or Reject each AI suggestion; (5) generate linked test-case drafts; (6) upload the finalized application ZIP and validate requirement coverage against its source. Only deterministic source extraction is stored as an extracted BRD requirement. An AI analysis report and proposed requirements remain suggestions and never replace extracted records. Suggestions retain their original content, exact source evidence when available, reason, related requirement, status, and reviewer decision history. Accepting a suggestion creates a separate requirement with AI origin and approval provenance; re-importing a BRD does not overwrite prior requirements, suggestions, or reviewer decisions. Test generation excludes pending/rejected suggestions and includes an accepted suggestion only after its explicit approval. Rule extraction supports structured headings, labeled requirements, CSV feature rows, and explicit requirement-like statements; it does not turn an entire unstructured document or a heading alone into a confirmed requirement. The analysis report is labeled `AI SUGGESTION` or `NEEDS REVIEW` and does not establish confirmed source facts. Cancelling the confirmation leaves the document and extracted requirements unsaved. View saved analyses from **BRD Documents** or download them as Markdown. Requirements can be deleted; linked cases remain but are unlinked.
@@ -61,7 +130,7 @@ Uploaded requirement/application files, attachments, archives, and exports remai
 - The **Test Case** module also offers **AI-assisted generation without a BRD**. Paste feature notes, workflows, draft requirements, or existing cases, select Functional, Non-Functional, Sanity, and/or Smoke coverage, then submit with a configured model-based provider. The model reports explicit facts, assumptions, gaps, duplicate/overlapping coverage, unclear points, and clarification questions separately. If the source is insufficient, it returns questions without creating cases. Generated drafts retain an input quotation when available, category, positive/negative classification, assumptions, and an editable title alongside the usual execution fields. The original text remains in the generator while navigating within the current page session; it is not saved as a requirement. CSV exports include the case category and traceability fields. Local deterministic mode remains available for BRD-based generation only.
 - Import a local `.json` OpenAPI 3.x or Swagger 2.0 specification from **API docs** to build a searchable project endpoint inventory. The app validates the document and records operations, summaries, operation IDs, tags, and the source document name; it never fetches a URL.
 - Upload a finalized developer build `.zip` from **Applications** for a project-scoped file inventory and bounded static analysis. Use **Validate requirement coverage** on an upload to compare every project requirement against source excerpts using the configured cloud/SDK AI provider; deterministic Local mode does not perform AI-assisted coverage review. At most 80 excerpts and 300 KB of source text per model request are sent (requirements are processed in batches of 100); cited evidence must match text in the uploaded files. Reports are marked stale when requirements change and should be rerun. Results are AI-assisted static estimates, not proof of runtime functionality or correctness. ZIPs are limited to 25 MB, 3,000 entries, 100 MB total extracted content, and 20 MB per file. Unsafe paths, symbolic links, duplicate/colliding entries, unsupported compression, encrypted members, and excessive compression are rejected.
-- Configure providers from **Settings → AI Module** after signing in as the local Admin. Supported choices are Local deterministic, Ollama (loopback OpenAI-compatible API), Google Gemini (default model `gemini-2.5-flash`), and Other (an OpenAI-compatible HTTPS endpoint). Google and Other require an API key; Ollama does not. The browser never receives provider keys: credentials are encrypted in SQLite with `QA_AI_ENCRYPTION_KEY`, which must remain stable while those credentials are stored. A lost or changed key makes existing credentials undecryptable. Gemini and compatible-provider requests send requirement text and bounded source excerpts to the selected endpoint; use Local or a trusted local Ollama instance for data that must remain local. The existing API is synchronous JSON and does not expose streaming. Missing, invalid, and connection-failure cases are surfaced by the settings and analysis APIs.
+- Configure providers from **Settings → AI Module** after signing in; any workspace member can manage the workspace-scoped provider settings. A workspace administrator enables the AI module per workspace; after that, any signed-in member of the workspace can configure a provider. Supported choices are Local deterministic, Google Gemini (default model `gemini-2.5-flash`), OpenAI (default model `gpt-4o-mini`), Anthropic Claude (default model `claude-3-5-sonnet-latest`), and Other (an OpenAI-compatible HTTPS endpoint). Ollama (loopback OpenAI-compatible API) is available only in the Default Workspace. Google, OpenAI, Anthropic, and Other require an API key; Ollama does not. The browser never receives provider keys: credentials are encrypted in SQLite with `QA_AI_ENCRYPTION_KEY`, which must remain stable while those credentials are stored. A lost or changed key makes existing credentials undecryptable. Gemini, OpenAI, Anthropic, and compatible-provider requests send requirement text and bounded source excerpts to the selected endpoint; use Local or a trusted local Ollama instance for data that must remain local. The existing API is synchronous JSON and does not expose streaming. Missing, invalid, and connection-failure cases are surfaced by the settings and analysis APIs.
 - Execute a case with one of: Not Executed, In Progress, Pass, Fail, Blocked, or Skipped. Each save creates an execution record; the latest result appears in the case list and dashboard. Optionally attach PNG, JPEG, GIF, or WebP screenshot evidence (maximum 5 MB per image) while recording an execution. The case list links to evidence previews and downloads.
 - Log bugs and link them to cases, especially failed cases. Update bug status, severity, priority, and assignment.
 - Use **Export report** to download a UTF-8 CSV that opens in Excel. It contains test cases, evidence references for each case's latest execution, a complete execution-evidence reference section, a requirement coverage matrix, and a bug summary. CSV is used instead of `.xlsx` to avoid third-party dependencies. Test cases include case, requirement, and optional use-case IDs; title, scenario, category, type, positive/negative classification, priority, preconditions, test data, assumptions, source reference, description, steps, expected result, status, and actual result. Edit cases to update their fields, status, or actual result, and delete cases with their execution history.
@@ -75,7 +144,7 @@ Uploaded requirement/application files, attachments, archives, and exports remai
 - SQLite is initialized on startup with foreign-key enforcement, project-scoped relationships, and parameterized user-data queries. Additive schema initialization creates API-document, endpoint-inventory, execution-evidence, application-analysis, application-upload, and requirement-document tables and fields for existing databases.
 - Requirements accept `.docx` uploads up to 5 MB and `.txt` / `.md` documents up to 1 MB of text. DOCX parsing reads only the bounded `word/document.xml` member without extracting or opening embedded content. API specifications accept local `.json` uploads up to 1 MB and must declare OpenAPI 3.x or Swagger 2.0 with valid document metadata and paths. No URL import, remote fetch, uploaded code execution, or specification dereferencing occurs.
 - Application ZIPs are untrusted input. Members are fully preflighted before extraction, extracted into a unique staging folder and atomically moved into `../qa-platform/storage/projects/{project_id}/applications/{upload_uuid}` beside the SQLite database. The database stores the project-scoped inventory and static findings; API responses do not reveal the server storage path. Source inspection has per-file, total-byte, file-count, and findings limits, so results may be incomplete. ZIP upload API: `POST /api/projects/{id}/applications/import?filename=client.zip` with raw ZIP bytes and `Content-Type: application/zip` (25 MB maximum); JSON/base64 uploads remain supported. List or retrieve records through `GET /api/projects/{id}/applications` and `GET /api/projects/{id}/applications/{upload_id}`.
-- `GET /api/ai/settings` returns provider metadata without credentials. `POST /api/ai/settings` saves encrypted provider settings and `POST /api/ai/test` checks the selected provider. These routes and AI operations require an Admin session from `POST /api/auth/login`; the session is local, in-memory, HttpOnly, and expires after 12 hours. Test-case generation accepts `{"generator":"deterministic"}` or the selected provider ID (`google`, `ollama`, or `openai-compatible`) at `POST /api/projects/{id}/test-cases/generate`. Existing BRD preview/confirmation and test-case response shapes remain intact.
+- `GET /api/ai/settings` returns provider metadata without credentials. `POST /api/ai/settings` saves encrypted provider settings and `POST /api/ai/test` checks the selected provider. `POST /api/ai/module` enables or disables AI for the workspace and requires a workspace administrator. These routes and AI operations require a signed-in workspace member; settings and credentials are stored per workspace. The session is local, in-memory, HttpOnly, and expires after 12 hours. Test-case generation accepts `{"generator":"deterministic"}` or the selected provider ID (`google`, `openai`, `anthropic`, `ollama`, or `openai-compatible`) at `POST /api/projects/{id}/test-cases/generate`. Existing BRD preview/confirmation and test-case response shapes remain intact.
 - Evidence is validated by declared image MIME type, file signature/structure, dimensions where available, and a 5 MB size limit, then stored as a BLOB in SQLite under its project and execution. The application does not serve evidence cross-project. Request bodies are capped at 27 MB to support raw ZIP uploads.
 - CSV exports are downloaded as before and also saved to `../qa-platform/storage/projects/{project_id}/exports/project-report.csv`. `DELETE /api/projects/{id}` deletes the project's SQLite records and archives its project folder instead of deleting its files.
 - The web app is a single-Admin local MVP without cloud sync. It listens on `127.0.0.1` by default; Admin login is accepted only from loopback clients. Do not expose the app to an untrusted network. Keep the database and `.env` private. Back up the database and encryption key together by stopping the app before copying them.
