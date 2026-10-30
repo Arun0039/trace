@@ -119,6 +119,28 @@ other single-page routes to the frontend entry point and maps the Product Owner
 and Developer pages to their static HTML files. Test direct navigation and
 refreshes after configuring the Pages custom domain.
 
+### Vercel frontend deployment
+
+Vercel can host the static frontend; keep the backend on Render. The root
+[vercel.json](./vercel.json) selects the "Other" framework preset, builds
+`frontend/dist`, and applies the SPA rewrites and security headers that Vercel
+does not read from Cloudflare's `_redirects` and `_headers` files.
+
+| Setting | Value |
+|---|---|
+| Root directory | blank (repository root) |
+| Framework preset | Other (enforced by `vercel.json`) |
+| Build command | `node frontend/build_pages.mjs` |
+| Build output directory | `frontend/dist` |
+| Build environment variable | `QA_API_BASE_URL=https://api.example.com` |
+
+Set the Vercel production origin as `QA_CORS_ORIGINS` on the Render service.
+Vercel's default `*.vercel.app` hostname is cross-site with `*.onrender.com`, so
+session cookies require custom domains under the same registrable domain. Do not
+deploy the repository root as a Python app on Vercel: the backend is a
+long-running HTTP server with a persistent disk and is not compatible with Vercel
+Functions.
+
 ### Render deployment
 
 The root [render.yaml](./render.yaml) defines the `qa-tracker` web service and
