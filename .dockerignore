@@ -5,7 +5,8 @@ venv
 env
 .git
 .gitignore
-.vscode/tasks.json
+.vscode
+.github
 node_modules
 .playwright-mcp
 **/.env
@@ -21,4 +22,7 @@ node_modules
 .mypy_cache
 .ruff_cache
 .coverage*
-/qa-platform/storage/
+/qa-platform
+/frontend/dist
+/docs
+/deploy

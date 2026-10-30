@@ -40,7 +40,7 @@ pause
 exit /b 1
 
 :run_app
-"%PYTHON_EXE%" %PYTHON_ARGS% -c "import cryptography, pypdf, psycopg" >nul 2>nul
+"%PYTHON_EXE%" %PYTHON_ARGS% -c "import cryptography, defusedxml, pypdf, psycopg, psycopg_pool" >nul 2>nul
 if errorlevel 1 (
   echo Required Python packages are missing. Installing from requirements.txt...
   "%PYTHON_EXE%" %PYTHON_ARGS% -m pip --version >nul 2>nul
@@ -51,7 +51,7 @@ if errorlevel 1 (
   )
   "%PYTHON_EXE%" %PYTHON_ARGS% -m pip install -r requirements.txt
   if errorlevel 1 goto dependencies_failed
-  "%PYTHON_EXE%" %PYTHON_ARGS% -c "import cryptography, pypdf, psycopg"
+  "%PYTHON_EXE%" %PYTHON_ARGS% -c "import cryptography, defusedxml, pypdf, psycopg, psycopg_pool"
   if errorlevel 1 goto dependencies_failed
 )
 echo Starting the QA Platform with "%PYTHON_EXE%"...
