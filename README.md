@@ -122,29 +122,32 @@ refreshes after configuring the Pages custom domain.
 ### Render deployment
 
 The root [render.yaml](./render.yaml) defines the `qa-tracker` web service and
-the `qa-tracker-trial-expiry` Cron Job on Render's Docker runtime. Both build from
-the root [Dockerfile](./Dockerfile), which pins Python 3.11.9 and installs
-`backend/requirements.txt`. The Blueprint configures a paid single-instance
-service with a 1 GB persistent disk mounted at `/app/qa-platform/storage`;
-increase disk capacity based on measured usage. Database records live in Render
-PostgreSQL, configured through `DATABASE_URL`. The blueprint leaves that value
-unset so the Render PostgreSQL external URL can be supplied with TLS enabled.
+the `qa-tracker-trial-expiry` Cron Job on Render's native Python runtime. Both
+build from the repository root with `pip install -r requirements.txt` and pin
+Python 3.11.9 through [.python-version](./.python-version). The Blueprint
+configures a paid single-instance service with a 1 GB persistent disk mounted at
+`/opt/render/project/src/qa-platform/storage`; increase disk capacity based on
+measured usage. Database records live in Render PostgreSQL, configured through
+`DATABASE_URL`. The blueprint leaves that value unset so the Render PostgreSQL
+external URL can be supplied with TLS enabled.
 
 The backend exposes `GET /health` (also `/healthz`) as a liveness check; it returns
 HTTP 200 with `{"status":"ok"}` without connecting to the database. `GET /ready`
 checks database connectivity and is configured as the Render health check. Both
 are public and do not reveal connection details.
 
-The container starts `python app.py` from `/app/backend` and runs as the
-non-root `appuser`. The entrypoint fixes ownership of the mounted storage
-directory before dropping privileges. For local setup, install dependencies from
-the backend directory with `pip install -r requirements.txt`. If you create a
-native Python service manually instead of using the Blueprint, set its root
-directory to `backend`; the root `requirements.txt` and `app.py` shims also
-support a service rooted at the repository root.
+The web service starts `python app.py` from the repository root. The root
+`requirements.txt` and `app.py` files are shims that delegate to `backend/`; the
+backend itself remains the canonical application directory. For local setup,
+install dependencies with `pip install -r requirements.txt` from the repository
+root, or `pip install -r requirements.txt` from `backend/`. If you create the
+Render service manually instead of using the Blueprint, leave its root directory
+blank (repository root) and use the same build and start commands. Do not set the
+root directory to a package subfolder such as `backend/qa_platform`, because
+`requirements.txt` will not be found there.
 
-The trial-expiry Cron Job runs `python /app/backend/expire_trials.py` from the
-same container image every 10 minutes and requires the same TLS-enabled
+The trial-expiry Cron Job runs `python backend/expire_trials.py` from the
+repository root every 10 minutes and requires the same TLS-enabled
 `DATABASE_URL` as the web service. It processes
 trials in batches and does not expose a public expiry endpoint. Request-time backend
 authorization denies access at the exact trial-expiry timestamp even if the Cron Job
@@ -180,8 +183,8 @@ Render environment configuration in the Blueprint:
    settings above. Set `QA_API_BASE_URL` to the Render API origin, attach the
    Pages domain (such as `app.example.com`), and ensure the two domains share the
    same registrable domain.
-4. Render builds the Docker image and starts `python app.py` from
-   `/app/backend`. `initialize()` applies the existing additive schema upgrades
+4. Render installs `requirements.txt` and starts `python app.py` from the
+   repository root. `initialize()` applies the existing additive schema upgrades
    at startup; it does not reset or drop the database. For an existing SQLite
    installation, migrate a copy to an empty PostgreSQL database with
    `py -3 migrate_sqlite_to_postgres.py` from `backend/` before pointing

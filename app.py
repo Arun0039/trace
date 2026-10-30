@@ -1,7 +1,7 @@
 """Root entry point for Render's native Python runtime.
 
-The application lives in ``backend/``. This shim keeps deployments that use the
-repository root as their service root working while the Blueprint uses Docker.
+The application lives in ``backend/``. This shim lets the Render Blueprint use the
+repository root as the service root while keeping ``backend/`` canonical.
 """
 
 from pathlib import Path
