@@ -317,9 +317,14 @@ def main(argv=None) -> int:
         help="SQLite database file (default: QA_PLATFORM_DB or qa_platform.sqlite3).",
     )
     args = parser.parse_args(argv)
-    target_url = os.environ.get("QA_PLATFORM_DATABASE_URL", "").strip()
+    target_url = (
+        os.environ.get("QA_PLATFORM_DATABASE_URL", "").strip()
+        or os.environ.get("POSTGRESQL_URI", "").strip()
+    )
     if not target_url:
-        parser.error("Set QA_PLATFORM_DATABASE_URL to the PostgreSQL target URL.")
+        parser.error(
+            "Set QA_PLATFORM_DATABASE_URL or POSTGRESQL_URI to the PostgreSQL target URL."
+        )
     try:
         counts = migrate(args.source, target_url)
     except Exception as exc:

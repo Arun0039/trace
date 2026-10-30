@@ -68,7 +68,7 @@ See the systemd unit example in README or create one pointing to your venv pytho
 |---|---|---|
 | HOST / QA_HOST | 127.0.0.1 | Bind to 0.0.0.0 for external access |
 | PORT / QA_PORT | 8001 | Port to listen on |
-| DATABASE_URL / QA_PLATFORM_DATABASE_URL / POSTGRES_URL | (unset) | Use PostgreSQL if set; remote URLs must use TLS (`sslmode=require` or stronger) |
+| DATABASE_URL / QA_PLATFORM_DATABASE_URL / POSTGRES_URL / POSTGRESQL_URI | (unset) | Use PostgreSQL if set; remote URLs must use TLS (`sslmode=require` or stronger) |
 | QA_ADMIN_PASSWORD | (unset) | Bootstrap Product Owner password; use a unique secret of at least 12 characters |
 | QA_AI_ENCRYPTION_KEY | (unset) | 64-hex key required before storing encrypted AI provider keys |
 | QA_ALLOW_PUBLIC_AUTH | false | `true` is required for cloud/public deployments; keep `false` for loopback-only hosts |

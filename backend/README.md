@@ -20,7 +20,7 @@ frontend process as shown in the root README.
 The backend reads `../qa-platform/.env`; if needed, copy `.env.example` there and
 replace its placeholders. The app listens on loopback (`127.0.0.1`) and port `8001`
 by default. It uses `../qa-platform/qa_platform.sqlite3` unless `DATABASE_URL`,
-`QA_PLATFORM_DATABASE_URL`, or `POSTGRES_URL` selects PostgreSQL; remote URLs must
+`QA_PLATFORM_DATABASE_URL`, `POSTGRES_URL`, or `POSTGRESQL_URI` selects PostgreSQL; remote URLs must
 include `sslmode=require`, `verify-ca`, or `verify-full`. `QA_PLATFORM_DB` selects a
 local SQLite file when no PostgreSQL URL is set. `QA_HOST`/`QA_PORT` (or `HOST`/
 `PORT`) can override the bind address and port; do not expose this development MVP

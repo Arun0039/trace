@@ -55,14 +55,15 @@ def database_connection() -> Path | str:
         os.environ.get("DATABASE_URL")
         or os.environ.get("QA_PLATFORM_DATABASE_URL")
         or os.environ.get("POSTGRES_URL")
+        or os.environ.get("POSTGRESQL_URI")
         or ""
     ).strip()
     if not url:
         return database_path()
     if not url.startswith(("postgres://", "postgresql://")):
         raise ValueError(
-            "DATABASE_URL, QA_PLATFORM_DATABASE_URL, or POSTGRES_URL must use "
-            "the postgres:// or postgresql:// scheme."
+            "DATABASE_URL, QA_PLATFORM_DATABASE_URL, POSTGRES_URL, or "
+            "POSTGRESQL_URI must use the postgres:// or postgresql:// scheme."
         )
     parsed = urlsplit(url)
     if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:

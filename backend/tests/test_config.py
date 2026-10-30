@@ -76,6 +76,7 @@ class ConfigurationTests(unittest.TestCase):
     def test_database_connection_defaults_to_sqlite_and_accepts_postgresql_url(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("QA_PLATFORM_DATABASE_URL", None)
+            os.environ.pop("POSTGRESQL_URI", None)
             os.environ.pop("QA_PLATFORM_DB", None)
             self.assertEqual(database_connection(), database_path())
 
@@ -83,13 +84,17 @@ class ConfigurationTests(unittest.TestCase):
             os.environ["QA_PLATFORM_DATABASE_URL"] = url
             self.assertEqual(database_connection(), url)
 
-    @patch.dict(os.environ, {"DATABASE_URL": "", "POSTGRES_URL": ""})
+            os.environ.pop("QA_PLATFORM_DATABASE_URL", None)
+            os.environ["POSTGRESQL_URI"] = url
+            self.assertEqual(database_connection(), url)
+
+    @patch.dict(os.environ, {"DATABASE_URL": "", "POSTGRES_URL": "", "POSTGRESQL_URI": ""})
     def test_database_connection_rejects_non_postgresql_urls(self):
         with patch.dict(os.environ, {"QA_PLATFORM_DATABASE_URL": "mysql://db/qa"}):
             with self.assertRaisesRegex(ValueError, "QA_PLATFORM_DATABASE_URL"):
                 database_connection()
 
-    @patch.dict(os.environ, {"DATABASE_URL": "", "POSTGRES_URL": ""})
+    @patch.dict(os.environ, {"DATABASE_URL": "", "POSTGRES_URL": "", "POSTGRESQL_URI": ""})
     def test_remote_database_url_requires_tls(self):
         with patch.dict(
             os.environ,

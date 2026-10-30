@@ -59,7 +59,7 @@ The backend serves the frontend on the same origin at `http://127.0.0.1:8001/` b
 default. Create an account in the sign-in screen. For an existing installation,
 the app continues to use `qa-platform/qa_platform.sqlite3` and
 `qa-platform/storage/`. Set `QA_PLATFORM_DB` to override the SQLite path, or set
-`DATABASE_URL`, `QA_PLATFORM_DATABASE_URL`, or `POSTGRES_URL` to use PostgreSQL.
+`DATABASE_URL`, `QA_PLATFORM_DATABASE_URL`, `POSTGRES_URL`, or `POSTGRESQL_URI` to use PostgreSQL.
 Remote PostgreSQL URLs must include `sslmode=require`, `verify-ca`, or `verify-full`.
 
 ### Run the frontend separately
