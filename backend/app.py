@@ -70,6 +70,7 @@ from ai_provider import (
     provider_settings,
     save_provider_settings,
     set_ai_module_enabled,
+    validate_encryption_key_configuration,
 )
 from ollama_integration import (
     MAX_AD_HOC_INPUT_LENGTH,
@@ -9117,6 +9118,7 @@ class QAHandler(BaseHTTPRequestHandler):
 
 
 def create_server(host="127.0.0.1", port=8001, db_path: Path | str = DB_PATH):
+    validate_encryption_key_configuration()
     initialize(db_path)
     server = ThreadingHTTPServer((host, port), QAHandler)
     server.cors_origins = cors_origins()

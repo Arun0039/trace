@@ -175,6 +175,24 @@ class ServerStartupTests(unittest.TestCase):
 
         create_server.assert_called_once_with("127.0.0.1", 8123)
 
+    def test_live_environment_requires_a_64_character_hex_encryption_key(self):
+        with patch.dict(os.environ, {"QA_ENVIRONMENT": "production"}, clear=False):
+            os.environ.pop("QA_AI_ENCRYPTION_KEY", None)
+            with self.assertRaisesRegex(RuntimeError, "64-character hexadecimal key"):
+                ai_provider.validate_encryption_key_configuration()
+            for invalid in ("not-hex", "a" * 63, "a" * 65, "B0jrphAPOY7pg92AN0c9MN4yecczLMdwnx4OkA1KFUk="):
+                with self.subTest(key=invalid):
+                    with patch.dict(os.environ, {"QA_AI_ENCRYPTION_KEY": invalid}):
+                        with self.assertRaisesRegex(RuntimeError, "64-character hexadecimal key"):
+                            ai_provider.validate_encryption_key_configuration()
+            with patch.dict(os.environ, {"QA_AI_ENCRYPTION_KEY": "a" * 64}):
+                ai_provider.validate_encryption_key_configuration()
+
+    def test_non_live_environment_does_not_require_the_encryption_key(self):
+        with patch.dict(os.environ, {"QA_ENVIRONMENT": "development"}, clear=False):
+            os.environ.pop("QA_AI_ENCRYPTION_KEY", None)
+            ai_provider.validate_encryption_key_configuration()
+
     def test_separately_served_frontend_cors_preflight_and_auth_status(self):
         origin = "http://127.0.0.1:3000"
         with tempfile.TemporaryDirectory() as temporary, patch.dict(

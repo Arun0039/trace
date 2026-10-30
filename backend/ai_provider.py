@@ -68,6 +68,27 @@ PROVIDERS = {
 }
 
 
+LIVE_ENVIRONMENTS = frozenset({"production", "prod", "live"})
+
+
+def environment_name() -> str:
+    return (
+        os.environ.get("QA_ENVIRONMENT")
+        or os.environ.get("ENVIRONMENT")
+        or "development"
+    ).strip().lower()
+
+
+def validate_encryption_key_configuration() -> None:
+    """Fail fast when a live deployment lacks a valid encryption key."""
+    if environment_name() not in LIVE_ENVIRONMENTS:
+        return
+    try:
+        _encryption_key()
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 def _encryption_key() -> bytes:
     value = os.environ.get(ENCRYPTION_KEY_ENV, "").strip()
     if not re.fullmatch(r"[0-9a-fA-F]{64}", value):

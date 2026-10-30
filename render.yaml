@@ -25,7 +25,7 @@ services:
       - key: QA_TRIAL_DURATION_DAYS
         value: "14"
       - key: QA_AI_ENCRYPTION_KEY
-        generateValue: true
+        sync: false
       - key: QA_ALLOW_PUBLIC_AUTH
         value: "true"
       - key: QA_COOKIE_SECURE
